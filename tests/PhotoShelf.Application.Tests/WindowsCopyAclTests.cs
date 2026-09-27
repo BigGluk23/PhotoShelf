@@ -69,7 +69,14 @@ public sealed class WindowsCopyAclTests : IDisposable
                 Assert.Equal(0, new FileInfo(state.Temporary!).Length);
                 Assert.Equal(expected, Security(state.Temporary!));
                 Assert.NotNull(state.WindowsSecurityDescriptor);
-                Assert.Contains("WindowsSecurityDescriptor", File.ReadAllText(Journal));
+                // The read-only observer must share the already open writer's access. The
+                // writer still denies other writers; File.ReadAllText would deny its write access.
+                using var journalReader = new StreamReader(new FileStream(Journal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+                Assert.Contains("WindowsSecurityDescriptor", journalReader.ReadToEnd());
+                Assert.Throws<IOException>(() =>
+                {
+                    using var competingWriter = new FileStream(Journal, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                });
             }
             return Task.CompletedTask;
         }});
