@@ -9,7 +9,7 @@
         MinHeight="620"
         WindowStartupLocation="CenterOwner"
         Background="#FFF7F4EF"
-        Icon="Assets/PhotoShelf.ico">
+        Icon="pack://application:,,,/PhotoShelf;component/Assets/PhotoShelf.ico">
     <Window.Resources>
         <local:BooleanNotConverter x:Key="BooleanNot" />
     </Window.Resources>

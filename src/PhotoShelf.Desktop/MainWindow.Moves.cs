@@ -8,10 +8,15 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow
 {
-    private readonly HashSet<PhotoItem> _selection = new();
+    private readonly PhotoSelection _selection = new();
     private System.Windows.Point _dragStart;
     private bool _fileOperationActive;
+    private bool _hasPendingRecovery = true;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _movedPaths = new();
     private Task _fileOperationTask = Task.CompletedTask;
+    private CancellationTokenSource? _fileOperationCancellation;
+    private static string OperationsDirectory => Path.Combine(LocalCatalogStore.CatalogDirectory, "operations");
+    private static string QuarantineDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "PhotoShelf_Quarantine");
 
     private void OnPhotoTileMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
@@ -21,80 +26,116 @@ public partial class MainWindow
         System.Windows.DragDrop.DoDragDrop((DependencyObject)sender, new System.Windows.DataObject("PhotoShelf.Selection", _selection.ToArray()), System.Windows.DragDropEffects.Move);
         e.Handled = true;
     }
-
     private void OnFolderDragOver(object sender, System.Windows.DragEventArgs e)
     {
         e.Effects = !_fileOperationActive && e.Data.GetDataPresent("PhotoShelf.Selection") ? System.Windows.DragDropEffects.Move : System.Windows.DragDropEffects.None;
         e.Handled = true;
     }
-
     private async void OnFolderDrop(object sender, System.Windows.DragEventArgs e)
     {
         e.Handled = true;
         if (_fileOperationActive || sender is not FrameworkElement { DataContext: FolderNode node } || node.IsPlaceholder || e.Data.GetData("PhotoShelf.Selection") is not PhotoItem[] items) return;
         await PreviewMoveAsync(items, node.FullPath, false);
     }
-
     private async void OnOrganizeYearsClicked(object sender, RoutedEventArgs e)
     {
         if (_fileOperationActive || _selection.Count == 0) return;
         using var dialog = new Forms.FolderBrowserDialog { Description = "Корневая папка для раскладки по дате съёмки", UseDescriptionForTitle = true };
         if (dialog.ShowDialog() == Forms.DialogResult.OK) await PreviewMoveAsync(_selection.ToArray(), dialog.SelectedPath, true);
     }
-
     private async Task PreviewMoveAsync(PhotoItem[] items, string destination, bool byYear)
     {
-        if (_isCatalogLoading || !_catalogLoaded)
+        if (!_catalogLoaded || _closing) return;
+        if (_hasPendingRecovery)
         {
-            System.Windows.MessageBox.Show("Дождитесь загрузки каталога перед переносом файлов.", "PhotoShelf"); return;
+            System.Windows.MessageBox.Show("Сначала проверьте незавершённые операции в окне «Операции». Новые переносы временно заблокированы.", "Восстановление"); return;
         }
         var requests = items.Select(x => new MoveRequest(x.Path, x.CaptureDate)).ToArray();
         var dialog = new MovePlanWindow(requests, destination, byYear) { Owner = this };
         if (dialog.ShowDialog() != true) return;
-        _fileOperationActive = true;
-        _saveCancellation?.Cancel();
-        _scanCancellation?.Cancel();
-        _browseCancellation?.Cancel();
-        _metadataIndexCancellation?.Cancel();
-        var journal = Path.Combine(LocalCatalogStore.CatalogDirectory, "operations", $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.jsonl");
-        _fileOperationTask = ExecuteMoveAsync(dialog.Plan, journal);
-        try { await _fileOperationTask; }
-        finally { _fileOperationActive = false; SaveCatalogState(); RebuildRows(); }
+        var journal = Path.Combine(OperationsDirectory, $"move-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.jsonl");
+        await RunFileOperationAsync((progress, token) => new FileMoveService().ExecuteAsync(dialog.Plan, journal, CommitFileMoveAsync, progress, token), dialog.Plan.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase));
+    }
+    private async Task CommitFileMoveAsync(MoveEntry entry)
+    {
+        await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination, removeFromLibrary: IsUnderFolder(entry.Destination, QuarantineDirectory));
+        // UI bookkeeping never participates in the durable commit/recovery protocol.
+        _movedPaths.Enqueue(entry.Source);
+    }
+    private void ApplyMovedPaths()
+    {
+        while (_movedPaths.TryDequeue(out var source))
+        {
+            var old = _selection.Find(source);
+            if (old is not null) { _selection.Remove(old); old.IsSelected = false; }
+            if (_selectedPhoto?.Path.Equals(source, StringComparison.OrdinalIgnoreCase) == true) _selectedPhoto = null;
+        }
+        SelectedText.Text = $"Выбрано: {_selection.Count:N0}";
     }
 
-    private async Task ExecuteMoveAsync(IReadOnlyList<MoveEntry> plan, string journal)
+    private Task RunFileOperationAsync(Func<IProgress<int>, CancellationToken, Task<IReadOnlyList<MoveResult>>> action, IReadOnlySet<string>? affectedPaths = null)
     {
+        if (_fileOperationActive || _closing) return Task.CompletedTask;
+        _fileOperationActive = true;
+        return _fileOperationTask = RunFileOperationCoreAsync(action, affectedPaths);
+    }
+    private async Task RunFileOperationCoreAsync(Func<IProgress<int>, CancellationToken, Task<IReadOnlyList<MoveResult>>> action, IReadOnlySet<string>? affectedPaths)
+    {
+        await Task.Yield();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _fileOperationCancellation = cancellation;
+        var progressWindow = new FileOperationProgressWindow(cancellation) { Owner = this };
+        progressWindow.Show();
+        IDisposable? mediaPause = null;
         try
         {
-            await _pendingSave;
-            await PersistStateAsync(CaptureState(), CancellationToken.None, _catalogRevision);
-            var progress = new Progress<int>(done => StatusText.Text = $"Перенос: {done} / {plan.Count}");
-            var result = await Task.Run(() => new FileMoveService().ExecuteAsync(plan, journal, async entry =>
+            await StopCatalogWritersAsync();
+            foreach (var viewer in OwnedWindows.OfType<PhotoViewerWindow>().ToArray()) viewer.Close();
+            mediaPause = await AsyncMediaImage.PauseForFileOperationsAsync(affectedPaths);
+            var progress = new Progress<int>(done => { StatusText.Text = $"Обработано файлов: {done:N0}"; progressWindow.SetProgress(done); });
+            IReadOnlyList<MoveResult>? result = null;
+            result = await Task.Run(() => action(progress, cancellation.Token));
+            if (result is not null)
             {
-                await _saveGate.WaitAsync();
-                try { await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination); }
-                finally { _saveGate.Release(); }
-                var replacement = new PhotoItem(entry.Destination);
-                await Dispatcher.InvokeAsync(() => ApplyMovedItem(entry.Source, replacement));
-            }, progress, _lifetime.Token));
-            System.Windows.MessageBox.Show($"Перенесено: {result.Count(x => x.Moved)}\nПропущено/ошибок: {result.Count(x => !x.Moved)}\nЖурнал: {journal}", "Перенос завершён");
+                var errors = result.Where(x => !x.Moved).Select(x => $"{x.Entry.Source}: {x.Error}").Take(6);
+                System.Windows.MessageBox.Show($"Завершено: {result.Count(x => x.Moved)}\nНе завершено: {result.Count(x => !x.Moved)}\n{string.Join("\n", errors)}\nИстория, восстановление и откат доступны в «Операции».", "Файловая операция");
+            }
         }
-        catch (Exception ex) { System.Windows.MessageBox.Show($"Операция остановлена: {ex.Message}\nЖурнал восстановления: {journal}", "Перенос"); }
-    }
-
-    private void ApplyMovedItem(string source, PhotoItem? replacement)
-    {
-        var old = Photos.FirstOrDefault(x => x.Path.Equals(source, StringComparison.OrdinalIgnoreCase));
-        if (old is not null)
+        catch (OperationCanceledException) { StatusText.Text = "Остановлено. Незавершённые шаги доступны в «Операции»."; }
+        catch (Exception ex) { System.Windows.MessageBox.Show($"Операция остановлена: {ex.Message}\nОткройте «Операции» для восстановления. Не удаляйте временные файлы вручную.", "PhotoShelf"); }
+        finally
         {
-            if (replacement is not null) { replacement.IsFavorite = old.IsFavorite; if (old.IsCaptureDateLoaded) replacement.ApplyIndexedCaptureDate(old.CaptureDate); }
-            _selection.Remove(old); Photos.Remove(old);
-            if (_selectedPhoto == old) _selectedPhoto = replacement;
-            if (_folderNodes.TryGetValue(NormalizePath(old.Folder), out var folder)) folder.DirectItemCount = Math.Max(0, folder.DirectItemCount - 1);
+            ApplyMovedPaths();
+            try { await CheckPendingOperationsAsync(); await RefreshCatalogCountAsync(); await RebuildRowsAsync(); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { StatusText.Text = $"Не удалось обновить состояние операции: {ex.Message}"; }
+            finally
+            {
+                mediaPause?.Dispose();
+                _fileOperationActive = false; _fileOperationCancellation = null; progressWindow.Finish();
+            }
         }
-        _catalogRevision++;
-        _itemsByPath.Remove(source);
-        _knownPhotoPaths.Remove(source); _duplicateHashCache.Remove(source);
-        if (replacement is not null) ApplyItems(new[] { replacement });
+    }
+    private async Task CheckPendingOperationsAsync()
+    {
+        _hasPendingRecovery = true;
+        var operations = await Task.Run(() => new FileMoveService().ReadHistory(OperationsDirectory));
+        _hasPendingRecovery = operations.Any(x => x.PendingFiles > 0 || x.Error is not null);
+        if (_hasPendingRecovery) StatusText.Text = "Есть незавершённые операции — откройте «Операции»";
+    }
+    private void OnOperationsClicked(object sender, RoutedEventArgs e)
+    {
+        if (_fileOperationActive || _closing) return;
+        var window = new OperationsWindow(OperationsDirectory, async (history, undo) =>
+        {
+            var service = new FileMoveService();
+            var undoJournal = Path.Combine(OperationsDirectory, $"undo-{Guid.NewGuid():N}.jsonl");
+            var entries = await Task.Run(() => service.ReadPlan(history.JournalPath));
+            var paths = entries.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            await RunFileOperationAsync((progress, token) => undo
+                ? service.UndoAsync(history.JournalPath, undoJournal, CommitFileMoveAsync, progress, token)
+                : service.RecoverAsync(history.JournalPath, CommitFileMoveAsync, progress, token), paths);
+        }, () => _desktopCatalogStore.CreateBackupAsync(_lifetime.Token)) { Owner = this };
+        window.ShowDialog();
     }
 }

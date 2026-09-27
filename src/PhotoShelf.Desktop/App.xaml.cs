@@ -1,68 +1,87 @@
-using System.IO;
 using System.Windows;
 using System.Windows.Threading;
+using System.IO;
+using PhotoShelf.Infrastructure.Sqlite;
+using PhotoShelf.Application.Diagnostics;
 
 namespace PhotoShelf.Desktop;
 
 public partial class App : System.Windows.Application
 {
-    protected override async void OnStartup(StartupEventArgs e)
+    private Mutex? _instanceMutex;
+    private FileStream? _catalogLease;
+    private bool _startupCompleted;
+    private readonly bool _verificationOnly;
+    internal bool VerificationFailed { get; private set; }
+
+    public App() : this(false) { }
+
+    public App(bool verificationOnly)
     {
-        base.OnStartup(e);
-        DispatcherUnhandledException += (_, args) =>
-        {
-            args.Handled = true;
-            var logPath = WriteCrashLog(args.Exception);
-            System.Windows.MessageBox.Show(
-                $"PhotoShelf поймал ошибку и не будет молча закрываться.\n\n{args.Exception.Message}\n\nПодробности:\n{logPath}",
-                "Ошибка PhotoShelf",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-        };
+        _verificationOnly = verificationOnly;
+        DispatcherUnhandledException += OnUnhandledDispatcherException;
+    }
 
-        var loading = new LoadingWindow();
-        loading.Show();
-        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-
-        MainWindow mainWindow;
-        try
+    private void OnUnhandledDispatcherException(object sender, DispatcherUnhandledExceptionEventArgs args)
+    {
+        args.Handled = true;
+        if (_verificationOnly)
         {
-            var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
-            mainWindow = new MainWindow(state);
-        }
-        catch (Exception ex)
-        {
-            var logPath = WriteCrashLog(ex);
-            System.Windows.MessageBox.Show(
-                $"Не удалось открыть каталог. Данные сохранены.\n\n{ex.Message}\n\nПодробности:\n{logPath}",
-                "PhotoShelf",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
+            VerificationFailed = true;
+            ErrorReporter.Save(ExceptionDiagnostics.Create(args.Exception, "Проверка встроенных ресурсов запуска", ErrorReporter.Version).Details);
             Shutdown(1);
             return;
         }
-
-        MainWindow = mainWindow;
-        mainWindow.Show();
-        loading.Close();
+        ErrorReporter.Show(args.Exception, _startupCompleted
+            ? "Не удалось выполнить действие в PhotoShelf"
+            : "Не удалось подготовить окно PhotoShelf");
+        if (!_startupCompleted) Shutdown(1);
     }
 
-    private static string WriteCrashLog(Exception exception)
+    protected override async void OnStartup(StartupEventArgs e)
     {
+        // Application queues OnStartup before Run; a nested dispatcher pump must remain harmless.
+        if (_verificationOnly) return;
         try
         {
-            var directory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "PhotoShelf",
-                "logs");
-            Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}.log");
-            File.WriteAllText(path, exception.ToString());
-            return path;
+            base.OnStartup(e);
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _instanceMutex = new Mutex(true, "Local\\PhotoShelf.Catalog.SingleWriter", out var firstInstance);
+            if (!firstInstance)
+            {
+                System.Windows.MessageBox.Show("PhotoShelf уже запущен. Откройте его окно через значок в области уведомлений.", "PhotoShelf");
+                _instanceMutex.Dispose(); _instanceMutex = null; Shutdown(); return;
+            }
+            // The handle protects this catalog across Windows login sessions too.
+            Directory.CreateDirectory(LocalCatalogStore.CatalogDirectory);
+            _catalogLease = new FileStream(Path.Combine(LocalCatalogStore.CatalogDirectory, "writer.lock"),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+            // Keep every stage inside the same error boundary, including the splash XAML and Show().
+            var loading = new LoadingWindow();
+            loading.Show();
+            await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            if (Dispatcher.HasShutdownStarted) return;
+            var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
+            if (Dispatcher.HasShutdownStarted) return;
+            var mainWindow = new MainWindow(state);
+            MainWindow = mainWindow;
+            mainWindow.Show();
+            _startupCompleted = true;
+            ShutdownMode = ShutdownMode.OnMainWindowClose;
+            loading.Close();
         }
-        catch
+        catch (Exception exception)
         {
-            return "лог не удалось записать";
+            ErrorReporter.Show(exception, "Не удалось запустить PhotoShelf");
+            Shutdown(1);
         }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _catalogLease?.Dispose();
+        if (_instanceMutex is not null) { _instanceMutex.ReleaseMutex(); _instanceMutex.Dispose(); }
+        base.OnExit(e);
     }
 }

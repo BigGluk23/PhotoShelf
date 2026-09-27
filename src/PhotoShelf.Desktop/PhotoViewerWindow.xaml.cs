@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using PhotoShelf.Application.Catalog;
+using PhotoShelf.Infrastructure.Sqlite;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Input;
@@ -7,21 +9,27 @@ using System.Windows.Threading;
 
 namespace PhotoShelf.Desktop;
 
-public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
+public partial class PhotoViewerWindow : Window
 {
-    private readonly IReadOnlyList<PhotoItem> _items;
+    private readonly SqliteDesktopCatalogStore _store;
+    private readonly CatalogViewQuery _query;
+    private readonly long _count;
+    private readonly CancellationTokenSource _lifetime = new();
+    private CancellationTokenSource? _request;
+    private readonly Dictionary<long, PhotoItem> _nearby = new();
     private readonly DispatcherTimer _videoTimer;
-    private int _index;
+    private long _index;
+    private string? _anchorPath;
     private bool _updatingFilmstrip;
     private bool _isSeeking;
     private bool _isVideoPlaying;
 
-    public PhotoViewerWindow(IReadOnlyList<PhotoItem> items, int index)
+    public PhotoViewerWindow(SqliteDesktopCatalogStore store, CatalogViewQuery query, long count, long index, string? anchorPath = null)
     {
         InitializeComponent();
-        _items = items;
+        _store = store; _query = query; _count = count; _anchorPath = anchorPath;
         DataContext = this;
-        _index = Math.Clamp(index, 0, Math.Max(0, items.Count - 1));
+        _index = Math.Clamp(index, 0, Math.Max(0, count - 1));
         _videoTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(300)
@@ -30,7 +38,6 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
         ShowCurrentPhoto();
     }
 
-    public event PropertyChangedEventHandler? PropertyChanged;
 
     public ObservableCollection<FilmstripCell> FilmstripItems { get; } = new();
 
@@ -72,28 +79,60 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
 
     private void Move(int delta)
     {
-        if (_items.Count == 0)
+        if (_count == 0)
         {
             return;
         }
 
-        _index = (_index + delta + _items.Count) % _items.Count;
+        _index = (_index + delta + _count) % _count;
         ShowCurrentPhoto();
     }
 
-    private void ShowCurrentPhoto()
+    private async void ShowCurrentPhoto()
     {
-        if (_items.Count == 0)
+        if (_count == 0)
         {
             return;
         }
 
-        var item = _items[_index];
-        RebuildFilmstrip();
+        _request?.Cancel();
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _request = request;
+        StopVideo(); AsyncMediaImage.SetPath(PhotoImage, null); TitleText.Text = "Загружаю…";
+        PhotoItem item;
+        try
+        {
+            var anchor = _anchorPath; _anchorPath = null;
+            var center = _index;
+            var start = Math.Max(0, center - 5);
+            var page = await _store.QueryPageAsync(_query, checked((int)start), 11, token: request.Token);
+            request.Token.ThrowIfCancellationRequested();
+            _nearby.Clear();
+            for (var i = 0; i < page.Items.Count; i++)
+            {
+                var saved = page.Items[i];
+                var photo = new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt) { IsFavorite = saved.IsFavorite };
+                if (saved.MetadataIndexed) photo.ApplyIndexedCaptureDate(saved.CaptureDate);
+                _nearby[start + i] = photo;
+            }
+            if (!_nearby.TryGetValue(center, out item!)) { TitleText.Text = "Файл больше не входит в этот вид"; return; }
+            if (anchor is not null && !item.Path.Equals(anchor, StringComparison.OrdinalIgnoreCase))
+            {
+                var saved = await _store.GetItemAsync(anchor, request.Token);
+                request.Token.ThrowIfCancellationRequested();
+                if (saved is null) { TitleText.Text = "Выбранный файл больше не в каталоге"; return; }
+                item = new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
+                if (saved.MetadataIndexed) item.ApplyIndexedCaptureDate(saved.CaptureDate);
+            }
+            RebuildFilmstrip();
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex) { TitleText.Text = $"Не удалось загрузить: {ex.Message}"; return; }
+        finally { if (ReferenceEquals(_request, request)) _request = null; }
 
         Title = item.FileName;
         TitleText.Text = item.FileName;
-        DetailText.Text = $"{_index + 1} из {_items.Count}   {item.DetailLine}   {item.Folder}";
+        DetailText.Text = $"{_index + 1} из {_count}   {item.DetailLine}   {item.Folder}";
         StopVideo();
         AsyncMediaImage.SetPath(PhotoImage, null);
 
@@ -124,6 +163,7 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
 
     protected override void OnClosed(EventArgs e)
     {
+        _lifetime.Cancel(); _request?.Cancel();
         StopVideo();
         AsyncMediaImage.SetPath(PhotoImage, null);
         base.OnClosed(e);
@@ -221,36 +261,14 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
 
     private void RebuildFilmstrip()
     {
-        _updatingFilmstrip = true;
-        FilmstripItems.Clear();
-        const int radius = 5;
-        for (var offset = -radius; offset <= radius; offset++)
+        _updatingFilmstrip = true; FilmstripItems.Clear();
+        foreach (var (index, item) in _nearby.OrderBy(x => x.Key))
         {
-            var absoluteIndex = (_index + offset + _items.Count) % _items.Count;
-            var distance = Math.Abs(offset);
-            FilmstripItems.Add(new FilmstripCell(
-                _items[absoluteIndex],
-                absoluteIndex,
-                offset == 0,
-                distance switch
-                {
-                    0 => 122,
-                    1 => 96,
-                    2 => 84,
-                    _ => 72
-                },
-                distance switch
-                {
-                    0 => 88,
-                    1 => 72,
-                    2 => 64,
-                    _ => 56
-                }));
+            var center = index == _index;
+            FilmstripItems.Add(new FilmstripCell(item, index, center, center ? 122 : 84, center ? 88 : 64));
         }
-
-        FilmstripList.SelectedIndex = radius;
+        FilmstripList.SelectedItem = FilmstripItems.FirstOrDefault(x => x.IsCenter);
         _updatingFilmstrip = false;
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FilmstripItems)));
     }
 
     private static string FormatTime(TimeSpan time)
@@ -260,5 +278,5 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
             : $"{time.Minutes}:{time.Seconds:00}";
     }
 
-    public sealed record FilmstripCell(PhotoItem Item, int AbsoluteIndex, bool IsCenter, double Width, double Height);
+    public sealed record FilmstripCell(PhotoItem Item, long AbsoluteIndex, bool IsCenter, double Width, double Height);
 }

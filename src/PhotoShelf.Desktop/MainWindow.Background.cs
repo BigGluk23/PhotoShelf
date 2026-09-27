@@ -1,8 +1,9 @@
 using System.ComponentModel;
-using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Threading;
+using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Background;
 
 namespace PhotoShelf.Desktop;
 
@@ -14,16 +15,37 @@ public partial class MainWindow
     private CancellationTokenSource? _projectionCancellation;
     private CancellationTokenSource? _browseCancellation;
     private CancellationTokenSource? _saveCancellation;
+    private CancellationTokenSource? _maintenanceCancellation;
     private Task _pendingSave = Task.CompletedTask;
-    private PhotoItem[] _visiblePhotos = Array.Empty<PhotoItem>();
+    private Task _metadataTask = Task.CompletedTask;
+    private Task _maintenanceTask = Task.CompletedTask;
+    private Task _scanTask = Task.CompletedTask;
+    private Task _browseTask = Task.CompletedTask;
     private bool _isProjecting;
     private bool _projectionQueued;
     private bool _includeSubfolders = true;
     private bool _closeReady;
     private bool _closing;
     private int _infoRevision;
-    private long _catalogRevision;
-    private long _persistedCatalogRevision = -1;
+    private CancellationTokenSource? _infoCancellation;
+    private Task _duplicateWorkTask = Task.CompletedTask;
+    private readonly HashSet<Task> _infoWorkTasks = new();
+    private DuplicateReviewWindow? _activeDuplicateReview;
+    private int _treeVisibilityRevision;
+    private long _catalogCount;
+    private CatalogViewQuery? _currentQuery;
+    private string _viewIdentity = "";
+
+    private CatalogViewQuery CreateQuery() => new()
+    {
+        Folder = _viewMode == LibraryViewMode.Folder ? _activeFolder : null,
+        ViewMode = _viewMode.ToString(), IncludeSubfolders = _includeSubfolders,
+        ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders,
+        MissingCaptureDateOnly = _showOnlyMissingCaptureDate,
+        UseCaptureDate = _dateGroupingMode == DateGroupingMode.CaptureDate,
+        NewestFirst = _sortNewestFirst, SearchText = _searchText,
+        ExcludedFolders = _viewMode == LibraryViewMode.Folder ? Array.Empty<string>() : _excludedFolders.ToArray()
+    };
 
     private async void QueueProjectionRefresh()
     {
@@ -31,123 +53,64 @@ public partial class MainWindow
         _projectionQueued = true;
         try
         {
-            if (PhotoRows.Count > 0 || _isProjecting) await Task.Delay(750, _lifetime.Token);
-            // Finish the current projection so sustained scanning cannot starve the first page.
+            await Task.Delay(750, _lifetime.Token);
             while (_isProjecting) await Task.Delay(100, _lifetime.Token);
-            RebuildRows();
+            await RebuildRowsAsync();
         }
         catch (OperationCanceledException) { }
         finally { _projectionQueued = false; }
     }
 
+    private PhotoItem CreateVisibleItem(SavedMediaItem saved, long index)
+    {
+        var item = _selection.Find(saved.Path)
+            ?? new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
+        item.IsFavorite = saved.IsFavorite; item.ViewIndex = index;
+        if (saved.MetadataIndexed) item.ApplyIndexedCaptureDate(saved.CaptureDate);
+        return item;
+    }
+
     private async Task RebuildRowsAsync()
     {
+        if (!_catalogLoaded) return;
         _projectionCancellation?.Cancel();
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _projectionCancellation = operation;
         var token = operation.Token;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var query = CreateQuery();
+        var identity = $"{query.Folder}|{query.ViewMode}|{query.SearchText}|{query.ShowVideos}|{query.IncludeSubfolders}|{query.MissingCaptureDateOnly}";
+        var preserve = identity == _viewIdentity;
+        var anchor = preserve ? GetGridAnchor() : 0;
+        var old = PhotoRows as VirtualPhotoRows;
         _isProjecting = true;
-        PhotoRows.Clear();
-        _visiblePhotos = Array.Empty<PhotoItem>();
+        if (!preserve)
+        {
+            old?.Dispose(); PhotoRows = Array.Empty<PhotoRow>(); OnPropertyChanged(nameof(PhotoRows));
+        }
         EmptyState.Visibility = Visibility.Collapsed;
         StatusText.Text = "Обновляю вид…";
         CatalogProgressBar.Visibility = Visibility.Visible;
         CatalogProgressBar.IsIndeterminate = true;
-        var source = Photos.ToArray();
-        var includeSystem = _includeSystemFolders;
-        var excluded = _excludedFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var mode = _viewMode;
-        var folder = _activeFolder;
-        var search = _searchText;
-        var showVideos = ShowVideos;
-        var missing = _showOnlyMissingCaptureDate;
-        var dateMode = _dateGroupingMode;
-        var descending = _sortNewestFirst;
-        var recursive = _includeSubfolders;
-        var columns = _columns;
-        var collapsed = _collapsedDateGroups.ToHashSet();
         try
         {
             await Task.Delay(60, token);
-            var result = await Task.Run(() =>
-            {
-                var eligible = new List<PhotoItem>();
-                var allowedFolders = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-                var includedFolders = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-                foreach (var item in source)
-                {
-                    token.ThrowIfCancellationRequested();
-                    if (!showVideos && item.IsVideo) continue;
-                    if (!includeSystem)
-                    {
-                        if (!allowedFolders.TryGetValue(item.Folder, out var allowed))
-                        {
-                            allowed = !PhotoScanner.IsIgnoredPath(item.Folder, false);
-                            var current = item.Folder;
-                            while (allowed && !string.IsNullOrEmpty(current) && current != Path.GetPathRoot(current))
-                            {
-                                try { allowed = (File.GetAttributes(current) & (FileAttributes.Hidden | FileAttributes.System)) == 0; }
-                                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { break; }
-                                current = Path.GetDirectoryName(current);
-                            }
-                            allowedFolders[item.Folder] = allowed;
-                        }
-                        if (!allowed) continue;
-                    }
-                    if (mode == LibraryViewMode.Folder && folder is not null)
-                    {
-                        if (!(recursive ? IsUnderFolder(item.Path, folder) : NormalizePath(item.Folder).Equals(NormalizePath(folder), StringComparison.OrdinalIgnoreCase))) continue;
-                    }
-                    else
-                    {
-                        if (!includedFolders.TryGetValue(item.Folder, out var included))
-                        {
-                            included = true;
-                            var current = item.Folder;
-                            while (!string.IsNullOrEmpty(current))
-                            {
-                                if (excluded.Contains(NormalizePath(current))) { included = false; break; }
-                                current = Path.GetDirectoryName(current.TrimEnd(Path.DirectorySeparatorChar));
-                            }
-                            includedFolders[item.Folder] = included;
-                        }
-                        if (!included) continue;
-                    }
-                    if (mode == LibraryViewMode.Favorites && !item.IsFavorite) continue;
-                    if (missing && (item.IsVideo || item.CaptureDate is not null)) continue;
-                    if (search.Length > 0 && !item.FileName.Contains(search, StringComparison.CurrentCultureIgnoreCase) && !item.Folder.Contains(search, StringComparison.CurrentCultureIgnoreCase)) continue;
-                    eligible.Add(item);
-                }
-                IEnumerable<PhotoItem> query = eligible;
-                if (mode == LibraryViewMode.Recent) query = query.OrderByDescending(x => x.FileModifiedAt).Take(500);
-                DateTime? Date(PhotoItem x) => dateMode == DateGroupingMode.CaptureDate ? x.CaptureDate : x.FileModifiedAt;
-                var ordered = (descending ? query.OrderByDescending(Date) : query.OrderBy(Date))
-                    .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase).ToArray();
-                token.ThrowIfCancellationRequested();
-                var rows = new List<PhotoRow>();
-                foreach (var group in ordered.GroupBy(x => (Date(x)?.Year, Date(x)?.Month)))
-                {
-                    token.ThrowIfCancellationRequested();
-                    var (year, month) = group.Key;
-                    var key = $"{(dateMode == DateGroupingMode.CaptureDate ? "capture" : "file")}:{(year is null ? "none" : $"{year:D4}-{month:D2}")}";
-                    var culture = CultureInfo.GetCultureInfo("ru-RU");
-                    var title = year is null ? (dateMode == DateGroupingMode.CaptureDate ? "Без даты съёмки" : "Без даты файла")
-                        : $"{year} / {culture.TextInfo.ToTitleCase(culture.DateTimeFormat.GetMonthName(month!.Value))}";
-                    rows.Add(PhotoRow.CreateHeader(title, key, collapsed.Contains(key)));
-                    if (collapsed.Contains(key)) continue;
-                    foreach (var chunk in group.Chunk(columns)) { token.ThrowIfCancellationRequested(); rows.Add(new PhotoRow(chunk)); }
-                }
-                return (ordered, rows);
-            }, token);
+            var groups = await _desktopCatalogStore.QueryGroupsAsync(query, token);
             token.ThrowIfCancellationRequested();
-            _visiblePhotos = result.ordered;
-            foreach (var batch in result.rows.Chunk(24))
+            var rows = new VirtualPhotoRows(_desktopCatalogStore, query, groups, _columns, TileImageHeight + 60,
+                _collapsedDateGroups, CreateVisibleItem, token);
+            rows.LoadFailed += message => { if (ReferenceEquals(PhotoRows, rows)) StatusText.Text = $"Страница не загружена: {message}"; };
+            await rows.PrimeAsync();
+            if (token.IsCancellationRequested) { rows.Dispose(); token.ThrowIfCancellationRequested(); }
+            old?.Dispose(); PhotoRows = rows; _currentQuery = query; _viewIdentity = identity;
+            OnPropertyChanged(nameof(PhotoRows));
+            if (preserve && anchor > 0 && rows.Count > 0)
             {
-                token.ThrowIfCancellationRequested();
-                foreach (var row in batch) PhotoRows.Add(row);
-                await Dispatcher.Yield(DispatcherPriority.Background);
+                var row = rows[rows.RowForItem(anchor)];
+                PhotoGrid.ScrollIntoView(row);
             }
-            StatusText.Text = $"Показано: {result.ordered.Length} · Всего: {Photos.Count}";
+            StatusText.Text = $"В виде: {rows.ItemCount:N0} · Каталог: {_catalogCount:N0}";
+            PerformanceMetrics.Record("catalog.first_page", timer.Elapsed.TotalMilliseconds, rows.ItemCount);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Не удалось обновить вид: {ex.Message}"; }
@@ -155,46 +118,108 @@ public partial class MainWindow
         {
             if (ReferenceEquals(_projectionCancellation, operation))
             {
-                _projectionCancellation = null;
-                _isProjecting = false;
+                _projectionCancellation = null; _isProjecting = false;
                 CatalogProgressBar.Visibility = _isCatalogLoading ? Visibility.Visible : Visibility.Collapsed;
                 EmptyState.Visibility = !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             }
         }
     }
 
-    private async Task BrowseFolderAsync(string folder)
+    private long GetGridAnchor()
     {
-        _browseCancellation?.Cancel();
-        using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _browseCancellation = operation;
-        var token = operation.Token;
-        var includeSystem = _includeSystemFolders;
-        var recursive = _includeSubfolders;
-        try
+        var scroll = FindVisualChild<System.Windows.Controls.ScrollViewer>(PhotoGrid);
+        if (scroll is null || PhotoRows is not VirtualPhotoRows rows || rows.Count == 0) return 0;
+        return rows.ItemIndexForRow(Math.Clamp((int)scroll.VerticalOffset, 0, rows.Count - 1));
+    }
+    private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (var i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(parent); i++)
         {
-            await PhotoScanner.ScanAsync(new[] { folder }, async batch =>
-            {
-                var items = batch.Paths.Select(path => new PhotoItem(path)).ToArray();
-                await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) ApplyItems(items); }, DispatcherPriority.Background, token);
-            }, includeSystem, token, recursive: recursive);
-            token.ThrowIfCancellationRequested();
-            RebuildRows();
+            var child = System.Windows.Media.VisualTreeHelper.GetChild(parent, i);
+            if (child is T result) return result;
+            if (FindVisualChild<T>(child) is { } nested) return nested;
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { if (!token.IsCancellationRequested) StatusText.Text = ex.Message; }
-        finally { if (ReferenceEquals(_browseCancellation, operation)) _browseCancellation = null; }
+        return null;
     }
 
+    private Task BrowseFolderAsync(string folder)
+    {
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return Task.CompletedTask;
+        _browseCancellation?.Cancel();
+        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var previous = _browseTask;
+        _browseCancellation = operation;
+        return _browseTask = RunBrowseAsync(folder, operation, _includeSystemFolders, _includeSubfolders, previous);
+    }
+    private async Task RunBrowseAsync(string folder, CancellationTokenSource operation, bool system, bool recursive, Task previous)
+    {
+        try
+        {
+            await previous;
+            operation.Token.ThrowIfCancellationRequested();
+            await PhotoScanner.ScanAsync(new[] { folder }, batch => IndexScanBatchAsync(batch, operation.Token),
+                system, operation.Token, recursive: recursive);
+            if (!operation.IsCancellationRequested) { await RefreshCatalogCountAsync(); QueueProjectionRefresh(); StartMetadataIndexing(false); }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (!operation.IsCancellationRequested) StatusText.Text = ex.Message; }
+        finally { if (ReferenceEquals(_browseCancellation, operation)) _browseCancellation = null; operation.Dispose(); }
+    }
+
+    private async Task IndexScanBatchAsync(PhotoScanBatch batch, CancellationToken token)
+    {
+        var items = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ =>
+            batch.Paths.Select(ToSavedItem).Where(x => x is not null).Cast<SavedMediaItem>().ToArray(), token);
+        token.ThrowIfCancellationRequested();
+        await _desktopCatalogStore.UpsertItemsAsync(items, preserveFavorites: true, token);
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (token.IsCancellationRequested) return;
+            StatusText.Text = $"Сканирую: {batch.SeenCount:N0} · {batch.CurrentFolder}";
+            QueueProjectionRefresh();
+        }, DispatcherPriority.Background, token);
+    }
+    private static SavedMediaItem? ToSavedItem(string path)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists) return null;
+            var hidden = false;
+            string? folder = file.DirectoryName;
+            while (!string.IsNullOrEmpty(folder) && folder != Path.GetPathRoot(folder))
+            {
+                try { hidden |= (File.GetAttributes(folder) & (FileAttributes.Hidden | FileAttributes.System)) != 0; }
+                catch (IOException) { break; }
+                folder = Path.GetDirectoryName(folder);
+            }
+            hidden |= (file.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+            hidden |= PhotoScanner.IsIgnoredPath(path, false);
+            return new SavedMediaItem { Path = path, SizeBytes = file.Length, FileModifiedAt = file.LastWriteTime,
+                IsVideo = PhotoItem.IsVideoPath(path), IsHiddenOrSystem = hidden };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+    }
+    private async Task RefreshCatalogCountAsync()
+    {
+        _catalogCount = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }, _lifetime.Token);
+    }
     private async void RefreshTreeVisibility()
     {
+        var revision = ++_treeVisibilityRevision;
         var nodes = _folderNodes.Values.ToArray(); var includeSystem = _includeSystemFolders;
-        var hidden = await Task.Run(() => nodes.Select(n => n.FullPath != Path.GetPathRoot(n.FullPath) && ShouldHideFolderInTree(n.FullPath, includeSystem)).ToArray());
-        for (var i = 0; i < nodes.Length; i++)
+        try
         {
-            nodes[i].IsVisible = !hidden[i];
-            if (i % 64 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
+            var hidden = await Task.Run(() => nodes.Select(n => n.FullPath != Path.GetPathRoot(n.FullPath) && ShouldHideFolderInTree(n.FullPath, includeSystem)).ToArray(), _lifetime.Token);
+            for (var i = 0; i < nodes.Length; i++)
+            {
+                if (revision != _treeVisibilityRevision || _lifetime.IsCancellationRequested) return;
+                nodes[i].IsVisible = !hidden[i];
+                if (i % 64 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
+            }
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { StatusText.Text = $"Дерево: {ex.Message}"; }
     }
 
     private void OnSubfoldersChanged(object sender, RoutedEventArgs e)
@@ -211,63 +236,57 @@ public partial class MainWindow
         DateGroupingMode = _dateGroupingMode.ToString(), ActiveFolder = _activeFolder, ViewMode = _viewMode.ToString(),
         SortNewestFirst = _sortNewestFirst, IncludeSubfolders = _includeSubfolders,
         ExpandedFolders = _folderNodes.Values.Where(x => x.IsExpanded).Select(x => x.FullPath).ToList(),
-        ExcludedFolders = _excludedFolders.ToList(),
-        Items = Photos.Select(x => new SavedMediaItem { Path = x.Path, IsFavorite = x.IsFavorite, IsVideo = x.IsVideo, SizeBytes = x.FileSizeBytes, FileModifiedAt = x.FileModifiedAt }).ToList(),
-        DuplicateHashes = _duplicateHashCache.Values.ToList()
+        ExcludedFolders = _excludedFolders.ToList()
     };
-
     private async Task SaveAfterDelayAsync(CancellationToken token)
     {
-        try
-        {
-            await Task.Delay(500, token);
-            var state = CaptureState();
-            await PersistStateAsync(state, token, _catalogRevision);
-        }
+        try { await Task.Delay(500, token); await PersistStateAsync(CaptureState(), token, 0); }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusText.Text = $"Каталог не сохранён: {ex.Message}"; }
+        catch (Exception ex) { StatusText.Text = $"Настройки не сохранены: {ex.Message}"; }
     }
-
     private async Task PersistStateAsync(LocalCatalogState state, CancellationToken token, long revision)
     {
         await _saveGate.WaitAsync(token);
-        try
-        {
-            await Task.Run(async () =>
-            {
-                token.ThrowIfCancellationRequested();
-                await _desktopCatalogStore.SaveAsync(state, token, saveItems: revision != _persistedCatalogRevision);
-                // The fallback is written only after a successful database transaction.
-                LocalCatalogStore.Save(state);
-                _persistedCatalogRevision = revision;
-            }, token);
-        }
+        try { await _desktopCatalogStore.SaveAsync(state, token, saveItems: false); }
         finally { _saveGate.Release(); }
     }
-
+    private async Task StopCatalogWritersAsync(bool stopDuplicates = true)
+    {
+        _scanCancellation?.Cancel(); _browseCancellation?.Cancel();
+        _metadataIndexCancellation?.Cancel(); _maintenanceCancellation?.Cancel();
+        _saveCancellation?.Cancel(); _infoCancellation?.Cancel();
+        if (stopDuplicates)
+        {
+            _duplicateCancellation?.Cancel();
+            try { await _duplicateWorkTask; } catch (OperationCanceledException) { }
+        }
+        try { await Task.WhenAll(_infoWorkTasks.ToArray()); } catch (Exception) { /* All readers have finished, including canceled or failed reads. */ }
+        await Task.WhenAll(_scanTask, _browseTask, _metadataTask, _maintenanceTask, _pendingSave);
+    }
     protected override async void OnClosing(CancelEventArgs e)
     {
         if (_closeReady) { base.OnClosing(e); return; }
         e.Cancel = true;
         if (_closing) return;
         _closing = true;
-        _saveCancellation?.Cancel();
-        _scanCancellation?.Cancel();
-        _browseCancellation?.Cancel();
-        _metadataIndexCancellation?.Cancel();
-        _duplicateCancellation?.Cancel();
+        IsEnabled = false;
+        var enabledOwnedWindows = OwnedWindows.Cast<Window>().Where(window => window.IsEnabled).ToArray();
+        foreach (var window in enabledOwnedWindows) window.IsEnabled = false;
+        _fileOperationCancellation?.Cancel(); _duplicateCancellation?.Cancel();
         try
         {
+            await StopCatalogWritersAsync();
+            if (_activeDuplicateReview is { } review) { review.StopOperation(); await review.PendingOperation; }
             await _fileOperationTask;
-            await _pendingSave;
-            if (_catalogLoaded && !_isCatalogLoading) await PersistStateAsync(CaptureState(), CancellationToken.None, _catalogRevision);
-            _closeReady = true;
-            Close();
+            if (_catalogLoaded) await PersistStateAsync(CaptureState(), CancellationToken.None, 0);
+            _closeReady = true; Close();
         }
         catch (Exception ex)
         {
             _closing = false;
-            System.Windows.MessageBox.Show($"Не удалось сохранить каталог: {ex.Message}\nОкно оставлено открытым.", "PhotoShelf");
+            IsEnabled = true;
+            foreach (var window in enabledOwnedWindows.Where(window => window.IsLoaded)) window.IsEnabled = true;
+            System.Windows.MessageBox.Show($"Не удалось завершить сохранение: {ex.Message}\nОкно оставлено открытым.", "PhotoShelf");
         }
     }
 }

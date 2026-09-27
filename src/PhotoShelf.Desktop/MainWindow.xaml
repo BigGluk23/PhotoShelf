@@ -2,14 +2,14 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:media="clr-namespace:PhotoShelf.Desktop"
-        Title="PhotoShelf"
+        Title="PhotoShelf Ultra"
         Width="1280"
         Height="800"
         MinWidth="920"
         MinHeight="600"
         WindowStartupLocation="CenterScreen"
         PreviewMouseWheel="OnPreviewMouseWheel"
-        Icon="Assets/PhotoShelf.ico"
+        Icon="pack://application:,,,/PhotoShelf;component/Assets/PhotoShelf.ico"
         StateChanged="OnWindowStateChanged"
         Loaded="OnMainWindowLoaded">
     <Window.Resources>
@@ -30,8 +30,8 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <Image Width="30" Height="30" Source="Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.8" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.1" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -45,6 +45,7 @@
                 </Border>
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
                     <Button x:Name="DuplicatesButton" Style="{StaticResource FlatActionButton}" Content="Дубликаты" Click="OnDuplicatesClicked" />
+                    <Button Style="{StaticResource FlatActionButton}" Content="Операции" Click="OnOperationsClicked" />
                     <Button Style="{StaticResource FlatActionButton}" Content="Настройки" Click="OnSettingsClicked" />
                 </StackPanel>
             </Grid>
@@ -88,7 +89,7 @@
                                   Background="Transparent"
                                   SelectedItemChanged="OnFolderTreeSelectedItemChanged"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
                             <TreeView.Resources>
                                 <HierarchicalDataTemplate DataType="{x:Type local:FolderNode}" ItemsSource="{Binding Children}" xmlns:local="clr-namespace:PhotoShelf.Desktop">
                                     <StackPanel Orientation="Horizontal" AllowDrop="True" DragOver="OnFolderDragOver" Drop="OnFolderDrop">
@@ -198,7 +199,7 @@
                                                     Background="{StaticResource BorderBrush}" />
                                         </DockPanel>
                                     </Border>
-                                    <ItemsControl ItemsSource="{Binding Items}"
+                                    <ItemsControl MinHeight="{Binding MinimumHeight}" ItemsSource="{Binding Items}"
                                                   Visibility="{Binding IsPhotoRow, Converter={StaticResource BoolToVisibility}}">
                                         <ItemsControl.ItemsPanel>
                                             <ItemsPanelTemplate>
@@ -237,7 +238,8 @@
                                                     <StackPanel>
                                                         <Border Height="{Binding DataContext.TileImageHeight, RelativeSource={RelativeSource AncestorType=Window}}" Background="#FFE5E2DC" ClipToBounds="True">
                                                             <Grid>
-                                                                <Image x:Name="TileImage" media:AsyncMediaImage.Path="{Binding Path}" Stretch="UniformToFill" />
+                                                                <media:PreviewImage x:Name="TileImage" media:AsyncMediaImage.Path="{Binding Path}" Stretch="UniformToFill" />
+                                                                <TextBlock Text="{Binding ElementName=TileImage, Path=Status}" TextWrapping="Wrap" FontSize="10" Background="#DDE5E2DC" VerticalAlignment="Bottom" />
                                                                 <TextBlock Text="{Binding KindLabel}"
                                                                            Foreground="{StaticResource MutedTextBrush}"
                                                                            FontWeight="SemiBold"

@@ -1,3 +1,5 @@
+> Актуальное реализованное состояние: [v0.10.0-validation.md](v0.10.0-validation.md). Desktop использует SqliteDesktopCatalogStore и CatalogViewQuery; полное подключение богатой доменной модели ниже остаётся планом. Часть оркестрации пока находится в MainWindow. Реальные контракты: [CATALOG.md](../src/PhotoShelf.Infrastructure.Sqlite/CATALOG.md), [SAFETY.md](../src/PhotoShelf.Application/Files/SAFETY.md).
+
 > Реализованное состояние v0.9.7 и оставшиеся ограничения описаны в [v0.9.7-validation.md](v0.9.7-validation.md). Ниже также присутствует целевая архитектура будущих этапов.
 
 # Архитектура PhotoShelf

@@ -5,8 +5,8 @@ namespace PhotoShelf.Application.Tests;
 
 public sealed class FileMoveTests : IDisposable
 {
-    private readonly string _root = Path.Combine(Path.GetTempPath(), "photoshelf-test-" + Guid.NewGuid().ToString("N"));
-    private readonly FileMoveService _service = new();
+    private readonly string _root = Path.Combine(OperatingSystem.IsMacOS() ? "/private/tmp" : Path.GetTempPath(), "photoshelf-test-" + Guid.NewGuid().ToString("N"));
+    private readonly FileMoveService _service = new(new FileMoveOptions { AlwaysCopy = true });
     public FileMoveTests() => Directory.CreateDirectory(_root);
     private string Write(string relative, string content = "original content")
     {
@@ -24,7 +24,7 @@ public sealed class FileMoveTests : IDisposable
             Assert.Single(Directory.GetFiles(Path.GetDirectoryName(source)!, "*.photoshelf-moving-*"));
             commits++; return Task.CompletedTask;
         }, null, CancellationToken.None);
-        Assert.True(Assert.Single(result).Moved); Assert.Equal(1, commits); Assert.False(File.Exists(source));
+        Assert.True(Assert.Single(result).Moved, result[0].Error); Assert.Equal(1, commits); Assert.False(File.Exists(source));
         Assert.Contains("completed", File.ReadAllText(Journal));
     }
     [Fact] public async Task NameAppearingAfterPreviewIsNeverOverwritten()

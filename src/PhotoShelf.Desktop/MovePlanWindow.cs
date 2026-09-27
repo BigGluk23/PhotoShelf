@@ -15,6 +15,11 @@ public sealed class MovePlanWindow : Window
     private readonly ComboBox _collision = new() { ItemsSource = new[] { "Совпадения: пропустить", "Совпадения: новое имя" }, SelectedIndex = 0, Margin = new Thickness(8) };
     private readonly Button _execute = new() { Content = "Выполнить перенос", Margin = new Thickness(8), Padding = new Thickness(12, 6, 12, 6) };
     private int _revision;
+    private CancellationTokenSource? _planning;
+    private readonly ComboBox _layout = new() { ItemsSource = new[] { "В выбранную папку", "Год", "Год / месяц", "Год / месяц / день" }, Margin = new Thickness(8), Width = 200 };
+    private readonly ComboBox _names = new() { ItemsSource = new[] { "Сохранить имена", "Дата съёмки + имя" }, SelectedIndex = 0, Margin = new Thickness(8), Width = 190 };
+    private readonly System.Windows.Controls.TextBox _event = new() { Margin = new Thickness(8), Width = 240, ToolTip = "Необязательная подпапка события. Например: Отпуск" };
+    private readonly TextBlock _summary = new() { Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap };
     public IReadOnlyList<MoveEntry> Plan { get; private set; } = Array.Empty<MoveEntry>();
     public MovePlanWindow(MoveRequest[] requests, string destination, bool byYear)
     {
@@ -22,29 +27,45 @@ public sealed class MovePlanWindow : Window
         Title = "Предварительный план переноса"; Width = 1050; Height = 650; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         var panel = new DockPanel(); Content = panel;
         var top = new StackPanel(); DockPanel.SetDock(top, Dock.Top); panel.Children.Add(top);
-        top.Children.Add(new TextBlock { Text = $"Папка: {destination}\nОригиналы перемещаются после проверки копии. Совпадения никогда не перезаписываются.", Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap });
+        top.Children.Add(new TextBlock { Text = $"Папка: {destination}\nВнутри тома — переименование, между томами — проверенная копия. Совпадения не перезаписываются. Связанные файлы показаны отдельными строками.", Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap });
         top.Children.Add(_collision);
+        var options = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+        _layout.SelectedIndex = byYear ? 2 : 0;
+        options.Children.Add(_layout); options.Children.Add(_names);
+        options.Children.Add(new TextBlock { Text = "Событие:", VerticalAlignment = VerticalAlignment.Center }); options.Children.Add(_event);
+        top.Children.Add(options); top.Children.Add(_summary);
         DockPanel.SetDock(_execute, Dock.Bottom); panel.Children.Add(_execute);
         _grid.Columns.Add(new DataGridTextColumn { Header = "Откуда", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.Source)), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         _grid.Columns.Add(new DataGridTextColumn { Header = "Куда", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.Destination)), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         _grid.Columns.Add(new DataGridTextColumn { Header = "Пропуск", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.SkipReason)), Width = 160 });
         panel.Children.Add(_grid);
         _collision.SelectionChanged += async (_, _) => await RefreshAsync();
+        _layout.SelectionChanged += async (_, _) => await RefreshAsync();
+        _names.SelectionChanged += async (_, _) => await RefreshAsync();
+        _event.TextChanged += async (_, _) => await RefreshAsync();
         Loaded += async (_, _) => await RefreshAsync();
+        Closed += (_, _) => { ++_revision; _planning?.Cancel(); };
         _execute.Click += (_, _) => { DialogResult = true; };
     }
     private async Task RefreshAsync()
     {
         var revision = ++_revision;
+        _planning?.Cancel();
+        using var operation = new CancellationTokenSource(); _planning = operation;
         _execute.IsEnabled = false;
         var collision = _collision.SelectedIndex == 0 ? CollisionPolicy.Skip : CollisionPolicy.Rename;
         try
         {
-            var plan = await Task.Run(() => new FileMoveService().Plan(_requests, _destination, collision, _byYear));
+            var layout = new MoveLayoutOptions((FolderLayout)Math.Max(0, _layout.SelectedIndex), (FileNameStyle)Math.Max(0, _names.SelectedIndex), _event.Text.Trim());
+            await Task.Delay(120, operation.Token);
+            var plan = await Task.Run(() => new FileMoveService().Plan(_requests, _destination, collision, _byYear, operation.Token, layout), operation.Token);
             if (revision != _revision) return;
             Plan = plan; _grid.ItemsSource = plan;
+            _summary.Text = $"К переносу: {plan.Count(x => x.SkipReason is null):N0} · Пропусков: {plan.Count(x => x.SkipReason is not null):N0} · {plan.Where(x => x.SkipReason is null).Sum(x => x.Length) / 1048576d:N1} МиБ";
             _execute.IsEnabled = plan.Any(x => x.SkipReason is null);
         }
-        catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Не удалось подготовить перенос"); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (revision == _revision) _summary.Text = $"План недоступен: {ex.Message}"; }
+        finally { if (ReferenceEquals(_planning, operation)) _planning = null; }
     }
 }

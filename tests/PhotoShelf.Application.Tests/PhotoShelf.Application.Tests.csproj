@@ -5,5 +5,12 @@
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2"><PrivateAssets>all</PrivateAssets></PackageReference>
     <ProjectReference Include="../../src/PhotoShelf.Application/PhotoShelf.Application.csproj" />
+    <ProjectReference Include="../PhotoShelf.CrashProbe/PhotoShelf.CrashProbe.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+  <Target Name="CopyCrashProbe" AfterTargets="Build">
+    <ItemGroup>
+      <CrashProbeFiles Include="$(MSBuildProjectDirectory)/../PhotoShelf.CrashProbe/bin/$(Configuration)/$(TargetFramework)/*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CrashProbeFiles)" DestinationFolder="$(TargetDir)CrashProbe" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

@@ -12,9 +12,6 @@ namespace PhotoShelf.Desktop;
 
 public sealed class PhotoItem : INotifyPropertyChanged
 {
-    private static readonly SemaphoreSlim ThumbnailGate = new(2, 2);
-    private ImageSource? _thumbnail;
-    private bool _thumbnailLoadStarted;
     private bool _isSelected;
     private bool _isFavorite;
     private string? _metadataText;
@@ -42,6 +39,8 @@ public sealed class PhotoItem : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public string Path { get; }
+
+    public long ViewIndex { get; set; } = -1;
 
     public string FileName { get; }
 
@@ -95,20 +94,6 @@ public sealed class PhotoItem : INotifyPropertyChanged
     public bool IsCaptureDateLoaded { get; private set; }
 
     public string Folder => System.IO.Path.GetDirectoryName(Path) ?? string.Empty;
-
-    public ImageSource? Thumbnail
-    {
-        get
-        {
-            EnsureThumbnailLoading();
-            return _thumbnail;
-        }
-        private set
-        {
-            _thumbnail = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail)));
-        }
-    }
 
     public string DetailLine
     {
@@ -228,64 +213,6 @@ public sealed class PhotoItem : INotifyPropertyChanged
             || extension.Equals(".rmvb", StringComparison.OrdinalIgnoreCase)
             || extension.Equals(".hevc", StringComparison.OrdinalIgnoreCase)
             || extension.Equals(".prores", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void EnsureThumbnailLoading()
-    {
-        if (_thumbnailLoadStarted)
-        {
-            return;
-        }
-
-        _thumbnailLoadStarted = true;
-        var dispatcher = System.Windows.Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
-        _ = Task.Run(async () =>
-        {
-            await ThumbnailGate.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                var image = IsVideo
-                    ? ThumbnailCache.LoadOrCreate(Path, 180, static (path, width) => VideoThumbnailProvider.TryLoad(path, width))
-                    : IsAnimatedGifPath(Path)
-                        ? LoadThumbnail(Path, 180)
-                    : ThumbnailCache.LoadOrCreate(Path, 180, LoadThumbnail);
-                _ = dispatcher.BeginInvoke(() => Thumbnail = image, DispatcherPriority.Background);
-            }
-            finally
-            {
-                ThumbnailGate.Release();
-            }
-        });
-    }
-
-    private static ImageSource? LoadThumbnail(string path, int decodeWidth)
-    {
-        if (IsWebpPath(path))
-        {
-            return ImageSharpBitmapLoader.TryLoad(path, decodeWidth);
-        }
-
-        try
-        {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-            bitmap.DecodePixelWidth = decodeWidth;
-            bitmap.UriSource = new Uri(path, UriKind.Absolute);
-            bitmap.EndInit();
-            bitmap.Freeze();
-            return bitmap;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    public static bool IsWebpPath(string path)
-    {
-        return System.IO.Path.GetExtension(path).Equals(".webp", StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsAnimatedGifPath(string path)

@@ -2,14 +2,14 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:PhotoShelf.Desktop"
-        Title="PhotoShelf Viewer"
+        Title="PhotoShelf Ultra Viewer"
         Width="1160"
         Height="800"
         MinWidth="760"
         MinHeight="520"
         WindowStartupLocation="CenterOwner"
         Background="#FF151619"
-        Icon="Assets/PhotoShelf.ico"
+        Icon="pack://application:,,,/PhotoShelf;component/Assets/PhotoShelf.ico"
         KeyDown="OnKeyDown">
     <Grid>
         <Grid.RowDefinitions>
@@ -45,10 +45,11 @@
         </Border>
 
         <Grid Grid.Row="1" Background="#FF111214">
-            <Image x:Name="PhotoImage"
+            <local:PreviewImage x:Name="PhotoImage"
                    Stretch="Uniform"
                    SnapsToDevicePixels="True" />
 
+            <TextBlock Text="{Binding ElementName=PhotoImage, Path=Status}" Foreground="White" Background="#BB202126" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="8" Padding="8" />
             <MediaElement x:Name="VideoPlayer"
                           LoadedBehavior="Manual"
                           UnloadedBehavior="Stop"

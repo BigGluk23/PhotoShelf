@@ -24,7 +24,7 @@ public static class VideoThumbnailProvider
             try
             {
                 var thumbnailSize = new NativeSize(size, size);
-                factory.GetImage(thumbnailSize, ShellImageFlags.ThumbnailOnly | ShellImageFlags.BiggerSizeOk, out var bitmapHandle);
+                factory.GetImage(thumbnailSize, ShellImageFlags.ThumbnailOnly, out var bitmapHandle);
                 if (bitmapHandle == IntPtr.Zero)
                 {
                     return null;

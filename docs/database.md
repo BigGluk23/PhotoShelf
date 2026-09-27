@@ -1,3 +1,5 @@
+> В v0.10.0 рабочий Desktop использует таблицы desktop_media_items, счётчики размеров и квитанции перемещения, реализованные SqliteDesktopCatalogStore. См. [CATALOG.md](../src/PhotoShelf.Infrastructure.Sqlite/CATALOG.md). Описанная ниже схема 001_initial.sql — сохранённая доменная основа для следующих этапов, не второй активный каталог Desktop.
+
 # SQLite-каталог
 
 Источник истины схемы: `src/PhotoShelf.Infrastructure.Sqlite/Migrations/001_initial.sql`.

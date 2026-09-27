@@ -1,92 +1,76 @@
 using System.IO;
-using System.Security.Cryptography;
-using System.Text;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using PhotoShelf.Application.Background;
 
 namespace PhotoShelf.Desktop;
 
 public static class ThumbnailCache
 {
-    private const string CacheVersion = "thumb-v1";
+    private static readonly OwnedThumbnailCache Store = new(Path.Combine(LocalCatalogStore.CatalogDirectory, "thumb-cache-v2"), 512L * 1024 * 1024);
+    private static long _lastTrimTicks;
+    private static int _trimScheduled;
 
+    // All callers run in background workers. This cache exclusively owns generated ps-thumb-v2-* entries.
     public static ImageSource? LoadOrCreate(string path, int decodeWidth, Func<string, int, ImageSource?> factory)
     {
+        ScheduleTrim();
+        string? key = null;
         try
         {
-            var sourceFile = new FileInfo(path);
-            if (!sourceFile.Exists)
+            var source = new FileInfo(path);
+            if (!source.Exists) return null;
+            key = Store.GetKey(source.FullName, source.Length, source.LastWriteTimeUtc.Ticks, decodeWidth);
+            if (Store.TryGetPath(key) is { } cachedPath && LoadBitmap(cachedPath, decodeWidth) is { } cached)
             {
-                return null;
+                ScheduleTrim();
+                return cached;
             }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException) { }
 
-            Directory.CreateDirectory(CacheDirectory);
-            var cachePath = GetCachePath(sourceFile, decodeWidth);
-            if (File.Exists(cachePath))
+        // Decode once: a failed cache write must never trigger a second decode.
+        var image = factory(path, decodeWidth);
+        if (image is BitmapSource bitmap && key is not null)
+        {
+            try
             {
-                var cached = LoadBitmap(cachePath, decodeWidth);
-                if (cached is not null)
+                Store.Write(key, stream =>
                 {
-                    return cached;
-                }
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                    encoder.Save(stream);
+                });
             }
-
-            var image = factory(path, decodeWidth);
-            if (image is BitmapSource bitmapSource)
-            {
-                SavePng(cachePath, bitmapSource);
-            }
-
-            return image;
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
         }
-        catch
-        {
-            return factory(path, decodeWidth);
-        }
+        ScheduleTrim();
+        return image;
     }
 
-    private static string CacheDirectory =>
-        Path.Combine(LocalCatalogStore.CatalogDirectory, "thumb-cache");
-
-    private static string GetCachePath(FileInfo file, int decodeWidth)
-    {
-        var stamp = $"{CacheVersion}|{decodeWidth}|{file.FullName}|{file.Length}|{file.LastWriteTimeUtc.Ticks}";
-        var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(stamp));
-        var hash = Convert.ToHexString(hashBytes).ToLowerInvariant();
-        return Path.Combine(CacheDirectory, $"{hash}.png");
-    }
-
-    private static BitmapImage? LoadBitmap(string path, int decodeWidth)
+    private static BitmapSource? LoadBitmap(string path, int decodeWidth)
     {
         try
         {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.DecodePixelWidth = decodeWidth;
-            bitmap.UriSource = new Uri(path, UriKind.Absolute);
-            bitmap.EndInit();
-            bitmap.Freeze();
-            return bitmap;
+            return ImageSharpBitmapLoader.LoadWicBounded(path, decodeWidth);
         }
-        catch
-        {
-            return null;
-        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException or FileFormatException) { return null; }
     }
 
-    private static void SavePng(string path, BitmapSource bitmap)
+    private static void ScheduleTrim()
+    {
+        var now = DateTime.UtcNow.Ticks;
+        if (now - Interlocked.Read(ref _lastTrimTicks) < TimeSpan.FromSeconds(30).Ticks || Interlocked.CompareExchange(ref _trimScheduled, 1, 0) != 0) return;
+        _ = TrimAsync();
+    }
+    private static async Task TrimAsync()
     {
         try
         {
-            var encoder = new PngBitmapEncoder();
-            encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            using var stream = File.Create(path);
-            encoder.Save(stream);
+            await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Maintenance, token => Store.Trim(token, reserveBytes: 64L * 1024 * 1024)).ConfigureAwait(false);
+            Interlocked.Exchange(ref _lastTrimTicks, DateTime.UtcNow.Ticks);
         }
-        catch
-        {
-            // Кэш ускоряет работу, но не должен мешать просмотру.
-        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or OperationCanceledException) { }
+        finally { Volatile.Write(ref _trimScheduled, 0); }
     }
 }

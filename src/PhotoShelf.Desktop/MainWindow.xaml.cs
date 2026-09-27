@@ -1,4 +1,7 @@
 using System.Collections.ObjectModel;
+using System.Collections;
+using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Background;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
@@ -16,11 +19,8 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "v0.9.8";
+    private const string VersionLabel = "Ultra v0.10.1";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, PhotoItem> _itemsByPath = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _knownPhotoPaths = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, SavedDuplicateHash> _duplicateHashCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
     private readonly SqliteDesktopCatalogStore _desktopCatalogStore = new();
@@ -55,13 +55,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         AppTitleText.Text = $"PhotoShelf {VersionLabel}";
         DataContext = this;
         _catalogState = initialState;
-        foreach (var hash in _catalogState.DuplicateHashes)
-        {
-            if (!string.IsNullOrWhiteSpace(hash.Path) && !string.IsNullOrWhiteSpace(hash.Hash))
-            {
-                _duplicateHashCache[hash.Path] = hash;
-            }
-        }
         TileWidth = Math.Clamp(_catalogState.TileWidth, 72, 260);
         ThumbnailSizeSlider.Value = TileWidth;
         ShowVideos = _catalogState.ShowVideos;
@@ -85,7 +78,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Interval = TimeSpan.FromMilliseconds(250)
         };
         _folderFilterRefreshTimer.Tick += OnFolderFilterRefreshTimerTick;
-        foreach (var root in DriveInfo.GetDrives()) AddFolder(root.Name);
+
         if (_activeFolder is not null) AddFolder(_activeFolder);
         foreach (var path in _catalogState.ExpandedFolders) AddFolder(path);
         ViewTitleText.Text = _viewMode == LibraryViewMode.Folder ? _activeFolder : _viewMode switch
@@ -94,9 +87,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public ObservableCollection<PhotoItem> Photos { get; } = new();
-
-    public ObservableCollection<PhotoRow> PhotoRows { get; } = new();
+    public IList PhotoRows { get; private set; } = Array.Empty<PhotoRow>();
 
     public ObservableCollection<FolderNode> FolderRoots { get; } = new();
 
@@ -204,6 +195,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void OnMainWindowLoaded(object sender, RoutedEventArgs e)
     {
         _isInitializing = false;
+        PerformanceMetrics.Start(Dispatcher);
         StartSavedCatalogLoading();
     }
 
@@ -413,40 +405,44 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateInfoPanel();
     }
 
-    private void OnPhotoTileMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    private async void OnPhotoTileMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: PhotoItem item })
-        {
-            return;
-        }
-
+        if (sender is not FrameworkElement { DataContext: PhotoItem item }) return;
+        if (_isProjecting || _fileOperationActive) { StatusText.Text = _fileOperationActive ? "Выполняется безопасный перенос…" : "Обновляю порядок файлов…"; return; }
         _dragStart = e.GetPosition(this);
-        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && _selectedPhoto is not null)
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && _selectedPhoto is not null && _currentQuery is not null)
         {
-            var start = Array.IndexOf(_visiblePhotos, _selectedPhoto);
-            var end = Array.IndexOf(_visiblePhotos, item);
-            if (start >= 0 && end >= 0) foreach (var selected in _visiblePhotos.Skip(Math.Min(start, end)).Take(Math.Abs(end - start) + 1))
-            { _selection.Add(selected); selected.IsSelected = true; }
+            var start = Math.Min(_selectedPhoto.ViewIndex, item.ViewIndex);
+            var count = Math.Abs(_selectedPhoto.ViewIndex - item.ViewIndex) + 1;
+            var query = _currentQuery;
+            try
+            {
+                for (long offset = 0; offset < count; offset += 256)
+                {
+                    var page = await _desktopCatalogStore.QueryPageAsync(query, checked((int)(start + offset)), (int)Math.Min(256, count - offset), token: _lifetime.Token);
+                    if (!ReferenceEquals(query, _currentQuery)) break;
+                    for (var i = 0; i < page.Items.Count; i++) { var selected = CreateVisibleItem(page.Items[i], start + offset + i); selected.IsSelected = true; _selection.Add(selected); }
+                    await Dispatcher.Yield(DispatcherPriority.Background);
+                }
+                RefreshLoadedSelection();
+            }
+            catch (Exception ex) { StatusText.Text = $"Выделение: {ex.Message}"; }
         }
         else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0)
         {
-            if (!_selection.Add(item)) _selection.Remove(item);
-            item.IsSelected = _selection.Contains(item);
+            var selected = _selection.Find(item.Path);
+            if (selected is null) _selection.Add(item); else { _selection.Remove(selected); selected.IsSelected = false; }
+            item.IsSelected = selected is null;
         }
         else if (!_selection.Contains(item))
         {
             foreach (var selected in _selection) selected.IsSelected = false;
-            _selection.Clear(); _selection.Add(item); item.IsSelected = true;
+            _selection.Clear(); _selection.Add(item); item.IsSelected = true; RefreshLoadedSelection();
         }
-        _selectedPhoto = item;
-        SelectedText.Text = $"Выбрано: {_selection.Count}";
-        UpdateInfoPanel();
-
-        if (e.ClickCount == 2)
-        {
-            OpenViewer(item);
-        }
+        _selectedPhoto = item; SelectedText.Text = $"Выбрано: {_selection.Count:N0}"; UpdateInfoPanel();
+        if (e.ClickCount == 2) OpenViewer(item);
     }
+
 
     private void OnDateHeaderMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -469,16 +465,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         e.Handled = true;
     }
 
-    private void OpenViewer(PhotoItem selected)
+    private async void OpenViewer(PhotoItem selected)
     {
-        var visibleItems = _visiblePhotos;
-        var index = Array.IndexOf(visibleItems, selected);
-        var viewer = new PhotoViewerWindow(visibleItems, Math.Max(0, index))
+        if (_fileOperationActive || _isProjecting || _currentQuery is null || PhotoRows is not VirtualPhotoRows rows || rows.ItemCount == 0) return;
+        var query = _currentQuery;
+        try
         {
-            Owner = this
-        };
-        viewer.Show();
+            var index = await _desktopCatalogStore.IndexOfAsync(query, selected.Path, _lifetime.Token);
+            if (index is null || !ReferenceEquals(query, _currentQuery)) return;
+            var viewer = new PhotoViewerWindow(_desktopCatalogStore, query, rows.ItemCount, index.Value, selected.Path) { Owner = this };
+            viewer.Show();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { StatusText.Text = $"Просмотр: {ex.Message}"; }
     }
+
 
     private void OnPhotoContextOpenClicked(object sender, RoutedEventArgs e)
     {
@@ -565,75 +566,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await FindExactDuplicatesAsync(DuplicateSearchScope.CurrentFolder);
     }
 
-    private async Task ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
+    private Task ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
     {
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return Task.CompletedTask;
         _scanCancellation?.Cancel();
-        using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var previous = _scanTask;
         _scanCancellation = operation;
-        var token = operation.Token;
-        SetScanning(true);
-        var rootList = roots.ToArray();
-        foreach (var root in rootList) AddFolder(root);
-        if (changeView)
-        {
-            _activeFolder = null;
-            _viewMode = LibraryViewMode.All;
-            ViewTitleText.Text = "Все фотографии";
-            RebuildRows();
-        }
-        var includeSystem = _includeSystemFolders;
-        var excluded = _excludedFolders.ToArray();
+        return _scanTask = RunScanAsync(roots.ToArray(), changeView, operation, previous);
+    }
+    private async Task RunScanAsync(string[] roots, bool changeView, CancellationTokenSource operation, Task previous)
+    {
         try
         {
-            await PhotoScanner.ScanAsync(rootList, async batch =>
-            {
-                token.ThrowIfCancellationRequested();
-                var items = batch.Paths.Select(path => new PhotoItem(path)).ToArray();
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    if (token.IsCancellationRequested) return;
-                    ApplyItems(items);
-                    StatusText.Text = $"Сканирую: {batch.CurrentFolder} · {Photos.Count}";
-                }, DispatcherPriority.Background, token);
-            }, includeSystem, token, excluded);
-            RebuildRows();
-            SaveCatalogState();
-            StartMetadataIndexing(resetExisting: false);
+            await previous;
+            var token = operation.Token; token.ThrowIfCancellationRequested();
+            SetScanning(true);
+            foreach (var root in roots) AddFolder(root);
+            if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
+            await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token, _excludedFolders.ToArray());
+            await RefreshCatalogCountAsync(); QueueProjectionRefresh(); SaveCatalogState(); StartMetadataIndexing(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Ошибка сканирования: {ex.Message}"; }
-        finally
-        {
-            if (ReferenceEquals(_scanCancellation, operation))
-            {
-                _scanCancellation = null;
-                SetScanning(false);
-            }
-        }
+        finally { if (ReferenceEquals(_scanCancellation, operation)) { _scanCancellation = null; SetScanning(false); } operation.Dispose(); }
     }
 
-    private void ApplyItems(IReadOnlyList<PhotoItem> items)
+
+    private void RefreshLoadedSelection()
     {
-        foreach (var item in items)
-        {
-            if (!_knownPhotoPaths.Add(item.Path))
-            {
-                if (!_itemsByPath.TryGetValue(item.Path, out var old) || (old.FileSizeBytes == item.FileSizeBytes && old.FileModifiedAt == item.FileModifiedAt)) continue;
-                item.IsFavorite = old.IsFavorite;
-                var index = Photos.IndexOf(old);
-                if (index >= 0) Photos[index] = item;
-                _itemsByPath[item.Path] = item;
-                _duplicateHashCache.Remove(item.Path);
-                _catalogRevision++;
-                continue;
-            }
-            _itemsByPath[item.Path] = item;
-            Photos.Add(item);
-            _catalogRevision++;
-            AddFolder(item.Folder, incrementDirectCount: true);
-        }
-        QueueProjectionRefresh();
+        if (PhotoRows is not VirtualPhotoRows rows) return;
+        foreach (var item in rows.LoadedItems)
+            item.IsSelected = _selection.Contains(item);
     }
+
 
     private void OnPhotoGridSizeChanged(object sender, SizeChangedEventArgs e)
     {
@@ -675,22 +641,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         e.Handled = true;
     }
 
-    private void OnFavoriteActionClicked(object sender, RoutedEventArgs e)
+    private async void OnFavoriteActionClicked(object sender, RoutedEventArgs e)
     {
-        if (_selectedPhoto is null)
+        var item = _selectedPhoto;
+        if (item is null || _fileOperationActive) return;
+        var favorite = !item.IsFavorite;
+        item.IsFavorite = favorite;
+        try
         {
-            return;
+            await _desktopCatalogStore.SetFavoriteAsync(item.Path, favorite, _lifetime.Token);
+            if (_viewMode == LibraryViewMode.Favorites) RebuildRows();
         }
-
-        _selectedPhoto.IsFavorite = !_selectedPhoto.IsFavorite;
-        _catalogRevision++;
-        if (_viewMode == LibraryViewMode.Favorites && !_selectedPhoto.IsFavorite)
-        {
-            RebuildRows();
-        }
-
-        SaveCatalogState();
+        catch (Exception ex) { item.IsFavorite = !favorite; StatusText.Text = $"Избранное не сохранено: {ex.Message}"; }
     }
+
 
     private void OnOpenFolderClicked(object sender, RoutedEventArgs e)
     {
@@ -715,6 +679,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     protected override void OnClosed(EventArgs e)
     {
         _lifetime.Cancel();
+        (PhotoRows as VirtualPhotoRows)?.Dispose();
+        PerformanceMetrics.Stop();
         _scanCancellation?.Cancel();
         _duplicateCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel();
@@ -725,11 +691,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private Forms.NotifyIcon CreateTrayIcon()
     {
-        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "PhotoShelf.ico");
         var trayIcon = new Forms.NotifyIcon
         {
-            Text = "PhotoShelf",
-            Icon = File.Exists(iconPath) ? new Drawing.Icon(iconPath) : Drawing.SystemIcons.Application,
+            Text = $"PhotoShelf {VersionLabel}",
+            Icon = AppResources.CreateTrayIcon(),
             Visible = true,
             ContextMenuStrip = new Forms.ContextMenuStrip()
         };
@@ -806,13 +771,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var collection = parent?.Children ?? FolderRoots;
         if (collection.Count == 1 && collection[0].IsPlaceholder) collection.Clear();
-        var insertIndex = 0;
-        while (insertIndex < collection.Count &&
-               string.Compare(collection[insertIndex].Name, node.Name, StringComparison.CurrentCultureIgnoreCase) <= 0)
+        var low = 0; var high = collection.Count;
+        while (low < high)
         {
-            insertIndex++;
+            var middle = low + (high - low) / 2;
+            if (string.Compare(collection[middle].Name, node.Name, StringComparison.CurrentCultureIgnoreCase) <= 0) low = middle + 1;
+            else high = middle;
         }
-
+        var insertIndex = low;
         collection.Insert(insertIndex, node);
         return node;
     }
@@ -824,9 +790,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var includeSystem = _includeSystemFolders;
         try
         {
-            var directories = await Task.Run(() => Directory.EnumerateDirectories(parent.FullPath)
-                .Where(directory => !ShouldHideFolderInTree(directory, includeSystem))
-                .Order(StringComparer.CurrentCultureIgnoreCase).ToArray(), _lifetime.Token);
+            var cached = _catalogLoaded ? await _desktopCatalogStore.GetImmediateFoldersAsync(parent.FullPath, _lifetime.Token) : Array.Empty<string>();
+            var directories = await Task.Run(() =>
+            {
+                var children = new HashSet<string>(cached, StringComparer.OrdinalIgnoreCase);
+                try { foreach (var directory in Directory.EnumerateDirectories(parent.FullPath)) children.Add(directory); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                return children.Where(directory => !ShouldHideFolderInTree(directory, includeSystem)).Order(StringComparer.CurrentCultureIgnoreCase).ToArray();
+            }, _lifetime.Token);
             if (_lifetime.IsCancellationRequested) return;
             if (parent.Children.Count == 1 && parent.Children[0].IsPlaceholder) parent.Children.Clear();
             foreach (var batch in directories.Chunk(32))
@@ -862,7 +833,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         catch
         {
-            return true;
+            return false;
         }
     }
 
@@ -874,18 +845,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void RefreshChrome()
     {
         EmptyState.Visibility = !_isProjecting && !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        if (!_isProjecting && !_isCatalogLoading) StatusText.Text = FormatPhotoCount(Photos.Count);
-        OnPropertyChanged(nameof(Photos));
-        OnPropertyChanged(nameof(PhotoRows));
-        OnPropertyChanged(nameof(FolderRoots));
+        if (!_isProjecting && !_isCatalogLoading) StatusText.Text = $"В виде: {(PhotoRows as VirtualPhotoRows)?.ItemCount ?? 0:N0} · Каталог: {_catalogCount:N0}";
     }
+
 
     private void OnPropertyChanged(string propertyName)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
-    private IEnumerable<PhotoItem> GetVisiblePhotos() => _visiblePhotos;
+
 
     private bool IsFolderIncluded(string folder) => !_excludedFolders.Any(excluded => IsUnderFolder(folder, excluded));
 
@@ -925,123 +894,81 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void StartMetadataIndexing(bool resetExisting)
     {
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return;
         _metadataIndexCancellation?.Cancel();
-        _metadataIndexCancellation = new CancellationTokenSource();
-        var token = _metadataIndexCancellation.Token;
-
-        var items = Photos
-            .Where(item => !item.IsVideo)
-            .Where(item => resetExisting || !item.IsCaptureDateLoaded)
-            .ToArray();
-
-        if (items.Length == 0)
-        {
-            MetadataStatusText.Text = "Метаданные: готово";
-            return;
-        }
-
-        MetadataStatusText.Text = $"Метаданные: 0 / {items.Length}";
-        _ = RunMetadataWorkerAsync(items, token);
+        var previous = _metadataTask;
+        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _metadataIndexCancellation = operation;
+        _metadataTask = RunMetadataWorkerAsync(resetExisting, operation, previous);
     }
 
-    private async Task RunMetadataWorkerAsync(PhotoItem[] items, CancellationToken token)
+
+    private async Task RunMetadataWorkerAsync(bool resetExisting, CancellationTokenSource operation, Task previous)
     {
-        try { await Task.Run(async () =>
+        try
         {
-            var indexed = 0;
-            var changedSinceUiRefresh = 0;
-            foreach (var item in items)
+            await previous;
+            var token = operation.Token; token.ThrowIfCancellationRequested();
+            MetadataStatusText.Text = "Индексирую метаданные…";
+            await Task.Run(async () =>
             {
-                if (token.IsCancellationRequested)
+                var indexed = 0;
+                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true }, token))
                 {
-                    break;
-                }
-
-                var captureDate = PhotoItem.ReadCaptureDate(item.Path);
-                var changed = item.CaptureDate != captureDate;
-                await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) item.ApplyIndexedCaptureDate(captureDate); }, DispatcherPriority.Background, token);
-                try
-                {
-                    await _metadataIndexStore.SaveAsync(item.Path, item.FileSizeBytes, item.FileModifiedAt, item.CaptureDate, token).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Индексация не должна ломать просмотр.
-                }
-
-                indexed++;
-                if (changed)
-                {
-                    changedSinceUiRefresh++;
-                }
-
-                if (indexed % 250 == 0 || indexed == items.Length)
-                {
-                    var current = indexed;
-                    var shouldRebuild = _dateGroupingMode == DateGroupingMode.CaptureDate && changedSinceUiRefresh > 0;
-                    changedSinceUiRefresh = 0;
-                    await Dispatcher.BeginInvoke(() =>
+                    if (item.IsVideo || (!resetExisting && item.MetadataIndexed)) continue;
+                    var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
+                        _ => ToSavedItem(item.Path), token);
+                    if (fresh is null) continue; // Disconnected media stays in the catalog.
+                    var date = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
+                        _ => PhotoItem.ReadCaptureDate(item.Path), token);
+                    await _desktopCatalogStore.UpdateCaptureDateAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, date, token);
+                    if (++indexed % 128 == 0)
                     {
-                        if (token.IsCancellationRequested) return;
-                        MetadataStatusText.Text = $"Метаданные: {current} / {items.Length}";
-                        if (shouldRebuild)
+                        var count = indexed;
+                        await Dispatcher.InvokeAsync(() =>
                         {
-                            QueueProjectionRefresh();
-                        }
-
-                        UpdateInfoPanel();
-                    });
-                }
-            }
-
-            if (!token.IsCancellationRequested)
-            {
-                await Dispatcher.BeginInvoke(() =>
-                {
-                    if (token.IsCancellationRequested) return;
-                    MetadataStatusText.Text = "Метаданные: готово";
-                    if (_dateGroupingMode == DateGroupingMode.CaptureDate)
-                    {
-                        RebuildRows();
-                        RefreshChrome();
+                            if (token.IsCancellationRequested) return;
+                            MetadataStatusText.Text = $"Метаданные: {count:N0}";
+                            if (_dateGroupingMode == DateGroupingMode.CaptureDate) QueueProjectionRefresh();
+                        }, DispatcherPriority.Background, token);
                     }
-                });
-            }
-        }, token); }
+                }
+            }, token);
+            if (!token.IsCancellationRequested) { MetadataStatusText.Text = "Метаданные: готово"; QueueProjectionRefresh(); }
+        }
         catch (OperationCanceledException) { }
         catch (Exception ex) { MetadataStatusText.Text = $"Метаданные: {ex.Message}"; }
+        finally { if (ReferenceEquals(_metadataIndexCancellation, operation)) _metadataIndexCancellation = null; operation.Dispose(); }
     }
+
 
     private async Task LoadSavedCatalogAsync()
     {
-        await Task.Run(async () =>
+        await _desktopCatalogStore.InitializeAsync(_lifetime.Token);
+        await _metadataIndexStore.InitializeAsync(_lifetime.Token);
+        await _duplicateHashStore.InitializeAsync(_lifetime.Token);
+        if (!_catalogState.ReadItemsFromSqlite && _catalogState.Items.Count > 0)
         {
-            await _desktopCatalogStore.InitializeAsync();
-            await _metadataIndexStore.InitializeAsync();
-            await _duplicateHashStore.InitializeAsync();
-            var dates = await _metadataIndexStore.LoadCaptureDatesAsync(_lifetime.Token);
-            var hashes = await _duplicateHashStore.LoadAsync(_lifetime.Token);
-            await Dispatcher.InvokeAsync(() => { foreach (var hash in hashes) _duplicateHashCache[hash.Path] = hash; });
-            async Task ApplyBatch(IReadOnlyList<SavedMediaItem> saved)
+            foreach (var batch in _catalogState.Items.Chunk(128))
             {
-                _lifetime.Token.ThrowIfCancellationRequested();
-                var items = saved.Where(x => !string.IsNullOrWhiteSpace(x.Path) && PhotoItem.IsSupported(x.Path))
-                    .Select(x =>
-                    {
-                        var item = _catalogState.ReadItemsFromSqlite ? new PhotoItem(x.Path, x.SizeBytes, x.FileModifiedAt) : new PhotoItem(x.Path);
-                        item.IsFavorite = x.IsFavorite;
-                        if (dates.TryGetValue(x.Path, out var cached) && cached.Size == item.FileSizeBytes && cached.ModifiedTicks == (item.FileModifiedAt?.ToUniversalTime().Ticks ?? 0))
-                            item.ApplyIndexedCaptureDate(cached.CaptureDate);
-                        return item;
-                    }).ToArray();
-                await Dispatcher.InvokeAsync(() => ApplyItems(items), DispatcherPriority.Background, _lifetime.Token);
+                var restored = await Task.Run(() => batch.Select(saved =>
+                {
+                    var current = ToSavedItem(saved.Path) ?? saved; current.IsFavorite = saved.IsFavorite; return current;
+                }).ToArray(), _lifetime.Token);
+                await _desktopCatalogStore.UpsertItemsAsync(restored, preserveFavorites: false, _lifetime.Token);
             }
-            if (_catalogState.ReadItemsFromSqlite) await _desktopCatalogStore.ReadBatchesAsync(ApplyBatch, _lifetime.Token);
-            else foreach (var batch in _catalogState.Items.Chunk(128)) await ApplyBatch(batch);
-        }, _lifetime.Token);
+            _catalogState.Items.Clear();
+        }
+        await CheckPendingOperationsAsync();
         _catalogLoaded = true;
-        RebuildRows();
+        await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
+        var roots = await Task.Run(() => DriveInfo.GetDrives().Select(x => x.Name).ToArray(), _lifetime.Token);
+        foreach (var root in roots) AddFolder(root);
+        await RefreshCatalogCountAsync();
+        await RebuildRowsAsync();
+        await CheckPendingOperationsAsync();
     }
+
 
     private void StartSavedCatalogLoading()
     {
@@ -1061,7 +988,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadSavedCatalogAsync();
             StartBackgroundCatalogMaintenance();
-            StartMetadataIndexing(resetExisting: false);
+            if (!_hasPendingRecovery) StartMetadataIndexing(resetExisting: false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Не удалось загрузить каталог: {ex.Message}"; }
@@ -1074,43 +1001,41 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private async void StartBackgroundCatalogMaintenance()
+    private void StartBackgroundCatalogMaintenance()
     {
-        var snapshot = Photos.ToArray();
+        if (_fileOperationActive || _hasPendingRecovery || _closing) return;
+        _maintenanceCancellation?.Cancel();
+        var previous = _maintenanceTask;
+        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _maintenanceCancellation = operation;
+        _maintenanceTask = MaintainCatalogAsync(operation, previous);
+    }
+    private async Task MaintainCatalogAsync(CancellationTokenSource operation, Task previous)
+    {
         try
         {
-            await Task.Run(async () =>
+            await previous;
+            var token = operation.Token;
+            var changed = new List<SavedMediaItem>(128);
+            await foreach (var old in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true }, token))
             {
-                foreach (var batch in snapshot.Chunk(128))
-                {
-                    _lifetime.Token.ThrowIfCancellationRequested();
-                    var changed = new List<PhotoItem>();
-                    foreach (var old in batch)
-                    {
-                        try
-                        {
-                            var file = new FileInfo(old.Path);
-                            if (file.Exists && (file.Length != old.FileSizeBytes || file.LastWriteTime != old.FileModifiedAt))
-                                changed.Add(new PhotoItem(old.Path, file.Length, file.LastWriteTime));
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-                    }
-                    if (changed.Count > 0) await Dispatcher.InvokeAsync(() =>
-                    {
-                        // A file operation may have removed a path since this snapshot.
-                        if (!_fileOperationActive) ApplyItems(changed.Where(x => _knownPhotoPaths.Contains(x.Path)).ToArray());
-                    }, DispatcherPriority.Background, _lifetime.Token);
-                }
-            }, _lifetime.Token);
-            if (!_fileOperationActive) { StartMetadataIndexing(false); SaveCatalogState(); }
+                var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ => ToSavedItem(old.Path), token);
+                if (fresh is not null && (fresh.SizeBytes != old.SizeBytes || fresh.FileModifiedAt != old.FileModifiedAt || fresh.IsHiddenOrSystem != old.IsHiddenOrSystem)) changed.Add(fresh);
+                if (changed.Count < 128) continue;
+                await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); changed.Clear();
+            }
+            if (changed.Count > 0) await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token);
+            QueueProjectionRefresh();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Проверка каталога: {ex.Message}"; }
+        finally { if (ReferenceEquals(_maintenanceCancellation, operation)) _maintenanceCancellation = null; operation.Dispose(); }
     }
+
 
     private void SaveCatalogState()
     {
-        if (_fileOperationActive || _isInitializing || !_catalogLoaded || _isCatalogLoading) return;
+        if (_fileOperationActive || _isInitializing || !_catalogLoaded || _isCatalogLoading || _closing) return;
         _saveCancellation?.Cancel();
         _saveCancellation = new CancellationTokenSource();
         _pendingSave = SaveAfterDelayAsync(_saveCancellation.Token);
@@ -1118,125 +1043,108 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task FindExactDuplicatesAsync(DuplicateSearchScope scope)
     {
-        if (_duplicateCancellation is not null || _fileOperationActive) return;
-        if (_isCatalogLoading || !_catalogLoaded)
+        if (_duplicateCancellation is not null || _fileOperationActive || !_catalogLoaded || _closing) return;
+        if (_hasPendingRecovery)
         {
-            System.Windows.MessageBox.Show("Дождитесь загрузки каталога перед поиском дублей.", "PhotoShelf"); return;
+            System.Windows.MessageBox.Show("Сначала завершите восстановление в окне «Операции». Это необходимо перед новой обработкой дублей.", "Восстановление");
+            return;
         }
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _duplicateCancellation = operation;
         var token = operation.Token;
-        var snapshot = Photos.ToArray();
-        var visible = _visiblePhotos;
-        var cache = new Dictionary<string, SavedDuplicateHash>(_duplicateHashCache, StringComparer.OrdinalIgnoreCase);
-        var excluded = _excludedFolders.ToArray();
-        var folder = _activeFolder;
-        var compareA = _duplicateCompareFolderA;
-        var compareB = _duplicateCompareFolderB;
-        var videos = ShowVideos;
-        SetDuplicateSearch(true, 1);
-        DuplicateProgressBar.IsIndeterminate = true;
+        var compareA = _duplicateCompareFolderA; var compareB = _duplicateCompareFolderB;
+        var query = scope == DuplicateSearchScope.CurrentView ? CreateQuery() : new CatalogViewQuery
+        {
+            IncludeSystemFolders = _includeSystemFolders, ShowVideos = ShowVideos,
+            Folder = scope == DuplicateSearchScope.CurrentFolder ? _activeFolder : null,
+            ExcludedFolders = scope == DuplicateSearchScope.IncludedFolders ? _excludedFolders.ToArray() : Array.Empty<string>()
+        };
+        query = query with { DuplicateCandidatesOnly = true };
+        SetDuplicateSearch(true, 1); DuplicateProgressBar.IsIndeterminate = true;
         StatusText.Text = "Подготавливаю поиск дублей…";
         try
         {
-            var result = await Task.Run(async () =>
+            var searchTask = Task.Run(async () =>
             {
-                IEnumerable<PhotoItem> query = scope == DuplicateSearchScope.CurrentView ? visible : snapshot;
-                query = query.Where(x => videos || !x.IsVideo);
-                query = scope switch
+                var hashes = new Dictionary<(long Size, string Hash), List<PhotoItem>>();
+                var pending = new List<SavedDuplicateHash>(); var count = 0;
+                await foreach (var saved in _desktopCatalogStore.EnumerateAsync(query, token))
                 {
-                    DuplicateSearchScope.IncludedFolders => query.Where(x => !excluded.Any(p => IsUnderFolder(x.Path, p))),
-                    DuplicateSearchScope.CurrentFolder when folder is not null => query.Where(x => IsUnderFolder(x.Path, folder)),
-                    DuplicateSearchScope.CompareTwoFolders when compareA is not null && compareB is not null => query.Where(x => IsUnderFolder(x.Path, compareA) || IsUnderFolder(x.Path, compareB)),
-                    _ => query
-                };
-                var fresh = new List<PhotoItem>();
-                foreach (var item in query)
-                {
-                    token.ThrowIfCancellationRequested();
-                    try { var file = new FileInfo(item.Path); if (file.Exists && file.Length > 0) fresh.Add(new PhotoItem(item.Path, file.Length, file.LastWriteTime)); }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-                }
-                var candidates = fresh.GroupBy(x => x.FileSizeBytes).Where(g => g.Count() > 1).SelectMany(g => g).ToArray();
-                var byHash = new Dictionary<(long Size, string Hash), List<PhotoItem>>();
-                var newHashes = new List<SavedDuplicateHash>();
-                var count = 0;
-                foreach (var item in candidates)
-                {
-                    token.ThrowIfCancellationRequested();
-                    string? hash = null;
-                    if (cache.TryGetValue(item.Path, out var saved) && saved.SizeBytes == item.FileSizeBytes && saved.FileModifiedAt == item.FileModifiedAt) hash = saved.Hash;
+                    if (scope == DuplicateSearchScope.CompareTwoFolders &&
+                        !(compareA is not null && IsUnderFolder(saved.Path, compareA)) &&
+                        !(compareB is not null && IsUnderFolder(saved.Path, compareB))) continue;
+                    var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash, _ => ToSavedItem(saved.Path), token);
+                    if (fresh is null || fresh.SizeBytes <= 0) continue;
+                    var cached = await _duplicateHashStore.TryGetAsync(fresh.Path, fresh.SizeBytes, fresh.FileModifiedAt, token);
+                    var hash = cached?.Hash;
                     if (string.IsNullOrEmpty(hash))
                     {
                         try
                         {
-                            await using var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                            hash = Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
-                            var after = new FileInfo(item.Path);
-                            if (after.Length != item.FileSizeBytes || after.LastWriteTime != item.FileModifiedAt) continue;
-                            newHashes.Add(new SavedDuplicateHash { Path = item.Path, SizeBytes = item.FileSizeBytes, FileModifiedAt = item.FileModifiedAt, Hash = hash });
+                            hash = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash, async ct =>
+                            {
+                                await using var stream = new FileStream(fresh.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                                var value = Convert.ToHexString(await SHA256.HashDataAsync(stream, ct));
+                                var after = new FileInfo(fresh.Path);
+                                return after.Length == fresh.SizeBytes && after.LastWriteTime == fresh.FileModifiedAt ? value : null;
+                            }, token);
+                            if (hash is null) continue;
+                            pending.Add(new SavedDuplicateHash { Path = fresh.Path, SizeBytes = fresh.SizeBytes, FileModifiedAt = fresh.FileModifiedAt, Hash = hash });
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
                     }
-                    if (!byHash.TryGetValue((item.FileSizeBytes, hash), out var group)) byHash[(item.FileSizeBytes, hash)] = group = new();
-                    group.Add(item);
-                    if (++count % 25 == 0)
-                        await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) StatusText.Text = $"Дубли: {count} / {candidates.Length}"; }, DispatcherPriority.Background, token);
+                    if (!hashes.TryGetValue((fresh.SizeBytes, hash), out var entries)) hashes[(fresh.SizeBytes, hash)] = entries = new();
+                    entries.Add(new PhotoItem(fresh.Path, fresh.SizeBytes, fresh.FileModifiedAt));
+                    if (++count % 128 == 0)
+                    {
+                        await _duplicateHashStore.SaveAsync(pending.ToArray(), token); pending.Clear();
+                        var progress = count;
+                        await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) StatusText.Text = $"Проверено кандидатов: {progress:N0}"; }, DispatcherPriority.Background, token);
+                    }
                 }
-                var groups = byHash.Where(x => x.Value.Count > 1)
+                await _duplicateHashStore.SaveAsync(pending, token);
+                return hashes.Where(x => x.Value.Count > 1)
                     .Where(x => scope != DuplicateSearchScope.CompareTwoFolders || (compareA is not null && compareB is not null && x.Value.Any(i => IsUnderFolder(i.Path, compareA)) && x.Value.Any(i => IsUnderFolder(i.Path, compareB))))
                     .Select(x => new DuplicateGroup(x.Key.Size, x.Key.Hash, x.Value)).ToArray();
-                await _duplicateHashStore.SaveAsync(newHashes, token);
-                return (groups, newHashes);
             }, token);
+            _duplicateWorkTask = searchTask;
+            var groups = await searchTask;
             token.ThrowIfCancellationRequested();
-            foreach (var hash in result.newHashes) _duplicateHashCache[hash.Path] = hash;
-            SaveCatalogState();
-            if (result.groups.Length == 0) System.Windows.MessageBox.Show("Точных дублей не найдено.", "Дубликаты");
+            if (groups.Length == 0) System.Windows.MessageBox.Show("Точных дублей не найдено.", "Дубликаты");
             else
             {
-                var models = await Task.Run(() => new ObservableCollection<DuplicateGroupViewModel>(result.groups.Select((group, index) => new DuplicateGroupViewModel(group, index + 1))), token);
-                var review = new DuplicateReviewWindow(models, async entry =>
-                {
-                    await _saveGate.WaitAsync();
-                    try { await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination, removeFromLibrary: true); }
-                    finally { _saveGate.Release(); }
-                    await Dispatcher.InvokeAsync(() => ApplyMovedItem(entry.Source, null));
-                }) { Owner = this };
+                var models = await Task.Run(() => new ObservableCollection<DuplicateGroupViewModel>(groups.Select((group, index) => new DuplicateGroupViewModel(group, index + 1))), token);
+                if (_fileOperationActive || token.IsCancellationRequested) return;
                 _fileOperationActive = true;
-                _scanCancellation?.Cancel();
-                _browseCancellation?.Cancel();
-                _metadataIndexCancellation?.Cancel();
-                _saveCancellation?.Cancel();
                 try
                 {
-                    await _pendingSave;
-                    await PersistStateAsync(CaptureState(), CancellationToken.None, _catalogRevision);
+                    await StopCatalogWritersAsync(stopDuplicates: false);
+                    var review = new DuplicateReviewWindow(models, CommitFileMoveAsync) { Owner = this };
+                    _activeDuplicateReview = review;
+                    foreach (var viewer in OwnedWindows.OfType<PhotoViewerWindow>().ToArray()) viewer.Close();
                     review.ShowDialog();
                 }
-                finally { _fileOperationActive = false; SaveCatalogState(); RebuildRows(); }
+                finally
+                {
+                    ApplyMovedPaths(); _activeDuplicateReview = null;
+                    try { await RefreshCatalogCountAsync(); await CheckPendingOperationsAsync(); RebuildRows(); }
+                    finally { _fileOperationActive = false; }
+                }
             }
         }
         catch (OperationCanceledException) { StatusText.Text = "Поиск дублей отменён"; }
         catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Поиск дублей"); }
-        finally
-        {
-            if (ReferenceEquals(_duplicateCancellation, operation)) _duplicateCancellation = null;
-            SetDuplicateSearch(false, 0);
-        }
+        finally { if (ReferenceEquals(_duplicateCancellation, operation)) _duplicateCancellation = null; SetDuplicateSearch(false, 0); }
     }
-
     private async Task<DuplicateSearchScope?> AskDuplicateScopeAsync()
     {
-        var snapshot = Photos.ToArray(); var visibleCount = _visiblePhotos.Length;
-        var excluded = _excludedFolders.ToArray(); var videos = ShowVideos;
-        var counts = await Task.Run(() => (All: snapshot.Count(x => videos || !x.IsVideo),
-            Included: snapshot.Count(x => (videos || !x.IsVideo) && !excluded.Any(p => IsUnderFolder(x.Path, p)))));
-        var dialog = new DuplicateSearchDialog(visibleCount, counts.Included, counts.All,
+        if (!_catalogLoaded) return null;
+        var all = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders }, _lifetime.Token);
+        var included = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders, ExcludedFolders = _excludedFolders.ToArray() }, _lifetime.Token);
+        var dialog = new DuplicateSearchDialog((int)Math.Min(int.MaxValue, (PhotoRows as VirtualPhotoRows)?.ItemCount ?? 0), (int)Math.Min(int.MaxValue, included), (int)Math.Min(int.MaxValue, all),
             _viewMode == LibraryViewMode.Folder ? _activeFolder : null) { Owner = this };
         if (dialog.ShowDialog() != true) return null;
-        _duplicateCompareFolderA = dialog.CompareFolderA;
-        _duplicateCompareFolderB = dialog.CompareFolderB;
+        _duplicateCompareFolderA = dialog.CompareFolderA; _duplicateCompareFolderB = dialog.CompareFolderB;
         return dialog.SelectedScope;
     }
 
@@ -1286,13 +1194,30 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void UpdateInfoPanel()
     {
-        if (InfoPanel.Visibility != Visibility.Visible) return;
+        _infoCancellation?.Cancel();
+        if (InfoPanel.Visibility != Visibility.Visible || _fileOperationActive || _closing) return;
         var item = _selectedPhoto;
         var revision = ++_infoRevision;
         InfoText.Text = item is null ? "Выберите фото или видео." : "Читаю сведения…";
         if (item is null) return;
-        var text = await Task.Run(() => item.MetadataText);
-        if (revision == _infoRevision && ReferenceEquals(item, _selectedPhoto)) InfoText.Text = text;
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _infoCancellation = operation;
+        Task? pendingRead = null;
+        try
+        {
+            var work = BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Interactive, _ => item.MetadataText, operation.Token);
+            pendingRead = work;
+            _infoWorkTasks.Add(work);
+            var text = await work;
+            if (!operation.IsCancellationRequested && revision == _infoRevision && ReferenceEquals(item, _selectedPhoto)) InfoText.Text = text;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (revision == _infoRevision) InfoText.Text = $"Сведения недоступны: {ex.Message}"; }
+        finally
+        {
+            if (pendingRead is not null) _infoWorkTasks.Remove(pendingRead);
+            if (ReferenceEquals(_infoCancellation, operation)) _infoCancellation = null;
+        }
     }
 
     private static string NormalizePath(string path)

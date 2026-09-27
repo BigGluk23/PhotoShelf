@@ -29,7 +29,7 @@ public sealed class SqliteCatalogDatabase
     {
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, "PRAGMA journal_mode = WAL;", cancellationToken).ConfigureAwait(false);
-        await ExecuteAsync(connection, "PRAGMA synchronous = NORMAL;", cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, "PRAGMA synchronous = FULL;", cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, "PRAGMA busy_timeout = 5000;", cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(
             connection,

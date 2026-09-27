@@ -32,6 +32,10 @@ public sealed class LocalCatalogState
 
 public sealed class SavedMediaItem
 {
+    public string AssetId { get; set; } = string.Empty;
+    public DateTime? CaptureDate { get; set; }
+    public bool MetadataIndexed { get; set; }
+    public bool IsHiddenOrSystem { get; set; }
     public string Path { get; set; } = string.Empty;
 
     public bool IsFavorite { get; set; }

@@ -8,7 +8,7 @@
         MinHeight="440"
         WindowStartupLocation="CenterOwner"
         Background="#FFF7F4EF"
-        Icon="Assets/PhotoShelf.ico">
+        Icon="pack://application:,,,/PhotoShelf;component/Assets/PhotoShelf.ico">
     <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
