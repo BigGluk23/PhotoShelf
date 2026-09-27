@@ -16,22 +16,45 @@ public sealed class WindowsCopyAclTests : IDisposable
     private string Journal => Path.Combine(_root, "operations", "move.jsonl");
     private static readonly AccessControlSections Sections = AccessControlSections.Owner | AccessControlSections.Group | AccessControlSections.Access;
 
-    private string Prepare()
+    private string Prepare(bool inheritedSource = false)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Source)!);
         Directory.CreateDirectory(Path.GetDirectoryName(Destination)!);
-        File.WriteAllText(Source, "private original bytes");
         var user = WindowsIdentity.GetCurrent().User!;
-        var sourceAcl = new FileSecurity(); sourceAcl.SetAccessRuleProtection(true, false);
-        sourceAcl.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
-        new FileInfo(Source).SetAccessControl(sourceAcl);
+        if (inheritedSource)
+        {
+            var parentAcl = new DirectorySecurity(); parentAcl.SetAccessRuleProtection(true, false);
+            parentAcl.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+            new DirectoryInfo(Path.GetDirectoryName(Source)!).SetAccessControl(parentAcl);
+        }
+        File.WriteAllText(Source, "private original bytes");
+        if (!inheritedSource)
+        {
+            var sourceAcl = new FileSecurity(); sourceAcl.SetAccessRuleProtection(true, false);
+            sourceAcl.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
+            new FileInfo(Source).SetAccessControl(sourceAcl);
+        }
         var destinationAcl = new DirectoryInfo(Path.GetDirectoryName(Destination)!).GetAccessControl();
         destinationAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), FileSystemRights.Read,
             InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         new DirectoryInfo(Path.GetDirectoryName(Destination)!).SetAccessControl(destinationAcl);
-        return Security(Source);
+        return Security(Source, freezeInherited: inheritedSource);
     }
-    private static string Security(string path) => new FileInfo(path).GetAccessControl(Sections).GetSecurityDescriptorSddlForm(Sections);
+    private static string Security(string path, bool freezeInherited = false)
+    {
+        var descriptor = new RawSecurityDescriptor(new FileInfo(path).GetAccessControl(Sections).GetSecurityDescriptorBinaryForm(), 0);
+        // AI/AR describe automatic inheritance bookkeeping, not an access grant. Windows can
+        // change these on rename. Keep owner, group, every ACE/order and the protected bit.
+        var flags = descriptor.ControlFlags & ~(ControlFlags.DiscretionaryAclAutoInherited | ControlFlags.DiscretionaryAclAutoInheritRequired);
+        if (freezeInherited)
+        {
+            flags |= ControlFlags.DiscretionaryAclProtected;
+            foreach (GenericAce ace in descriptor.DiscretionaryAcl!) ace.AceFlags &= ~AceFlags.Inherited;
+        }
+        descriptor.SetFlags(flags);
+        return descriptor.GetSddlForm(Sections);
+    }
     private IReadOnlyList<MoveEntry> Plan(FileMoveService service) => service.Plan([new(Source, null)], Path.GetDirectoryName(Destination)!, CollisionPolicy.Skip);
 
     [WindowsFact]
@@ -77,6 +100,32 @@ public sealed class WindowsCopyAclTests : IDisposable
         Assert.False(result.Moved); Assert.Contains("права", result.Error!, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("private original bytes", File.ReadAllText(Source));
         Assert.Equal("private original bytes", File.ReadAllText(Destination));
+    }
+
+    [WindowsFact]
+    public async Task InheritedSourceRightsBecomeExplicitProtectedRightsBeforeCopyBytes()
+    {
+        var expected = Prepare(inheritedSource: true);
+        var sourceAcl = new FileInfo(Source).GetAccessControl(Sections);
+        Assert.False(sourceAcl.AreAccessRulesProtected);
+        Assert.Contains(sourceAcl.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(), rule => rule.IsInherited);
+        var created = false;
+        var service = new FileMoveService(new FileMoveOptions { AlwaysCopy = true, Checkpoint = (phase, state) =>
+        {
+            if (phase == "copy_created")
+            {
+                created = true; Assert.Equal(0, new FileInfo(state.Temporary!).Length);
+                Assert.Equal(expected, Security(state.Temporary!));
+                Assert.True(new FileInfo(state.Temporary!).GetAccessControl(Sections).AreAccessRulesProtected);
+            }
+            return Task.CompletedTask;
+        }});
+        var result = Assert.Single(await service.ExecuteAsync(Plan(service), Journal, _ => Task.CompletedTask, null, default));
+        Assert.True(result.Moved, result.Error); Assert.True(created); Assert.False(File.Exists(Source));
+        var targetAcl = new FileInfo(Destination).GetAccessControl(Sections);
+        Assert.True(targetAcl.AreAccessRulesProtected);
+        Assert.All(targetAcl.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(), rule => Assert.False(rule.IsInherited));
+        Assert.Equal(expected, Security(Destination)); Assert.Equal("private original bytes", File.ReadAllText(Destination));
     }
 
     [WindowsFact]

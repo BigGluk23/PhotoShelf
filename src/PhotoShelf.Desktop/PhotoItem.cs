@@ -128,7 +128,8 @@ public sealed class PhotoItem : INotifyPropertyChanged
     public void ApplyIndexedCaptureDate(DateTime? captureDate, MetadataReadStatus? status = null)
     {
         var readStatus = status ?? (captureDate is null ? MetadataReadStatus.Absent : MetadataReadStatus.Found);
-        if (IsCaptureDateLoaded && CaptureDate == captureDate && MetadataStatus == readStatus) return;
+        if (CaptureDate == captureDate && MetadataStatus == readStatus &&
+            IsCaptureDateLoaded == (readStatus != MetadataReadStatus.Pending)) return;
         IsCaptureDateLoaded = readStatus != MetadataReadStatus.Pending;
         MetadataStatus = readStatus;
         CaptureDate = captureDate;
