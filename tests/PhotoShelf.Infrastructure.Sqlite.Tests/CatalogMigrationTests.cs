@@ -66,6 +66,9 @@ public sealed class CatalogMigrationTests : IDisposable
         Assert.True(error is SqliteException or InvalidDataException);
         var backups=Path.Combine(_root,"backups");
         Assert.True(!Directory.Exists(backups)||Directory.GetFiles(backups,"*.sqlite").Length==0);
+        // A disposed SQLite connection may retain an idle pooled handle on Windows.
+        // Close those idle handles before raw-byte inspection of this synthetic database.
+        SqliteConnection.ClearAllPools();
         Assert.Equal(new byte[4096],await File.ReadAllBytesAsync(Database));
     }
 

@@ -37,15 +37,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify application version.' }
     Invoke-Checked $DotNet @('--info')
     Invoke-Checked $DotNet @('build', 'PhotoShelf.sln', '-c', 'Release', '-m:1', '-nr:false', '-p:UseSharedCompilation=false')
+    $hadTestFailure = $false
     foreach ($project in @('Domain', 'Application', 'Infrastructure.Sqlite', 'Desktop')) {
         $arguments = @('test', "tests/PhotoShelf.$project.Tests/PhotoShelf.$project.Tests.csproj", '-c', 'Release', '--no-build', '--no-restore',
             '-m:1', '-nr:false', '--results-directory', $results, '--logger', "trx;LogFileName=$project.trx")
         if (-not $Scale) { $arguments += @('--filter', 'Category!=CatalogScale') }
-        Invoke-Checked $DotNet $arguments
+        # Collect every suite's result so one failure does not hide independent Windows regressions.
+        & $DotNet @arguments
+        if ($LASTEXITCODE -ne 0) { $hadTestFailure = $true }
     }
     # Every project must produce a nonempty report; skipped native/WPF tests fail this gate.
     Invoke-Checked $Python @('tools/harness_checks.py', 'trx', $results, '--projects', 'Domain', 'Application', 'Infrastructure.Sqlite', 'Desktop',
         '--summary', (Join-Path $results 'test-summary.json'))
+    if ($hadTestFailure) { throw 'At least one dotnet test process failed; publishing is blocked.' }
 
     $packageName = 'PhotoShelf-v' + $result.version + '-win-x64'
     $artifactRoot = Join-Path $repoRoot ('artifacts/windows-' + $runId)

@@ -35,6 +35,9 @@ internal sealed class UiSmokeSession
         var file = new FileInfo(_fixturePath);
         var store = new SqliteDesktopCatalogStore();
         await store.InitializeAsync();
+        // Maintenance correctly classifies files under TEMP/the catalog as system media.
+        // Persist this fixture-only filter before normal startup so a regroup cannot hide the preview.
+        await store.SaveAsync(new LocalCatalogState { IncludeSystemFolders = true }, saveItems: false);
         await store.UpsertItemsAsync(new[] { new SavedMediaItem
         {
             Path = _fixturePath, SizeBytes = file.Length, FileModifiedAt = file.LastWriteTime,
