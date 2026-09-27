@@ -8,6 +8,8 @@
     <NuGetAudit>true</NuGetAudit>
     <NuGetAuditMode>all</NuGetAuditMode>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- Publish adds RID-specific assets and implicit SDK tools to all project references. -->
+    <NuGetLockFilePath Condition="'$(PhotoShelfPublish)' == 'true'">$(MSBuildProjectDirectory)/packages.publish.lock.json</NuGetLockFilePath>
     <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
     <WarningsAsErrors>$(WarningsAsErrors);NU1900;NU1901;NU1902;NU1903;NU1904</WarningsAsErrors>
   </PropertyGroup>

@@ -67,7 +67,13 @@ try {
     New-Item -ItemType Directory -Path $publish | Out-Null
     Invoke-Checked $DotNet @('publish', 'src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj', '-c', 'Release', '-r', 'win-x64',
         '--self-contained', 'true', '-m:1', '-nr:false', '-p:UseSharedCompilation=false', '-p:PublishSingleFile=true',
+        '-p:PhotoShelfPublish=true', '-p:RestoreLockedMode=true',
         '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:EnableCompressionInSingleFile=true', '-p:DebugType=None', '-o', $publish)
+    # Read the just-restored publish graph without replacing it with the ordinary build graph.
+    & $DotNet list src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'publish-dependencies.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not record resolved publish dependency inventory.' }
+    & $DotNet list src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj package --vulnerable --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'publish-dependency-audit.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not check publish dependency advisories.' }
     $exe = Join-Path $publish 'PhotoShelf.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Publish did not produce PhotoShelf.exe.' }
     & (Join-Path $repoRoot 'scripts/test-startup-package.ps1') -ExePath $exe -ReportDirectory $results
