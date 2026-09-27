@@ -119,7 +119,17 @@ public sealed class FileMoveProcessCrashTests : IDisposable
     private static async Task TerminateAsync(Process process)
     {
         if (!process.HasExited) process.Kill(entireProcessTree: true);
-        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        if (OperatingSystem.IsWindows())
+        {
+            // .NET 10.0.12 WaitForExitAsync can short-circuit through HasExited/GetExitCodeProcess
+            // before the native process handle is signaled. WaitForExit(int) waits on that
+            // handle, so the killed probe's file handles/pending I/O are gone before hashing.
+            // https://github.com/dotnet/runtime/blob/v10.0.12/src/libraries/System.Diagnostics.Process/src/System/Diagnostics/ProcessManager.Windows.cs#L260-L281
+            // Do not retry or skip file reads: a remaining sharing violation must still fail.
+            Assert.True(await Task.Run(() => process.WaitForExit(5_000)),
+                "The killed probe's native process handle was not signaled within 5 seconds");
+        }
+        else await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
     }
     private static string FindDotnetHost()
     {
