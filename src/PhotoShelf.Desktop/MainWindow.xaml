@@ -1,0 +1,360 @@
+<Window x:Class="PhotoShelf.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:gif="http://wpfanimatedgif.codeplex.com"
+        Title="PhotoShelf"
+        Width="1280"
+        Height="800"
+        MinWidth="920"
+        MinHeight="600"
+        WindowStartupLocation="CenterScreen"
+        PreviewMouseWheel="OnPreviewMouseWheel"
+        Icon="Assets/PhotoShelf.ico"
+        StateChanged="OnWindowStateChanged"
+        Loaded="OnMainWindowLoaded">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+    </Window.Resources>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="48" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="46" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="#FFFAFAF8" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+            <Grid Margin="14,7">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="220" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Width="30" Height="30" Source="Assets/giraffe-icon.png" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.6" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                </StackPanel>
+                <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="32" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="⌕" FontSize="19" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <TextBox x:Name="SearchBox" Grid.Column="1" BorderThickness="0" Background="Transparent" VerticalContentAlignment="Center" ToolTip="Поиск по имени и папке" TextChanged="OnSearchTextChanged" />
+                    </Grid>
+                </Border>
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button x:Name="DuplicatesButton" Style="{StaticResource FlatActionButton}" Content="Дубликаты" Click="OnDuplicatesClicked" />
+                    <Button Style="{StaticResource FlatActionButton}" Content="Настройки" Click="OnSettingsClicked" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="250" />
+                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition x:Name="InfoColumn" Width="0" />
+            </Grid.ColumnDefinitions>
+
+            <Border Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+                <DockPanel Margin="12,10">
+                    <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+                        <Button Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="+  Добавить папку" Click="OnAddFolderClicked" />
+                        <Button Margin="0,4,0,0" Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="⌕  Найти все фото" Click="OnDiscoverPhotosClicked" />
+                        <Button x:Name="CancelScanButton" Margin="0,4,0,0" Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="×  Остановить поиск" Click="OnCancelScanClicked" IsEnabled="False" />
+                    </StackPanel>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Expander Grid.Row="0" Header="БИБЛИОТЕКА" IsExpanded="True" Foreground="{StaticResource MutedTextBrush}" FontSize="11" FontWeight="SemiBold" Margin="0,0,0,8">
+                        <StackPanel Margin="0,5,0,0">
+                        <TextBlock Text="БИБЛИОТЕКА" Foreground="{StaticResource MutedTextBrush}" FontSize="11" FontWeight="SemiBold" Margin="8,4,0,5" />
+                        <Button Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="▦  Все фотографии" Click="OnAllPhotosClicked" />
+                        <Button Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="★  Избранное" Click="OnFavoritesClicked" />
+                        <Button Style="{StaticResource FlatActionButton}" HorizontalContentAlignment="Left" Content="◷  Последние" Click="OnRecentClicked" />
+                        </StackPanel>
+                        </Expander>
+                        <TextBlock Grid.Row="1" Text="ПАПКИ" Foreground="{StaticResource MutedTextBrush}" FontSize="11" FontWeight="SemiBold" Margin="8,18,0,5" />
+                        <Expander Grid.Row="2" Header="ПАПКИ" IsExpanded="True" Foreground="{StaticResource MutedTextBrush}" FontSize="11" FontWeight="SemiBold" Margin="0,8,0,0">
+                        <TreeView x:Name="FolderTree"
+                                  Margin="0,5,0,0"
+                                  Grid.Row="2"
+                                  BorderThickness="0"
+                                  Background="Transparent"
+                                  SelectedItemChanged="OnFolderTreeSelectedItemChanged"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <TreeView.Resources>
+                                <HierarchicalDataTemplate DataType="{x:Type local:FolderNode}" ItemsSource="{Binding Children}" xmlns:local="clr-namespace:PhotoShelf.Desktop">
+                                    <StackPanel Orientation="Horizontal">
+                                        <StackPanel.ContextMenu>
+                                            <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                                <MenuItem Header="Открыть папку в проводнике" Click="OnFolderContextOpenInExplorerClicked" />
+                                                <MenuItem Header="Сканировать эту папку" Click="OnFolderContextScanClicked" />
+                                                <MenuItem Header="Найти дубли в этой папке" Click="OnFolderContextDuplicatesClicked" />
+                                            </ContextMenu>
+                                        </StackPanel.ContextMenu>
+                                        <TextBlock Text="│"
+                                                   Foreground="#FFB9B5AE"
+                                                   Margin="0,0,4,0"
+                                                   VerticalAlignment="Center" />
+                                        <CheckBox IsChecked="{Binding IsIncluded, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Checked="OnFolderIncludedChanged" Unchecked="OnFolderIncludedChanged" VerticalAlignment="Center" />
+                                        <TextBlock Text="{Binding DisplayText}" Margin="4,0,0,0" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </HierarchicalDataTemplate>
+                            </TreeView.Resources>
+                            <TreeView.ItemContainerStyle>
+                                <Style TargetType="TreeViewItem">
+                                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                    <EventSetter Event="Expanded" Handler="OnFolderTreeItemExpanded" />
+                                </Style>
+                            </TreeView.ItemContainerStyle>
+                        </TreeView>
+                        </Expander>
+                    </Grid>
+                </DockPanel>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="5" Background="Transparent" HorizontalAlignment="Stretch" />
+
+            <Grid Grid.Column="2" Background="{StaticResource CanvasBrush}">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="42" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                    <Grid Margin="16,0">
+                        <TextBlock x:Name="ViewTitleText" Text="Все фотографии" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <ComboBox x:Name="DateModeBox"
+                                      Width="128"
+                                      Height="28"
+                                      Margin="0,0,8,0"
+                                      VerticalContentAlignment="Center"
+                                      SelectionChanged="OnDateModeChanged"
+                                      ToolTip="Как группировать ленту: по дате съёмки из метаданных или по дате файла">
+                                <ComboBoxItem Content="Дата съёмки" Tag="CaptureDate" />
+                                <ComboBoxItem Content="Дата файла" Tag="FileDate" />
+                            </ComboBox>
+                            <Button x:Name="DateSortButton" Style="{StaticResource FlatActionButton}" Content="Съёмка ↓" Click="OnDateSortClicked" ToolTip="Переключить сортировку по дате" />
+                            <Button x:Name="MissingCaptureDateFilterButton" Style="{StaticResource FlatActionButton}" Content="Без даты съёмки" Click="OnMissingCaptureDateFilterClicked" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+                <Grid Grid.Row="1">
+                    <ListBox x:Name="PhotoGrid"
+                             ItemsSource="{Binding PhotoRows}"
+                             BorderThickness="0"
+                             Background="Transparent"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling"
+                             ScrollViewer.CanContentScroll="True"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             SizeChanged="OnPhotoGridSizeChanged">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Focusable" Value="False" />
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="Margin" Value="0" />
+                                <Setter Property="Background" Value="Transparent" />
+                                <Setter Property="BorderThickness" Value="0" />
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListBoxItem">
+                                            <ContentPresenter />
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate DataType="{x:Type local:PhotoRow}" xmlns:local="clr-namespace:PhotoShelf.Desktop">
+                                <Grid>
+                                    <Border Margin="8,18,8,6"
+                                            Padding="4,4"
+                                            Cursor="Hand"
+                                            MouseLeftButtonDown="OnDateHeaderMouseLeftButtonDown"
+                                            Visibility="{Binding IsHeader, Converter={StaticResource BoolToVisibility}}">
+                                        <DockPanel>
+                                            <TextBlock Text="{Binding ExpandedGlyph}"
+                                                       Width="22"
+                                                       FontSize="18"
+                                                       FontWeight="SemiBold"
+                                                       Foreground="{StaticResource MutedTextBrush}"
+                                                       VerticalAlignment="Center" />
+                                            <TextBlock Text="{Binding Header}"
+                                                       FontSize="20"
+                                                       FontWeight="SemiBold"
+                                                       Foreground="{StaticResource TextBrush}" />
+                                            <Border Height="1"
+                                                    Margin="14,14,0,0"
+                                                    Background="{StaticResource BorderBrush}" />
+                                        </DockPanel>
+                                    </Border>
+                                    <ItemsControl ItemsSource="{Binding Items}"
+                                                  Visibility="{Binding IsPhotoRow, Converter={StaticResource BoolToVisibility}}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <StackPanel Orientation="Horizontal" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate DataType="{x:Type local:PhotoItem}">
+                                                <Border Width="{Binding DataContext.TileWidth, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        Margin="8"
+                                                        Padding="6"
+                                                        Background="#F8FFFFFF"
+                                                        BorderBrush="{StaticResource BorderBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="4"
+                                                        MouseLeftButtonDown="OnPhotoTileMouseLeftButtonDown">
+                                                    <Border.ContextMenu>
+                                                        <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                                            <MenuItem Header="Открыть" Click="OnPhotoContextOpenClicked" />
+                                                            <MenuItem Header="Открыть в проводнике" Click="OnPhotoContextOpenFolderClicked" />
+                                                            <MenuItem Header="Избранное / убрать" Click="OnPhotoContextFavoriteClicked" />
+                                                            <MenuItem Header="Сведения" Click="OnPhotoContextInfoClicked" />
+                                                        </ContextMenu>
+                                                    </Border.ContextMenu>
+                                                    <Border.Style>
+                                                        <Style TargetType="Border">
+                                                            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                                                            <Setter Property="BorderThickness" Value="1" />
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                                                    <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                                                                    <Setter Property="BorderThickness" Value="3" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </Border.Style>
+                                                    <StackPanel>
+                                                        <Border Height="{Binding DataContext.TileImageHeight, RelativeSource={RelativeSource AncestorType=Window}}" Background="#FFE5E2DC" ClipToBounds="True">
+                                                            <Grid>
+                                                                <Image Source="{Binding Thumbnail}" gif:ImageBehavior.AnimatedSource="{Binding Thumbnail}" Stretch="UniformToFill" />
+                                                                <TextBlock Text="{Binding KindLabel}"
+                                                                           Foreground="{StaticResource MutedTextBrush}"
+                                                                           FontWeight="SemiBold"
+                                                                           FontSize="15"
+                                                                           HorizontalAlignment="Center"
+                                                                           VerticalAlignment="Center" />
+                                                                <TextBlock Text="{Binding FavoriteGlyph}"
+                                                                           Foreground="#FFFFD35A"
+                                                                           FontSize="22"
+                                                                           FontWeight="Bold"
+                                                                           HorizontalAlignment="Right"
+                                                                           VerticalAlignment="Top"
+                                                                           Margin="0,4,6,0" />
+                                                            </Grid>
+                                                        </Border>
+                                                        <TextBlock Margin="0,6,0,0" Text="{Binding FileName}" TextTrimming="CharacterEllipsis" FontWeight="SemiBold" />
+                                                        <TextBlock Margin="0,2,0,0" Text="{Binding DetailLine}" Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Border x:Name="EmptyState"
+                            Margin="16"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            Background="#40FFFFFF"
+                            CornerRadius="4">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <TextBlock Text="▦" FontSize="46" Foreground="{StaticResource AccentBrush}" HorizontalAlignment="Center" />
+                            <TextBlock Margin="0,8,0,0" Text="Добавьте папку или запустите поиск фото" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Margin="0,5,0,0" Text="Оригиналы останутся на своих местах" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Center" />
+                            <StackPanel Margin="0,16,0,0" Orientation="Horizontal" HorizontalAlignment="Center">
+                                <Button Padding="14,7" Content="Добавить папку" Click="OnAddFolderClicked" />
+                                <Button Margin="8,0,0,0" Padding="14,7" Content="Найти все фото" Click="OnDiscoverPhotosClicked" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Grid>
+
+            <Border x:Name="InfoPanel"
+                    Grid.Column="3"
+                    Background="#FFFAFAF8"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1,0,0,0"
+                    Visibility="Collapsed">
+                <DockPanel Margin="12">
+                    <TextBlock DockPanel.Dock="Top" Text="Сведения" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,8" />
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <TextBlock x:Name="InfoText"
+                                   Text="Выберите фото или видео."
+                                   TextWrapping="Wrap"
+                                   Foreground="{StaticResource TextBrush}" />
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="2" Background="{StaticResource PanelDarkBrush}">
+            <Grid Margin="10,4">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="360" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="560" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="StatusText" Text="0 фотографий" Width="210" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock x:Name="MetadataStatusText" Text="Метаданные: ждут" Width="130" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <ProgressBar x:Name="CatalogProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
+                    <ProgressBar x:Name="DuplicateProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
+                    <Button x:Name="CancelDuplicatesButton" Margin="8,0,0,0" Padding="7,2" Content="×" ToolTip="Остановить проверку дублей" Click="OnCancelDuplicatesClicked" Visibility="Collapsed" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="★  Избранное" Click="OnFavoriteActionClicked" />
+                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="▣  Папка" Click="OnOpenFolderClicked" />
+                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="↻  Метаданные" Click="OnReindexMetadataClicked" ToolTip="Переиндексировать дату съёмки и базовые метаданные" />
+                </StackPanel>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="SelectedText" Text="" Width="140" TextTrimming="CharacterEllipsis" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="0,0,12,0" />
+                    <CheckBox x:Name="ShowInfoCheckBox"
+                              Content="Сведения"
+                              Foreground="#FFDEDEDE"
+                              VerticalAlignment="Center"
+                              Margin="0,0,14,0"
+                              Checked="OnShowInfoChanged"
+                              Unchecked="OnShowInfoChanged" />
+                    <CheckBox x:Name="ShowVideosCheckBox"
+                              Content="Видео"
+                              Foreground="#FFDEDEDE"
+                              IsChecked="True"
+                              VerticalAlignment="Center"
+                              Margin="0,0,14,0"
+                              Checked="OnShowVideosChanged"
+                              Unchecked="OnShowVideosChanged" />
+                    <CheckBox x:Name="IncludeSystemFoldersCheckBox"
+                              Content="Системные"
+                              Foreground="#FFDEDEDE"
+                              VerticalAlignment="Center"
+                              Margin="0,0,14,0"
+                              Checked="OnIncludeSystemFoldersChanged"
+                              Unchecked="OnIncludeSystemFoldersChanged" />
+                    <TextBlock Text="Размер" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <Slider x:Name="ThumbnailSizeSlider"
+                            Width="150"
+                            Minimum="72"
+                            Maximum="260"
+                            Value="178"
+                            TickFrequency="10"
+                            IsSnapToTickEnabled="False"
+                            ValueChanged="OnThumbnailSizeChanged" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

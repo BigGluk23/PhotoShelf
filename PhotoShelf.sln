@@ -1,0 +1,48 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Domain", "src\PhotoShelf.Domain\PhotoShelf.Domain.csproj", "{4578619A-CF1A-46DA-9092-A7BD54C66A11}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Application", "src\PhotoShelf.Application\PhotoShelf.Application.csproj", "{CF5BF70A-25D1-4930-A89C-52C56C144859}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Infrastructure.Sqlite", "src\PhotoShelf.Infrastructure.Sqlite\PhotoShelf.Infrastructure.Sqlite.csproj", "{A2C114D8-AC4E-4181-814B-D49A7340B516}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Desktop", "src\PhotoShelf.Desktop\PhotoShelf.Desktop.csproj", "{95656703-4B48-4DDD-A968-B577E6B07D34}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Domain.Tests", "tests\PhotoShelf.Domain.Tests\PhotoShelf.Domain.Tests.csproj", "{8D8CBA5E-D921-4C5A-B7E6-D8149B2244FB}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "PhotoShelf.Infrastructure.Sqlite.Tests", "tests\PhotoShelf.Infrastructure.Sqlite.Tests\PhotoShelf.Infrastructure.Sqlite.Tests.csproj", "{14E427D7-5841-49DF-A0C0-D0B209C62D6C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{4578619A-CF1A-46DA-9092-A7BD54C66A11}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4578619A-CF1A-46DA-9092-A7BD54C66A11}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4578619A-CF1A-46DA-9092-A7BD54C66A11}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4578619A-CF1A-46DA-9092-A7BD54C66A11}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CF5BF70A-25D1-4930-A89C-52C56C144859}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CF5BF70A-25D1-4930-A89C-52C56C144859}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CF5BF70A-25D1-4930-A89C-52C56C144859}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CF5BF70A-25D1-4930-A89C-52C56C144859}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A2C114D8-AC4E-4181-814B-D49A7340B516}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A2C114D8-AC4E-4181-814B-D49A7340B516}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A2C114D8-AC4E-4181-814B-D49A7340B516}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A2C114D8-AC4E-4181-814B-D49A7340B516}.Release|Any CPU.Build.0 = Release|Any CPU
+		{95656703-4B48-4DDD-A968-B577E6B07D34}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{95656703-4B48-4DDD-A968-B577E6B07D34}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{95656703-4B48-4DDD-A968-B577E6B07D34}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{95656703-4B48-4DDD-A968-B577E6B07D34}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8D8CBA5E-D921-4C5A-B7E6-D8149B2244FB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8D8CBA5E-D921-4C5A-B7E6-D8149B2244FB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D8CBA5E-D921-4C5A-B7E6-D8149B2244FB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8D8CBA5E-D921-4C5A-B7E6-D8149B2244FB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{14E427D7-5841-49DF-A0C0-D0B209C62D6C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{14E427D7-5841-49DF-A0C0-D0B209C62D6C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{14E427D7-5841-49DF-A0C0-D0B209C62D6C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{14E427D7-5841-49DF-A0C0-D0B209C62D6C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

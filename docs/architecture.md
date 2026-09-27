@@ -1,0 +1,96 @@
+# Архитектура PhotoShelf
+
+## Границы системы
+
+PhotoShelf использует ports-and-adapters. `Domain` описывает фотообъекты и метаданные. `Application` координирует индексирование, запросы, просмотр и карантин через интерфейсы. `Infrastructure.Sqlite` реализует каталог. `Desktop` отвечает только за состояние экрана и ввод пользователя.
+
+Ни ViewModel, ни индексатор не открывают SQLite connection и не знают имён таблиц. SQL, FTS и транзакционные детали остаются внутри SQLite-адаптера. Контракт `IPhotoCatalog` использует доменные документы и `PhotoQuery`, поэтому новый backend реализует тот же порт.
+
+## Логический asset и физические файлы
+
+`MediaAsset` — то, что пользователь видит как одну фотографию. `MediaFile` — физический файл на диске. Связь хранит роль файла:
+
+- `PrimaryImage` — основной JPEG/HEIC/RAW;
+- `AlternateImage` — альтернативное представление;
+- `PairedVideo` — MOV-компонент Live Photo;
+- `MetadataSidecar` — XMP;
+- `AdjustmentSidecar` — Apple AAE;
+- `EmbeddedPreview` — извлечённое превью, если его решим учитывать как файл.
+
+Так модель не ломается, когда один кадр содержит HEIC + MOV + AAE или RAW + XMP. Resolver связывает companion-файлы по идентификаторам, а имя файла использует только как осторожный fallback. Неоднозначная связь не создаётся автоматически и попадает в диагностический список.
+
+## Metadata pipeline
+
+```text
+file discovered
+  → lightweight signature/type probe
+  → metadata readers (container + embedded + sidecars)
+  → MetadataEnvelope
+  → precedence/normalization policy
+  → normalized searchable fields + lossless raw properties
+  → one catalog transaction
+```
+
+`IMetadataReader` возвращает значения с provenance. Decoder и metadata reader разделены: построение миниатюры не обязательно для чтения EXIF. В будущем HEIC/HEIF/RAW reader может использовать нативную библиотеку, сохраняя тот же контракт.
+
+### Приоритет источников
+
+Политика не зашивается в SQL. Начальная рекомендация:
+
+1. явное пользовательское значение PhotoShelf;
+2. XMP sidecar;
+3. встроенный XMP/IPTC;
+4. EXIF/container metadata;
+5. файловая система только как отображаемый fallback.
+
+Каждое итоговое поле может хранить ссылку на source property. Raw-пары никогда не удаляются только потому, что ключ неизвестен текущей версии.
+
+### Даты
+
+`FileCreatedUtc`, `FileModifiedUtc` и `FileAccessedUtc` относятся к `MediaFile`. `DateTimeOriginal`, `CreateDate` и `ModifyDate` относятся к metadata логического asset. Значение даты хранит локальный wall-clock, UTC offset (если известен) и точность; это не позволяет неверно сдвинуть старый EXIF timestamp без timezone.
+
+## Поиск
+
+`PhotoQuery` уже предусматривает диапазон даты съёмки, путь/папку, камеру, объектив, рейтинг, теги, GPS bounds и текст. SQLite-адаптер использует обычные индексы для facet-фильтров; FTS и spatial strategy можно добавить внутренней миграцией без изменения UI.
+
+Для большой библиотеки запросы всегда страничные и используют стабильный keyset cursor. UI не получает сотни тысяч объектов разом.
+
+## UX shell
+
+Основная компоновка наследует логику Picasa, но использует собственную тему:
+
+- слева постоянная узкая панель «Библиотека / Папки / Люди в будущем»;
+- сверху лёгкая строка поиска и быстрые фильтры;
+- в центре виртуализированная сетка с заголовками папок или дат;
+- двойной щелчок/Enter открывает viewer, стрелки перемещаются в порядке текущего запроса;
+- снизу компактная action tray для избранного, поворота, информации, экспорта, дублей и карантина;
+- тяжёлая анимация и декоративные blur/acrylic эффекты не используются.
+
+Иконки создаются для PhotoShelf или берутся из библиотеки с совместимой лицензией. Ассеты Google не включаются.
+
+## Производительность и потоки
+
+- UI thread только применяет готовые batches.
+- Scan, metadata, hashing и thumbnail — отдельные ограниченные очереди с backpressure.
+- Приоритет получают видимые thumbnail и соседние кадры viewer.
+- Thumbnail cache имеет versioned key: content identity + decoder version + size + color policy.
+- SQLite работает в WAL mode; запись сериализована короткими batch-транзакциями, чтения используют отдельные connections.
+- File watchers являются подсказкой. Периодическая reconciliation устраняет пропуски и офлайн-диски.
+
+## Этапы sidecar и Live Photo
+
+Фаза 1 включает схему, доменные роли и интерфейс resolver. Полная реализация может идти последовательно:
+
+1. XMP discovery и безопасная привязка, затем чтение rating/tags/caption.
+2. Apple AAE discovery без применения edits; файл сопровождает оригинал при переносе/карантине.
+3. Live Photo linking по Apple content identifier, fallback по basename только при однозначности.
+4. Воспроизведение paired MOV и атомарные операции над всей группой.
+
+## Правила зависимости
+
+- Domain не ссылается на WPF, SQLite, файловую систему или decoder packages.
+- Application не возвращает `DataTable`, SQL rows и SQLite-типы.
+- Infrastructure может зависеть от Application и Domain.
+- Desktop может зависеть от Application/Domain, но получает реализацию порта в composition root.
+- Любая операция перемещения/карантина формирует plan, проверяет его, пишет manifest и только затем меняет файлы.
+

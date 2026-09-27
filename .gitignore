@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+artifacts/
+PhotoShelf.catalog.db*
+thumb-cache/
+

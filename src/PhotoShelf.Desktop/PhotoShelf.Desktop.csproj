@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>PhotoShelf</AssemblyName>
+    <Product>PhotoShelf</Product>
+    <Description>Fast local photo library for Windows</Description>
+    <ApplicationIcon>Assets\PhotoShelf.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PhotoShelf.Application\PhotoShelf.Application.csproj" />
+    <ProjectReference Include="..\PhotoShelf.Domain\PhotoShelf.Domain.csproj" />
+    <ProjectReference Include="..\PhotoShelf.Infrastructure.Sqlite\PhotoShelf.Infrastructure.Sqlite.csproj" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.8" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+    <PackageReference Include="WpfAnimatedGif" Version="2.0.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="RUNNING.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\PhotoShelf.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\giraffe-icon.png" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\giraffe-icon-source.png" />
+  </ItemGroup>
+</Project>
