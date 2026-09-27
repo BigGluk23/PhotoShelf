@@ -11,3 +11,23 @@ TestResults/
 *.suo
 PhotoShelf.catalog.db*
 thumb-cache/
+thumb-cache-v*/
+catalog-v1.json*
+*.zip
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+# Git on case-insensitive filesystems also matches the source directory name.
+!src/PhotoShelf.Infrastructure.Sqlite/
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+writer.lock
+__pycache__/
+*.pyc

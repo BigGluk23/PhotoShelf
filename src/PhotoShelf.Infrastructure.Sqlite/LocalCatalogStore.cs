@@ -4,13 +4,17 @@ namespace PhotoShelf.Infrastructure.Sqlite;
 
 public static class LocalCatalogStore
 {
+    private static readonly CatalogLocation Location = new();
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         WriteIndented = true
     };
 
-    public static string CatalogDirectory =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhotoShelf");
+    public static string CatalogDirectory => Location.DirectoryPath;
+
+    public static bool IsIsolatedSmokeCatalog => Location.IsIsolatedSmoke;
+
+    public static string CreateIsolatedSmokeCatalog() => Location.CreateIsolatedSmokeDirectory();
 
     public static string CatalogPath => Path.Combine(CatalogDirectory, "catalog-v1.json");
 
@@ -41,4 +45,3 @@ public static class LocalCatalogStore
         File.Move(tempPath, CatalogPath, overwrite: true);
     }
 }
-

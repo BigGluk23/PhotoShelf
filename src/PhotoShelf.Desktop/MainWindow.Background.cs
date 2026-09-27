@@ -283,6 +283,12 @@ public partial class MainWindow
         }
         catch (Exception ex)
         {
+            if (ErrorReporter.AutomatedCheck)
+            {
+                ErrorReporter.Show(ex, "UI smoke shutdown failed");
+                System.Windows.Application.Current.Shutdown(1);
+                return;
+            }
             _closing = false;
             IsEnabled = true;
             foreach (var window in enabledOwnedWindows.Where(window => window.IsLoaded)) window.IsEnabled = true;

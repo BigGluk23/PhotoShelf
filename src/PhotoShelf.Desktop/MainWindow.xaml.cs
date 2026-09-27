@@ -987,11 +987,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             await LoadSavedCatalogAsync();
+            MarkInitialCatalogReady();
             StartBackgroundCatalogMaintenance();
             if (!_hasPendingRecovery) StartMetadataIndexing(resetExisting: false);
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusText.Text = $"Не удалось загрузить каталог: {ex.Message}"; }
+        catch (OperationCanceledException) { MarkInitialCatalogFailed(new OperationCanceledException()); }
+        catch (Exception ex) { MarkInitialCatalogFailed(ex); StatusText.Text = $"Не удалось загрузить каталог: {ex.Message}"; }
         finally
         {
             _isCatalogLoading = false;

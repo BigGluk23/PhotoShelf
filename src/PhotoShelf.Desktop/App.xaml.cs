@@ -12,13 +12,17 @@ public partial class App : System.Windows.Application
     private FileStream? _catalogLease;
     private bool _startupCompleted;
     private readonly bool _verificationOnly;
+    private readonly UiSmokeSession? _uiSmoke;
     internal bool VerificationFailed { get; private set; }
 
     public App() : this(false) { }
 
-    public App(bool verificationOnly)
+    public App(bool verificationOnly) : this(verificationOnly, null) { }
+
+    internal App(bool verificationOnly, UiSmokeSession? uiSmoke)
     {
         _verificationOnly = verificationOnly;
+        _uiSmoke = uiSmoke;
         DispatcherUnhandledException += OnUnhandledDispatcherException;
     }
 
@@ -35,7 +39,7 @@ public partial class App : System.Windows.Application
         ErrorReporter.Show(args.Exception, _startupCompleted
             ? "Не удалось выполнить действие в PhotoShelf"
             : "Не удалось подготовить окно PhotoShelf");
-        if (!_startupCompleted) Shutdown(1);
+        if (!_startupCompleted || _uiSmoke is not null) Shutdown(1);
     }
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -46,7 +50,10 @@ public partial class App : System.Windows.Application
         {
             base.OnStartup(e);
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
-            _instanceMutex = new Mutex(true, "Local\\PhotoShelf.Catalog.SingleWriter", out var firstInstance);
+            var mutexName = LocalCatalogStore.IsIsolatedSmokeCatalog
+                ? "Local\\PhotoShelf.Smoke." + Guid.NewGuid().ToString("N")
+                : "Local\\PhotoShelf.Catalog.SingleWriter";
+            _instanceMutex = new Mutex(true, mutexName, out var firstInstance);
             if (!firstInstance)
             {
                 System.Windows.MessageBox.Show("PhotoShelf уже запущен. Откройте его окно через значок в области уведомлений.", "PhotoShelf");
@@ -62,6 +69,7 @@ public partial class App : System.Windows.Application
             loading.Show();
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             if (Dispatcher.HasShutdownStarted) return;
+            if (_uiSmoke is not null) await _uiSmoke.SeedCatalogAsync();
             var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
             if (Dispatcher.HasShutdownStarted) return;
             var mainWindow = new MainWindow(state);
@@ -70,6 +78,7 @@ public partial class App : System.Windows.Application
             _startupCompleted = true;
             ShutdownMode = ShutdownMode.OnMainWindowClose;
             loading.Close();
+            if (_uiSmoke is not null) await _uiSmoke.ObserveAndCloseAsync(mainWindow);
         }
         catch (Exception exception)
         {

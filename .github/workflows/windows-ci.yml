@@ -1,0 +1,61 @@
+name: Windows build, safety tests and UI smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Include synthetic 10k/100k/1M catalog tests
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+      - name: Set up repository validator
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Build, test, publish and exercise isolated main window
+        shell: pwsh
+        env:
+          PHOTOSHELF_SCALE_TESTS: ${{ inputs.scale == true }}
+        run: ./tools/harness.ps1 -Scale:($env:PHOTOSHELF_SCALE_TESTS -eq 'true')
+      - name: Preserve test results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-test-results-${{ github.sha }}
+          path: TestResults/windows-*/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve verified Windows package
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: PhotoShelf-win-x64-${{ github.sha }}
+          path: |
+            artifacts/windows-*/*.zip
+            artifacts/windows-*/*.sha256
+          if-no-files-found: error
+          retention-days: 14
