@@ -1,16 +1,18 @@
 using Microsoft.Data.Sqlite;
+using PhotoShelf.Application.Catalog;
 using System.IO;
 
-namespace PhotoShelf.Desktop;
+namespace PhotoShelf.Infrastructure.Sqlite;
 
 public sealed class DuplicateHashStore
 {
     private readonly string _connectionString;
+    private readonly string _directory;
 
-    public DuplicateHashStore()
+    public DuplicateHashStore(string? catalogDirectory = null)
     {
-        Directory.CreateDirectory(LocalCatalogStore.CatalogDirectory);
-        var databasePath = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite");
+        _directory = catalogDirectory ?? LocalCatalogStore.CatalogDirectory;
+        var databasePath = Path.Combine(_directory, "catalog-v2.sqlite");
         _connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
@@ -22,6 +24,7 @@ public sealed class DuplicateHashStore
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        Directory.CreateDirectory(_directory);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =

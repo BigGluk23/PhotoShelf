@@ -15,7 +15,6 @@
     <ProjectReference Include="..\PhotoShelf.Infrastructure.Sqlite\PhotoShelf.Infrastructure.Sqlite.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.8" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
-    <PackageReference Include="WpfAnimatedGif" Version="2.0.2" />
   </ItemGroup>
   <ItemGroup>
     <None Include="RUNNING.txt" CopyToOutputDirectory="PreserveNewest" />

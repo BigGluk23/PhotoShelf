@@ -1,10 +1,13 @@
-bin/
-obj/
+**/bin/
+**/obj/
+artifacts/
+releases/
+TestResults/
+.backups/
 .vs/
 .idea/
+.DS_Store
 *.user
 *.suo
-artifacts/
 PhotoShelf.catalog.db*
 thumb-cache/
-

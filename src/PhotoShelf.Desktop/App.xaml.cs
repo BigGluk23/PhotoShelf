@@ -22,7 +22,18 @@ public partial class App : System.Windows.Application
         loading.Show();
         await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
 
-        var mainWindow = new MainWindow();
+        MainWindow mainWindow;
+        try
+        {
+            var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
+            mainWindow = new MainWindow(state);
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show($"Не удалось открыть каталог. Данные сохранены.\n{ex.Message}", "PhotoShelf");
+            Shutdown(1);
+            return;
+        }
         MainWindow = mainWindow;
         mainWindow.Show();
         loading.Close();

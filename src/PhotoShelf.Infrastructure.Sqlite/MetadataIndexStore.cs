@@ -1,16 +1,18 @@
 using Microsoft.Data.Sqlite;
+using PhotoShelf.Application.Catalog;
 using System.IO;
 
-namespace PhotoShelf.Desktop;
+namespace PhotoShelf.Infrastructure.Sqlite;
 
 public sealed class MetadataIndexStore
 {
     private readonly string _connectionString;
+    private readonly string _directory;
 
-    public MetadataIndexStore()
+    public MetadataIndexStore(string? catalogDirectory = null)
     {
-        Directory.CreateDirectory(LocalCatalogStore.CatalogDirectory);
-        var databasePath = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite");
+        _directory = catalogDirectory ?? LocalCatalogStore.CatalogDirectory;
+        var databasePath = Path.Combine(_directory, "catalog-v2.sqlite");
         _connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
@@ -22,6 +24,7 @@ public sealed class MetadataIndexStore
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        Directory.CreateDirectory(_directory);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
@@ -39,24 +42,24 @@ public sealed class MetadataIndexStore
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<Dictionary<string, DateTime?>> LoadCaptureDatesAsync(CancellationToken cancellationToken = default)
+    public async Task<Dictionary<string, CachedCaptureDate>> LoadCaptureDatesAsync(CancellationToken cancellationToken = default)
     {
-        var result = new Dictionary<string, DateTime?>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, CachedCaptureDate>(StringComparer.OrdinalIgnoreCase);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT path, capture_date_ticks FROM desktop_metadata_cache;";
+        command.CommandText = "SELECT path, capture_date_ticks, size_bytes, file_modified_utc_ticks FROM desktop_metadata_cache;";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var path = reader.GetString(0);
             var captureDate = reader.IsDBNull(1) ? (DateTime?)null : new DateTime(reader.GetInt64(1), DateTimeKind.Local);
-            result[path] = captureDate;
+            result[path] = new CachedCaptureDate(reader.GetInt64(2), reader.GetInt64(3), captureDate);
         }
 
         return result;
     }
 
-    public async Task SaveAsync(PhotoItem item, CancellationToken cancellationToken = default)
+    public async Task SaveAsync(string path, long size, DateTime? modified, DateTime? captureDate, CancellationToken cancellationToken = default)
     {
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -75,10 +78,10 @@ public sealed class MetadataIndexStore
                 capture_date_ticks = excluded.capture_date_ticks,
                 metadata_indexed_at_utc = excluded.metadata_indexed_at_utc;
             """;
-        command.Parameters.AddWithValue("$path", item.Path);
-        command.Parameters.AddWithValue("$size", item.FileSizeBytes);
-        command.Parameters.AddWithValue("$modified", item.FileModifiedAt?.ToUniversalTime().Ticks ?? 0L);
-        command.Parameters.AddWithValue("$capture", item.CaptureDate is null ? DBNull.Value : item.CaptureDate.Value.Ticks);
+        command.Parameters.AddWithValue("$path", path);
+        command.Parameters.AddWithValue("$size", size);
+        command.Parameters.AddWithValue("$modified", modified?.ToUniversalTime().Ticks ?? 0L);
+        command.Parameters.AddWithValue("$capture", captureDate is null ? DBNull.Value : captureDate.Value.Ticks);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -92,3 +95,5 @@ public sealed class MetadataIndexStore
         return connection;
     }
 }
+
+public sealed record CachedCaptureDate(long Size, long ModifiedTicks, DateTime? CaptureDate);

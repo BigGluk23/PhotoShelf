@@ -4,7 +4,6 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using WpfAnimatedGif;
 
 namespace PhotoShelf.Desktop;
 
@@ -96,6 +95,7 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
         TitleText.Text = item.FileName;
         DetailText.Text = $"{_index + 1} из {_items.Count}   {item.DetailLine}   {item.Folder}";
         StopVideo();
+        AsyncMediaImage.SetPath(PhotoImage, null);
 
         if (item.IsVideo)
         {
@@ -116,36 +116,17 @@ public partial class PhotoViewerWindow : Window, INotifyPropertyChanged
         VideoControlsPanel.Visibility = Visibility.Collapsed;
         VideoPlayer.Visibility = Visibility.Collapsed;
         PhotoImage.Visibility = Visibility.Visible;
-        ImageBehavior.SetAnimatedSource(PhotoImage, null);
         PhotoImage.Source = null;
 
-        if (PhotoItem.IsWebpPath(item.Path))
-        {
-            PhotoImage.Source = ImageSharpBitmapLoader.TryLoad(item.Path, 2200);
-            return;
-        }
+        AsyncMediaImage.SetDecodeWidth(PhotoImage, 2200);
+        AsyncMediaImage.SetPath(PhotoImage, item.Path);
+    }
 
-        try
-        {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.UriSource = new Uri(item.Path, UriKind.Absolute);
-            bitmap.EndInit();
-            bitmap.Freeze();
-            if (PhotoItem.IsAnimatedGifPath(item.Path))
-            {
-                ImageBehavior.SetAnimatedSource(PhotoImage, bitmap);
-            }
-            else
-            {
-                PhotoImage.Source = bitmap;
-            }
-        }
-        catch
-        {
-            PhotoImage.Source = null;
-        }
+    protected override void OnClosed(EventArgs e)
+    {
+        StopVideo();
+        AsyncMediaImage.SetPath(PhotoImage, null);
+        base.OnClosed(e);
     }
 
     private void StopVideo()

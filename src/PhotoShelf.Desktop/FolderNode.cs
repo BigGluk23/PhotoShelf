@@ -7,6 +7,8 @@ namespace PhotoShelf.Desktop;
 public sealed class FolderNode : INotifyPropertyChanged
 {
     private bool _isIncluded = true;
+    private bool _isVisible = true;
+    public bool IsVisible { get => _isVisible; set { _isVisible = value; OnPropertyChanged(nameof(IsVisible)); } }
     private bool _isExpanded;
     private int _directItemCount;
 
@@ -18,6 +20,10 @@ public sealed class FolderNode : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
+    public bool IsPlaceholder { get; private set; }
+    public bool IsLoading { get; set; }
+    public bool ChildrenLoaded { get; set; }
+    public static FolderNode Placeholder() => new FolderNode("…") { IsPlaceholder = true };
     public string FullPath { get; }
 
     public string Name { get; }

@@ -1,7 +1,7 @@
 <Window x:Class="PhotoShelf.Desktop.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:gif="http://wpfanimatedgif.codeplex.com"
+        xmlns:media="clr-namespace:PhotoShelf.Desktop"
         Title="PhotoShelf"
         Width="1280"
         Height="800"
@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.6" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.7" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -91,7 +91,7 @@
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
                             <TreeView.Resources>
                                 <HierarchicalDataTemplate DataType="{x:Type local:FolderNode}" ItemsSource="{Binding Children}" xmlns:local="clr-namespace:PhotoShelf.Desktop">
-                                    <StackPanel Orientation="Horizontal">
+                                    <StackPanel Orientation="Horizontal" AllowDrop="True" DragOver="OnFolderDragOver" Drop="OnFolderDrop">
                                         <StackPanel.ContextMenu>
                                             <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
                                                 <MenuItem Header="Открыть папку в проводнике" Click="OnFolderContextOpenInExplorerClicked" />
@@ -103,7 +103,7 @@
                                                    Foreground="#FFB9B5AE"
                                                    Margin="0,0,4,0"
                                                    VerticalAlignment="Center" />
-                                        <CheckBox IsChecked="{Binding IsIncluded, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Checked="OnFolderIncludedChanged" Unchecked="OnFolderIncludedChanged" VerticalAlignment="Center" />
+                                        <CheckBox IsChecked="{Binding IsIncluded, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Click="OnFolderIncludedChanged" VerticalAlignment="Center" />
                                         <TextBlock Text="{Binding DisplayText}" Margin="4,0,0,0" VerticalAlignment="Center" />
                                     </StackPanel>
                                 </HierarchicalDataTemplate>
@@ -111,6 +111,7 @@
                             <TreeView.ItemContainerStyle>
                                 <Style TargetType="TreeViewItem">
                                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                    <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolToVisibility}}" />
                                     <EventSetter Event="Expanded" Handler="OnFolderTreeItemExpanded" />
                                 </Style>
                             </TreeView.ItemContainerStyle>
@@ -141,6 +142,7 @@
                                 <ComboBoxItem Content="Дата съёмки" Tag="CaptureDate" />
                                 <ComboBoxItem Content="Дата файла" Tag="FileDate" />
                             </ComboBox>
+                            <CheckBox x:Name="SubfoldersCheckBox" Content="Подпапки" IsChecked="True" VerticalAlignment="Center" Click="OnSubfoldersChanged" Margin="0,0,8,0" />
                             <Button x:Name="DateSortButton" Style="{StaticResource FlatActionButton}" Content="Съёмка ↓" Click="OnDateSortClicked" ToolTip="Переключить сортировку по дате" />
                             <Button x:Name="MissingCaptureDateFilterButton" Style="{StaticResource FlatActionButton}" Content="Без даты съёмки" Click="OnMissingCaptureDateFilterClicked" />
                         </StackPanel>
@@ -209,15 +211,14 @@
                                                         Margin="8"
                                                         Padding="6"
                                                         Background="#F8FFFFFF"
-                                                        BorderBrush="{StaticResource BorderBrush}"
-                                                        BorderThickness="1"
                                                         CornerRadius="4"
-                                                        MouseLeftButtonDown="OnPhotoTileMouseLeftButtonDown">
+                                                        MouseLeftButtonDown="OnPhotoTileMouseLeftButtonDown" MouseMove="OnPhotoTileMouseMove">
                                                     <Border.ContextMenu>
                                                         <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
                                                             <MenuItem Header="Открыть" Click="OnPhotoContextOpenClicked" />
                                                             <MenuItem Header="Открыть в проводнике" Click="OnPhotoContextOpenFolderClicked" />
                                                             <MenuItem Header="Избранное / убрать" Click="OnPhotoContextFavoriteClicked" />
+                                                            <MenuItem Header="Разложить выбранные по годам…" Click="OnOrganizeYearsClicked" />
                                                             <MenuItem Header="Сведения" Click="OnPhotoContextInfoClicked" />
                                                         </ContextMenu>
                                                     </Border.ContextMenu>
@@ -236,7 +237,8 @@
                                                     <StackPanel>
                                                         <Border Height="{Binding DataContext.TileImageHeight, RelativeSource={RelativeSource AncestorType=Window}}" Background="#FFE5E2DC" ClipToBounds="True">
                                                             <Grid>
-                                                                <Image Source="{Binding Thumbnail}" gif:ImageBehavior.AnimatedSource="{Binding Thumbnail}" Stretch="UniformToFill" />
+                                                                <Image x:Name="TileImage" media:AsyncMediaImage.Path="{Binding Path}" Stretch="UniformToFill" />
+                                                                <TextBlock Text="{Binding ElementName=TileImage, Path=(media:AsyncMediaImage.Status)}" TextWrapping="Wrap" FontSize="10" Background="#DDE5E2DC" VerticalAlignment="Bottom" />
                                                                 <TextBlock Text="{Binding KindLabel}"
                                                                            Foreground="{StaticResource MutedTextBrush}"
                                                                            FontWeight="SemiBold"

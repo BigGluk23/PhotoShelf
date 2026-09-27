@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using SixLabors.ImageSharp.Metadata.Profiles.Exif;
 
 namespace PhotoShelf.Desktop;
 
@@ -27,6 +28,15 @@ public sealed class PhotoItem : INotifyPropertyChanged
         var file = new FileInfo(path);
         FileSizeBytes = file.Exists ? file.Length : 0;
         FileModifiedAt = file.Exists ? file.LastWriteTime : null;
+    }
+
+    public PhotoItem(string path, long sizeBytes, DateTime? modifiedAt)
+    {
+        Path = path;
+        FileName = System.IO.Path.GetFileName(path);
+        IsVideo = IsVideoPath(path);
+        FileSizeBytes = sizeBytes;
+        FileModifiedAt = modifiedAt;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -121,7 +131,7 @@ public sealed class PhotoItem : INotifyPropertyChanged
         }
 
         IsCaptureDateLoaded = true;
-        var captureDate = IsVideo ? null : TryReadCaptureDate(Path);
+        var captureDate = IsVideo ? null : ReadCaptureDate(Path);
         if (CaptureDate == captureDate)
         {
             return false;
@@ -310,6 +320,21 @@ public sealed class PhotoItem : INotifyPropertyChanged
 
         try
         {
+            var info = SixLabors.ImageSharp.Image.Identify(Path);
+            text.AppendLine($"Пиксели: {info.Width} x {info.Height}");
+            text.AppendLine($"Кадров: {info.FrameMetadataCollection.Count}");
+            if (info.Metadata.ExifProfile is { } exif)
+                foreach (var value in exif.Values) text.AppendLine($"{value.Tag}: {value.GetValue()}");
+            if (info.Metadata.IptcProfile is { } iptc)
+                foreach (var value in iptc.Values) text.AppendLine($"IPTC {value.Tag}: {value.Value}");
+            if (info.Metadata.XmpProfile is { } xmp)
+                text.AppendLine(System.Text.Encoding.UTF8.GetString(xmp.ToByteArray()));
+            return text.ToString();
+        }
+        catch { /* A WIC metadata reader remains a fallback for legacy formats. */ }
+
+        try
+        {
             using var stream = File.OpenRead(Path);
             var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad);
             var frame = decoder.Frames.FirstOrDefault();
@@ -370,8 +395,16 @@ public sealed class PhotoItem : INotifyPropertyChanged
         return string.IsNullOrWhiteSpace(second) ? first : $"{first} {second}";
     }
 
-    private static DateTime? TryReadCaptureDate(string path)
+    public static DateTime? ReadCaptureDate(string path)
     {
+        try
+        {
+            var exif = SixLabors.ImageSharp.Image.Identify(path).Metadata.ExifProfile;
+            if (exif is not null && exif.TryGetValue(ExifTag.DateTimeOriginal, out var original) &&
+                DateTime.TryParseExact(original.Value, "yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out var capture))
+                return capture;
+        }
+        catch { }
         try
         {
             using var stream = File.OpenRead(path);

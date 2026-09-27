@@ -28,7 +28,7 @@ public static class ImageSharpBitmapLoader
         }
     }
 
-    private static BitmapSource ToBitmapSource(Image<Rgba32> image)
+    public static BitmapSource ToBitmapSource(Image<Rgba32> image)
     {
         var width = image.Width;
         var height = image.Height;

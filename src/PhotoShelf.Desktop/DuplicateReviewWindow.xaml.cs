@@ -4,18 +4,21 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using PhotoShelf.Application.Files;
 
 namespace PhotoShelf.Desktop;
 
 public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
 {
+    private readonly Func<MoveEntry, Task> _commitCatalog;
+    private bool _moving;
     private DuplicateGroupViewModel? _selectedGroup;
 
-    public DuplicateReviewWindow(IReadOnlyList<DuplicateGroup> groups)
+    public DuplicateReviewWindow(ObservableCollection<DuplicateGroupViewModel> groups, Func<MoveEntry, Task> commitCatalog)
     {
         InitializeComponent();
-        Groups = new ObservableCollection<DuplicateGroupViewModel>(
-            groups.Select((group, index) => new DuplicateGroupViewModel(group, index + 1)));
+        _commitCatalog = commitCatalog;
+        Groups = groups;
         DataContext = this;
         GroupList.SelectedIndex = Groups.Count > 0 ? 0 : -1;
         RefreshSummary();
@@ -53,96 +56,81 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private void OnKeepNewestClicked(object sender, RoutedEventArgs e)
+    private async void OnKeepNewestClicked(object sender, RoutedEventArgs e)
     {
-        foreach (var group in Groups)
+        if (_moving) return;
+        foreach (var batch in Groups.ToArray().Chunk(32))
         {
-            group.KeepNewest();
+            foreach (var group in batch) { group.KeepNewest(); }
+            await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         }
-
         RefreshSummary();
     }
 
-    private void OnKeepShortestPathClicked(object sender, RoutedEventArgs e)
+    private async void OnKeepShortestPathClicked(object sender, RoutedEventArgs e)
     {
-        foreach (var group in Groups)
+        if (_moving) return;
+        foreach (var batch in Groups.ToArray().Chunk(32))
         {
-            group.KeepShortestPath();
+            foreach (var group in batch) { group.KeepShortestPath(); }
+            await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         }
-
         RefreshSummary();
     }
 
-    private void OnKeepLargestFileClicked(object sender, RoutedEventArgs e)
+    private async void OnKeepLargestFileClicked(object sender, RoutedEventArgs e)
     {
-        foreach (var group in Groups)
+        if (_moving) return;
+        foreach (var batch in Groups.ToArray().Chunk(32))
         {
-            group.KeepLargestFile();
+            foreach (var group in batch) { group.KeepLargestFile(); }
+            await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         }
-
         RefreshSummary();
     }
 
-    private void OnMarkExtrasClicked(object sender, RoutedEventArgs e)
+    private async void OnMarkExtrasClicked(object sender, RoutedEventArgs e)
     {
-        foreach (var group in Groups)
+        foreach (var group in Groups.ToArray())
         {
             foreach (var item in group.Items)
             {
                 item.IsSelected = !item.IsKeep;
             }
+            await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         }
 
         RefreshSummary();
     }
 
-    private void OnMoveMarkedClicked(object sender, RoutedEventArgs e)
+    private async void OnMoveMarkedClicked(object sender, RoutedEventArgs e)
     {
+        if (_moving) return;
         var marked = Groups.SelectMany(group => group.GetMarkedItems()).ToArray();
-        if (marked.Length == 0)
+        if (marked.Length == 0) return;
+        var batchRoot = Path.Combine(QuarantineRoot, $"{DateTime.Now:yyyy-MM-dd_HH-mm-ss}-{Guid.NewGuid():N}");
+        var requests = marked.Select(x => new MoveRequest(x.Photo.Path, x.Photo.CaptureDate)).ToArray();
+        var dialog = new MovePlanWindow(requests, batchRoot, false) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var plan = dialog.Plan;
+        _moving = true;
+        try
         {
-            System.Windows.MessageBox.Show("Сначала отметьте файлы для карантина.", "Карантин", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
+            var journal = Path.Combine(LocalCatalogStore.CatalogDirectory, "operations", $"quarantine-{Guid.NewGuid():N}.jsonl");
+            var results = await Task.Run(() => new FileMoveService().ExecuteAsync(plan, journal, _commitCatalog, null, CancellationToken.None));
+            var moved = results.Where(x => x.Moved).Select(x => x.Entry.Source).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            RemoveMovedItems(marked.Where(x => moved.Contains(x.Photo.Path)).ToArray());
+            System.Windows.MessageBox.Show($"Перенесено: {moved.Count}\nПропуски/ошибки: {results.Count - moved.Count}\nКарантин: {batchRoot}\nЖурнал: {journal}", "Карантин");
+            RefreshSummary();
         }
+        catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Карантин: операция остановлена"); }
+        finally { _moving = false; }
+    }
 
-        var result = System.Windows.MessageBox.Show(
-            $"Перенести в карантин {marked.Length} файлов?\n\nОни не будут удалены. Их можно проверить в папке карантина.",
-            "Карантин дубликатов",
-            MessageBoxButton.OKCancel,
-            MessageBoxImage.Warning);
-        if (result != MessageBoxResult.OK)
-        {
-            return;
-        }
-
-        var batchRoot = Path.Combine(QuarantineRoot, DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss"));
-        Directory.CreateDirectory(batchRoot);
-        var movedItems = new List<DuplicateItemViewModel>();
-        foreach (var item in marked)
-        {
-            try
-            {
-                var relative = item.Photo.Path
-                    .Replace(Path.GetPathRoot(item.Photo.Path) ?? "", "", StringComparison.OrdinalIgnoreCase)
-                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                var target = Path.Combine(batchRoot, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                if (File.Exists(target))
-                {
-                    target = Path.Combine(Path.GetDirectoryName(target)!, $"{Path.GetFileNameWithoutExtension(target)}_{Guid.NewGuid():N}{Path.GetExtension(target)}");
-                }
-
-                File.Move(item.Photo.Path, target);
-                movedItems.Add(item);
-            }
-            catch
-            {
-            }
-        }
-
-        RemoveMovedItems(movedItems);
-        System.Windows.MessageBox.Show($"Перенесено в карантин: {movedItems.Count}\n\nПапка: {batchRoot}", "Карантин", MessageBoxButton.OK, MessageBoxImage.Information);
-        RefreshSummary();
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (_moving) { e.Cancel = true; StatusText.Text = "Дождитесь завершения безопасного переноса"; }
+        base.OnClosing(e);
     }
 
     private void RemoveMovedItems(IReadOnlyCollection<DuplicateItemViewModel> movedItems)

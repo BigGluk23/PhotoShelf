@@ -1,16 +1,18 @@
 using Microsoft.Data.Sqlite;
+using PhotoShelf.Application.Catalog;
 using System.IO;
 
-namespace PhotoShelf.Desktop;
+namespace PhotoShelf.Infrastructure.Sqlite;
 
 public sealed class SqliteDesktopCatalogStore
 {
     private readonly string _connectionString;
+    private readonly string _directory;
 
-    public SqliteDesktopCatalogStore()
+    public SqliteDesktopCatalogStore(string? catalogDirectory = null)
     {
-        Directory.CreateDirectory(LocalCatalogStore.CatalogDirectory);
-        var databasePath = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite");
+        _directory = catalogDirectory ?? LocalCatalogStore.CatalogDirectory;
+        var databasePath = Path.Combine(_directory, "catalog-v2.sqlite");
         _connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
@@ -22,10 +24,12 @@ public sealed class SqliteDesktopCatalogStore
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        Directory.CreateDirectory(_directory);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
+            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS desktop_media_items (
                 path TEXT NOT NULL PRIMARY KEY,
                 is_favorite INTEGER NOT NULL DEFAULT 0,
@@ -47,13 +51,14 @@ public sealed class SqliteDesktopCatalogStore
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<LocalCatalogState> LoadAsync(CancellationToken cancellationToken = default)
+    public async Task<LocalCatalogState> LoadAsync(CancellationToken cancellationToken = default, bool includeItems = true)
     {
         var state = new LocalCatalogState();
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        await using (var command = connection.CreateCommand())
+        if (includeItems)
         {
+            await using var command = connection.CreateCommand();
             command.CommandText = "SELECT path, is_favorite FROM desktop_media_items ORDER BY file_modified_utc_ticks DESC;";
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -84,7 +89,17 @@ public sealed class SqliteDesktopCatalogStore
             {
                 var key = reader.GetString(0);
                 var value = reader.GetString(1);
-                if (key == "tile_width" && double.TryParse(value, out var tileWidth))
+                state.ReadItemsFromSqlite = true;
+                switch (key)
+                {
+                    case "include_system": state.IncludeSystemFolders = bool.Parse(value); break;
+                    case "active_folder": state.ActiveFolder = string.IsNullOrEmpty(value) ? null : value; break;
+                    case "view_mode": state.ViewMode = value; break;
+                    case "newest_first": state.SortNewestFirst = bool.Parse(value); break;
+                    case "include_subfolders": state.IncludeSubfolders = bool.Parse(value); break;
+                    case "expanded": state.ExpandedFolders = System.Text.Json.JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
+                }
+                if (key == "tile_width" && double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var tileWidth))
                 {
                     state.TileWidth = tileWidth;
                 }
@@ -102,22 +117,42 @@ public sealed class SqliteDesktopCatalogStore
         return state;
     }
 
-    public async Task SaveAsync(LocalCatalogState state, CancellationToken cancellationToken = default)
+    // Called by the catalog worker; each callback is awaited to bound dispatcher pressure.
+    public async Task ReadBatchesAsync(Func<IReadOnlyList<SavedMediaItem>, Task> apply, CancellationToken token)
+    {
+        await using var connection = await OpenAsync(token).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT path, is_favorite, size_bytes, file_modified_utc_ticks FROM desktop_media_items ORDER BY file_modified_utc_ticks DESC, path;";
+        await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+        var batch = new List<SavedMediaItem>(128);
+        while (await reader.ReadAsync(token).ConfigureAwait(false))
+        {
+            token.ThrowIfCancellationRequested();
+            batch.Add(new SavedMediaItem { Path = reader.GetString(0), IsFavorite = reader.GetInt64(1) == 1,
+                SizeBytes = reader.GetInt64(2), FileModifiedAt = reader.GetInt64(3) == 0 ? null : new DateTime(reader.GetInt64(3), DateTimeKind.Utc).ToLocalTime() });
+            if (batch.Count < 128) continue;
+            await apply(batch.ToArray()).ConfigureAwait(false);
+            batch.Clear();
+        }
+        if (batch.Count > 0) await apply(batch.ToArray()).ConfigureAwait(false);
+    }
+
+    public async Task SaveAsync(LocalCatalogState state, CancellationToken cancellationToken = default, bool saveItems = true)
     {
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        await ExecuteAsync(connection, transaction, "DELETE FROM desktop_media_items;", cancellationToken).ConfigureAwait(false);
+        if (saveItems) await ExecuteAsync(connection, transaction, "DELETE FROM desktop_media_items;", cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, transaction, "DELETE FROM desktop_excluded_folders;", cancellationToken).ConfigureAwait(false);
 
-        foreach (var item in state.Items)
+        foreach (var item in saveItems ? state.Items : Enumerable.Empty<SavedMediaItem>())
         {
             if (string.IsNullOrWhiteSpace(item.Path))
             {
                 continue;
             }
 
-            var file = new FileInfo(item.Path);
+            
             await using var command = connection.CreateCommand();
             command.Transaction = (SqliteTransaction)transaction;
             command.CommandText =
@@ -127,9 +162,9 @@ public sealed class SqliteDesktopCatalogStore
                 """;
             command.Parameters.AddWithValue("$path", item.Path);
             command.Parameters.AddWithValue("$favorite", item.IsFavorite ? 1 : 0);
-            command.Parameters.AddWithValue("$size", file.Exists ? file.Length : 0);
-            command.Parameters.AddWithValue("$modified", file.Exists ? file.LastWriteTimeUtc.Ticks : 0);
-            command.Parameters.AddWithValue("$video", PhotoItem.IsVideoPath(item.Path) ? 1 : 0);
+            command.Parameters.AddWithValue("$size", item.SizeBytes);
+            command.Parameters.AddWithValue("$modified", item.FileModifiedAt?.ToUniversalTime().Ticks ?? 0);
+            command.Parameters.AddWithValue("$video", item.IsVideo ? 1 : 0);
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -146,7 +181,32 @@ public sealed class SqliteDesktopCatalogStore
         await UpsertSettingAsync(connection, transaction, "show_videos", state.ShowVideos.ToString(), cancellationToken).ConfigureAwait(false);
         await UpsertSettingAsync(connection, transaction, "date_grouping_mode", state.DateGroupingMode, cancellationToken).ConfigureAwait(false);
 
+        await UpsertSettingAsync(connection, transaction, "include_system", state.IncludeSystemFolders.ToString(), cancellationToken);
+        await UpsertSettingAsync(connection, transaction, "active_folder", state.ActiveFolder ?? "", cancellationToken);
+        await UpsertSettingAsync(connection, transaction, "view_mode", state.ViewMode, cancellationToken);
+        await UpsertSettingAsync(connection, transaction, "newest_first", state.SortNewestFirst.ToString(), cancellationToken);
+        await UpsertSettingAsync(connection, transaction, "include_subfolders", state.IncludeSubfolders.ToString(), cancellationToken);
+        await UpsertSettingAsync(connection, transaction, "expanded", System.Text.Json.JsonSerializer.Serialize(state.ExpandedFolders), cancellationToken);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task MoveItemAsync(string source, string destination, bool removeFromLibrary = false)
+    {
+        await using var connection = await OpenAsync(CancellationToken.None);
+        await using var transaction = connection.BeginTransaction();
+        foreach (var table in new[] { "desktop_media_items", "desktop_metadata_cache", "duplicate_hash_cache" })
+        {
+            await using var exists = connection.CreateCommand(); exists.Transaction = transaction;
+            exists.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$table";
+            exists.Parameters.AddWithValue("$table", table);
+            if (Convert.ToInt64(await exists.ExecuteScalarAsync()) == 0) continue;
+            await using var command = connection.CreateCommand(); command.Transaction = transaction;
+            command.CommandText = removeFromLibrary ? $"DELETE FROM {table} WHERE path=$source;" : $"UPDATE {table} SET path=$destination WHERE path=$source;";
+            command.Parameters.AddWithValue("$source", source);
+            if (!removeFromLibrary) command.Parameters.AddWithValue("$destination", destination);
+            await command.ExecuteNonQueryAsync();
+        }
+        await transaction.CommitAsync();
     }
 
     private static async Task UpsertSettingAsync(SqliteConnection connection, SqliteTransaction transaction, string key, string value, CancellationToken cancellationToken)

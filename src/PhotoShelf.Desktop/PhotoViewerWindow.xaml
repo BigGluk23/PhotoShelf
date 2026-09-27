@@ -2,7 +2,6 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:PhotoShelf.Desktop"
-        xmlns:gif="http://wpfanimatedgif.codeplex.com"
         Title="PhotoShelf Viewer"
         Width="1160"
         Height="800"
@@ -50,6 +49,7 @@
                    Stretch="Uniform"
                    SnapsToDevicePixels="True" />
 
+            <TextBlock Text="{Binding ElementName=PhotoImage, Path=(local:AsyncMediaImage.Status)}" Foreground="White" Background="#BB202126" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="8" Padding="8" />
             <MediaElement x:Name="VideoPlayer"
                           LoadedBehavior="Manual"
                           UnloadedBehavior="Stop"
@@ -146,7 +146,7 @@
                     <DataTemplate>
                         <Border x:Name="ThumbCard" Width="{Binding Width}" Height="{Binding Height}" Background="#FF2D3036" CornerRadius="10" ClipToBounds="True">
                             <Grid>
-                                <Image Source="{Binding Item.Thumbnail}" gif:ImageBehavior.AnimatedSource="{Binding Item.Thumbnail}" Stretch="UniformToFill" />
+                                <Image local:AsyncMediaImage.Path="{Binding Item.Path}" Stretch="UniformToFill" />
                                 <TextBlock Text="{Binding Item.KindLabel}"
                                            Foreground="#FFEFEFEF"
                                            FontWeight="SemiBold"

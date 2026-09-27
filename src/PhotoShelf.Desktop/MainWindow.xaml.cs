@@ -16,8 +16,9 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "v0.9.6";
+    private const string VersionLabel = "v0.9.7";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PhotoItem> _itemsByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _knownPhotoPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SavedDuplicateHash> _duplicateHashCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
@@ -37,7 +38,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _isInitializing = true;
     private bool _catalogLoaded;
     private bool _isCatalogLoading;
-    private bool _isUpdatingFolderChecks;
     private readonly DispatcherTimer _folderFilterRefreshTimer;
     private bool _sortNewestFirst = true;
     private DateGroupingMode _dateGroupingMode = DateGroupingMode.FileDate;
@@ -48,14 +48,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private LibraryViewMode _viewMode = LibraryViewMode.All;
     private readonly HashSet<string> _collapsedDateGroups = new(StringComparer.OrdinalIgnoreCase);
 
-    public MainWindow()
+    public MainWindow(LocalCatalogState initialState)
     {
         InitializeComponent();
         Title = $"PhotoShelf {VersionLabel}";
         AppTitleText.Text = $"PhotoShelf {VersionLabel}";
         DataContext = this;
-        _catalogState = LoadInitialCatalogState();
-        foreach (var hash in LoadInitialDuplicateHashes(_catalogState))
+        _catalogState = initialState;
+        foreach (var hash in _catalogState.DuplicateHashes)
         {
             if (!string.IsNullOrWhiteSpace(hash.Path) && !string.IsNullOrWhiteSpace(hash.Hash))
             {
@@ -68,7 +68,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ShowVideosCheckBox.IsChecked = ShowVideos;
         _includeSystemFolders = _catalogState.IncludeSystemFolders;
         IncludeSystemFoldersCheckBox.IsChecked = _includeSystemFolders;
-        _dateGroupingMode = DateGroupingMode.FileDate;
+        _dateGroupingMode = Enum.TryParse<DateGroupingMode>(_catalogState.DateGroupingMode, out var savedMode) ? savedMode : DateGroupingMode.FileDate;
+        _sortNewestFirst = _catalogState.SortNewestFirst;
+        _activeFolder = _catalogState.ActiveFolder;
+        _viewMode = Enum.TryParse<LibraryViewMode>(_catalogState.ViewMode, out var view) ? view : LibraryViewMode.All;
+        _includeSubfolders = _catalogState.IncludeSubfolders;
+        SubfoldersCheckBox.IsChecked = _includeSubfolders;
+        foreach (var folder in _catalogState.ExcludedFolders) _excludedFolders.Add(NormalizePath(folder));
         DateModeBox.SelectedIndex = _dateGroupingMode == DateGroupingMode.CaptureDate ? 0 : 1;
         RefreshDateSortButton();
         FolderTree.ItemsSource = FolderRoots;
@@ -79,7 +85,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Interval = TimeSpan.FromMilliseconds(250)
         };
         _folderFilterRefreshTimer.Tick += OnFolderFilterRefreshTimerTick;
-        _ = InitializeSqliteCatalogAsync();
+        foreach (var root in DriveInfo.GetDrives()) AddFolder(root.Name);
+        if (_activeFolder is not null) AddFolder(_activeFolder);
+        foreach (var path in _catalogState.ExpandedFolders) AddFolder(path);
+        ViewTitleText.Text = _viewMode == LibraryViewMode.Folder ? _activeFolder : _viewMode switch
+        { LibraryViewMode.Favorites => "Избранное", LibraryViewMode.Recent => "Последние", _ => "Все фотографии" };
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -155,12 +165,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        await ScanRootsAsync(PhotoScanner.GetDefaultDiscoveryRoots());
+        await ScanRootsAsync(await Task.Run(PhotoScanner.GetDefaultDiscoveryRoots));
     }
 
     private async void OnDuplicatesClicked(object sender, RoutedEventArgs e)
     {
-        var scope = AskDuplicateScope();
+        var scope = await AskDuplicateScopeAsync();
         if (scope is null)
         {
             return;
@@ -185,17 +195,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _includeSystemFolders = dialog.IncludeSystemFolders;
         ShowVideosCheckBox.IsChecked = ShowVideos;
         IncludeSystemFoldersCheckBox.IsChecked = _includeSystemFolders;
+        RefreshTreeVisibility();
         RebuildRows();
         RefreshChrome();
         SaveCatalogState();
     }
 
-    private async void OnMainWindowLoaded(object sender, RoutedEventArgs e)
+    private void OnMainWindowLoaded(object sender, RoutedEventArgs e)
     {
-        await InitializeMetadataIndexAsync();
-        _catalogLoaded = true;
         _isInitializing = false;
-        RefreshChrome();
         StartSavedCatalogLoading();
     }
 
@@ -221,6 +229,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnAllPhotosClicked(object sender, RoutedEventArgs e)
     {
+        _browseCancellation?.Cancel();
         _activeFolder = null;
         _viewMode = LibraryViewMode.All;
         FolderTree.Focus();
@@ -231,6 +240,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnFavoritesClicked(object sender, RoutedEventArgs e)
     {
+        _browseCancellation?.Cancel();
         _activeFolder = null;
         _viewMode = LibraryViewMode.Favorites;
         FolderTree.Focus();
@@ -241,6 +251,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnRecentClicked(object sender, RoutedEventArgs e)
     {
+        _browseCancellation?.Cancel();
         _activeFolder = null;
         _viewMode = LibraryViewMode.Recent;
         FolderTree.Focus();
@@ -313,7 +324,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        StartBackgroundCatalogMaintenance();
+        RefreshTreeVisibility();
+        foreach (var node in _folderNodes.Values) node.ChildrenLoaded = false;
         QueueFolderFilterRefresh();
     }
 
@@ -329,6 +341,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _activeFolder = folderNode.FullPath;
         _viewMode = LibraryViewMode.Folder;
         RebuildRows();
+        _ = BrowseFolderAsync(folderNode.FullPath);
         RefreshChrome();
     }
 
@@ -342,48 +355,38 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnFolderIncludedChanged(object sender, RoutedEventArgs e)
     {
-        if (_isUpdatingFolderChecks)
-        {
-            e.Handled = true;
-            return;
-        }
-
-        if (!_isUpdatingFolderChecks && sender is System.Windows.Controls.CheckBox { DataContext: FolderNode node })
-        {
-            _ = SetFolderIncludedRecursiveAsync(node, node.IsIncluded);
-        }
-
+        if (_isInitializing || sender is not System.Windows.Controls.CheckBox { DataContext: FolderNode node } || node.IsPlaceholder) return;
+        _scanCancellation?.Cancel();
+        _excludedFolders.RemoveWhere(x => IsUnderFolder(x, node.FullPath));
+        if (node.IsIncluded) _excludedFolders.RemoveWhere(x => IsUnderFolder(node.FullPath, x));
+        else _excludedFolders.Add(node.FullPath);
+        _ = RefreshFolderChecksAsync();
+        if (node.IsIncluded) _ = ScanRootsAsync(new[] { node.FullPath }, changeView: false);
         QueueFolderFilterRefresh();
         e.Handled = true;
     }
 
-    private async Task SetFolderIncludedRecursiveAsync(FolderNode node, bool isIncluded)
+    private int _folderCheckRevision;
+    private async Task RefreshFolderChecksAsync()
     {
-        _isUpdatingFolderChecks = true;
-        try
+        var revision = ++_folderCheckRevision;
+        var nodes = _folderNodes.Values.ToArray();
+        var excluded = _excludedFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var included = await Task.Run(() => nodes.Select(node =>
         {
-            var pending = new Queue<FolderNode>(node.Children);
-            var changed = 0;
-            while (pending.Count > 0)
+            string? current = node.FullPath;
+            while (!string.IsNullOrEmpty(current))
             {
-                var child = pending.Dequeue();
-                child.IsIncluded = isIncluded;
-                foreach (var grandChild in child.Children)
-                {
-                    pending.Enqueue(grandChild);
-                }
-
-                changed++;
-                if (changed % 100 == 0)
-                {
-                    await Dispatcher.Yield(DispatcherPriority.Background);
-                }
+                if (excluded.Contains(NormalizePath(current))) return false;
+                current = Path.GetDirectoryName(current.TrimEnd(Path.DirectorySeparatorChar));
             }
-        }
-        finally
+            return true;
+        }).ToArray());
+        for (var index = 0; index < nodes.Length; index++)
         {
-            _isUpdatingFolderChecks = false;
-            QueueFolderFilterRefresh();
+            if (revision != _folderCheckRevision || _lifetime.IsCancellationRequested) return;
+            nodes[index].IsIncluded = included[index];
+            if (index % 64 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
         }
     }
 
@@ -417,7 +420,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        SelectPhoto(item);
+        _dragStart = e.GetPosition(this);
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && _selectedPhoto is not null)
+        {
+            var start = Array.IndexOf(_visiblePhotos, _selectedPhoto);
+            var end = Array.IndexOf(_visiblePhotos, item);
+            if (start >= 0 && end >= 0) foreach (var selected in _visiblePhotos.Skip(Math.Min(start, end)).Take(Math.Abs(end - start) + 1))
+            { _selection.Add(selected); selected.IsSelected = true; }
+        }
+        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0)
+        {
+            if (!_selection.Add(item)) _selection.Remove(item);
+            item.IsSelected = _selection.Contains(item);
+        }
+        else if (!_selection.Contains(item))
+        {
+            foreach (var selected in _selection) selected.IsSelected = false;
+            _selection.Clear(); _selection.Add(item); item.IsSelected = true;
+        }
+        _selectedPhoto = item;
+        SelectedText.Text = $"Выбрано: {_selection.Count}";
+        UpdateInfoPanel();
 
         if (e.ClickCount == 2)
         {
@@ -448,7 +471,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OpenViewer(PhotoItem selected)
     {
-        var visibleItems = GetVisiblePhotos().ToArray();
+        var visibleItems = _visiblePhotos;
         var index = Array.IndexOf(visibleItems, selected);
         var viewer = new PhotoViewerWindow(visibleItems, Math.Max(0, index))
         {
@@ -504,7 +527,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnFolderContextOpenInExplorerClicked(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: FolderNode node } || !Directory.Exists(node.FullPath))
+        if (sender is not FrameworkElement { DataContext: FolderNode node })
         {
             return;
         }
@@ -519,7 +542,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void OnFolderContextScanClicked(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: FolderNode node } || !Directory.Exists(node.FullPath))
+        if (sender is not FrameworkElement { DataContext: FolderNode node })
         {
             return;
         }
@@ -529,7 +552,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void OnFolderContextDuplicatesClicked(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: FolderNode node } || !Directory.Exists(node.FullPath))
+        if (sender is not FrameworkElement { DataContext: FolderNode node })
         {
             return;
         }
@@ -542,64 +565,74 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await FindExactDuplicatesAsync(DuplicateSearchScope.CurrentFolder);
     }
 
-    private async Task ScanRootsAsync(IEnumerable<string> roots)
+    private async Task ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
     {
         _scanCancellation?.Cancel();
-        _scanCancellation = new CancellationTokenSource();
-
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _scanCancellation = operation;
+        var token = operation.Token;
         SetScanning(true);
-        var token = _scanCancellation.Token;
-        var rootList = roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        foreach (var root in rootList)
-        {
-            AddFolder(root);
-        }
-
-        try
+        var rootList = roots.ToArray();
+        foreach (var root in rootList) AddFolder(root);
+        if (changeView)
         {
             _activeFolder = null;
             _viewMode = LibraryViewMode.All;
-            RebuildRows();
             ViewTitleText.Text = "Все фотографии";
-            var progress = new Progress<PhotoScanBatch>(ApplyScanBatch);
-            await PhotoScanner.ScanAsync(rootList, progress, _includeSystemFolders, token);
             RebuildRows();
-            StatusText.Text = FormatPhotoCount(Photos.Count);
+        }
+        var includeSystem = _includeSystemFolders;
+        var excluded = _excludedFolders.ToArray();
+        try
+        {
+            await PhotoScanner.ScanAsync(rootList, async batch =>
+            {
+                token.ThrowIfCancellationRequested();
+                var items = batch.Paths.Select(path => new PhotoItem(path)).ToArray();
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (token.IsCancellationRequested) return;
+                    ApplyItems(items);
+                    StatusText.Text = $"Сканирую: {batch.CurrentFolder} · {Photos.Count}";
+                }, DispatcherPriority.Background, token);
+            }, includeSystem, token, excluded);
+            RebuildRows();
             SaveCatalogState();
             StartMetadataIndexing(resetExisting: false);
         }
-        catch (OperationCanceledException)
-        {
-            StatusText.Text = $"Поиск остановлен. Найдено: {Photos.Count}";
-        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { StatusText.Text = $"Ошибка сканирования: {ex.Message}"; }
         finally
         {
-            SetScanning(false);
-            RefreshChrome();
+            if (ReferenceEquals(_scanCancellation, operation))
+            {
+                _scanCancellation = null;
+                SetScanning(false);
+            }
         }
     }
 
-    private void ApplyScanBatch(PhotoScanBatch batch)
+    private void ApplyItems(IReadOnlyList<PhotoItem> items)
     {
-        if (batch.Paths.Count == 0)
+        foreach (var item in items)
         {
-            StatusText.Text = $"Сканирую: {batch.CurrentFolder}";
-            return;
-        }
-
-        foreach (var path in batch.Paths)
-        {
-            if (_knownPhotoPaths.Add(path))
+            if (!_knownPhotoPaths.Add(item.Path))
             {
-                var item = new PhotoItem(path);
-                Photos.Add(item);
-                AddFolder(item.Folder, incrementDirectCount: true);
-                AddPhotoToRows(item);
+                if (!_itemsByPath.TryGetValue(item.Path, out var old) || (old.FileSizeBytes == item.FileSizeBytes && old.FileModifiedAt == item.FileModifiedAt)) continue;
+                item.IsFavorite = old.IsFavorite;
+                var index = Photos.IndexOf(old);
+                if (index >= 0) Photos[index] = item;
+                _itemsByPath[item.Path] = item;
+                _duplicateHashCache.Remove(item.Path);
+                _catalogRevision++;
+                continue;
             }
+            _itemsByPath[item.Path] = item;
+            Photos.Add(item);
+            _catalogRevision++;
+            AddFolder(item.Folder, incrementDirectCount: true);
         }
-
-        EmptyState.Visibility = Photos.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        StatusText.Text = $"{FormatPhotoCount(Photos.Count)} найдено";
+        QueueProjectionRefresh();
     }
 
     private void OnPhotoGridSizeChanged(object sender, SizeChangedEventArgs e)
@@ -650,26 +683,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         _selectedPhoto.IsFavorite = !_selectedPhoto.IsFavorite;
+        _catalogRevision++;
         if (_viewMode == LibraryViewMode.Favorites && !_selectedPhoto.IsFavorite)
         {
             RebuildRows();
         }
 
         SaveCatalogState();
-    }
-
-    private void OnInfoClicked(object sender, RoutedEventArgs e)
-    {
-        if (_selectedPhoto is null)
-        {
-            return;
-        }
-
-        System.Windows.MessageBox.Show(
-            $"{_selectedPhoto.FileName}\n\nТип: {_selectedPhoto.MediaTypeLabel}\nРазмер: {_selectedPhoto.FileSizeBytes / 1024d / 1024d:0.0} MB\nДата файла: {_selectedPhoto.FileModifiedAt:dd.MM.yyyy HH:mm}\nПапка: {_selectedPhoto.Folder}\n\nПуть:\n{_selectedPhoto.Path}",
-            "Сведения",
-            MessageBoxButton.OK,
-            MessageBoxImage.Information);
     }
 
     private void OnOpenFolderClicked(object sender, RoutedEventArgs e)
@@ -694,7 +714,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     protected override void OnClosed(EventArgs e)
     {
-        SaveCatalogState();
+        _lifetime.Cancel();
+        _scanCancellation?.Cancel();
+        _duplicateCancellation?.Cancel();
+        _metadataIndexCancellation?.Cancel();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         base.OnClosed(e);
@@ -748,7 +771,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         var rootNode = EnsureFolderNode(root, parent: null);
-        rootNode.IsExpanded = true;
+        rootNode.IsExpanded = _catalogState.ExpandedFolders.Contains(root, StringComparer.OrdinalIgnoreCase);
 
         var currentPath = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var parent = rootNode;
@@ -776,10 +799,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return node;
         }
 
-        node = new FolderNode(normalized);
+        node = new FolderNode(normalized) { IsIncluded = !_excludedFolders.Contains(normalized) && (parent?.IsIncluded ?? true) };
+        node.Children.Add(FolderNode.Placeholder());
+        node.IsExpanded = _catalogState.ExpandedFolders.Contains(normalized, StringComparer.OrdinalIgnoreCase);
         _folderNodes.Add(normalized, node);
 
         var collection = parent?.Children ?? FolderRoots;
+        if (collection.Count == 1 && collection[0].IsPlaceholder) collection.Clear();
         var insertIndex = 0;
         while (insertIndex < collection.Count &&
                string.Compare(collection[insertIndex].Name, node.Name, StringComparison.CurrentCultureIgnoreCase) <= 0)
@@ -793,33 +819,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void LoadImmediateSubfolders(FolderNode parent)
     {
-        if (!Directory.Exists(parent.FullPath))
-        {
-            return;
-        }
-
-        string[] directories;
+        if (parent.IsPlaceholder || parent.IsLoading || parent.ChildrenLoaded) return;
+        parent.IsLoading = true;
+        var includeSystem = _includeSystemFolders;
         try
         {
-            var includeSystemFolders = _includeSystemFolders;
-            directories = await Task.Run(() => Directory
-                .EnumerateDirectories(parent.FullPath)
-                .Where(directory => !ShouldHideFolderInTree(directory, includeSystemFolders))
-                .ToArray());
+            var directories = await Task.Run(() => Directory.EnumerateDirectories(parent.FullPath)
+                .Where(directory => !ShouldHideFolderInTree(directory, includeSystem))
+                .Order(StringComparer.CurrentCultureIgnoreCase).ToArray(), _lifetime.Token);
+            if (_lifetime.IsCancellationRequested) return;
+            if (parent.Children.Count == 1 && parent.Children[0].IsPlaceholder) parent.Children.Clear();
+            foreach (var batch in directories.Chunk(32))
+            {
+                foreach (var directory in batch) EnsureFolderNode(directory, parent);
+                await Dispatcher.Yield(DispatcherPriority.Background);
+                if (_lifetime.IsCancellationRequested) return;
+            }
+            parent.ChildrenLoaded = true;
         }
-        catch (UnauthorizedAccessException)
-        {
-            return;
-        }
-        catch (IOException)
-        {
-            return;
-        }
-
-        foreach (var directory in directories)
-        {
-            EnsureFolderNode(directory, parent);
-        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException) { }
+        finally { parent.IsLoading = false; }
     }
 
     private bool ShouldHideFolderInTree(string directory, bool includeSystemFolders)
@@ -852,45 +871,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return ShouldHideFolderInTree(directory, _includeSystemFolders);
     }
 
-    private void RebuildFolderTreeFromPhotos()
-    {
-        var excludedFolders = _folderNodes.Values
-            .Where(static node => !node.IsIncluded)
-            .Select(static node => node.FullPath)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var expandedFolders = _folderNodes.Values
-            .Where(static node => node.IsExpanded)
-            .Select(static node => node.FullPath)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _folderNodes.Clear();
-        FolderRoots.Clear();
-        foreach (var item in Photos)
-        {
-            AddFolder(item.Folder, incrementDirectCount: true);
-        }
-
-        foreach (var excludedFolder in excludedFolders)
-        {
-            if (_folderNodes.TryGetValue(NormalizePath(excludedFolder), out var node))
-            {
-                node.IsIncluded = false;
-            }
-        }
-
-        foreach (var expandedFolder in expandedFolders)
-        {
-            if (_folderNodes.TryGetValue(NormalizePath(expandedFolder), out var node))
-            {
-                node.IsExpanded = true;
-            }
-        }
-    }
-
     private void RefreshChrome()
     {
-        EmptyState.Visibility = Photos.Count == 0 || PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        StatusText.Text = FormatPhotoCount(Photos.Count);
+        EmptyState.Visibility = !_isProjecting && !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (!_isProjecting && !_isCatalogLoading) StatusText.Text = FormatPhotoCount(Photos.Count);
         OnPropertyChanged(nameof(Photos));
         OnPropertyChanged(nameof(PhotoRows));
         OnPropertyChanged(nameof(FolderRoots));
@@ -901,61 +885,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
-    private IEnumerable<PhotoItem> GetVisiblePhotos()
-    {
-        var query = Photos.Where(IsVisibleByType);
-        if (_viewMode != LibraryViewMode.Folder)
-        {
-            query = query.Where(photo => IsFolderIncluded(photo.Folder));
-        }
+    private IEnumerable<PhotoItem> GetVisiblePhotos() => _visiblePhotos;
 
-        if (!string.IsNullOrWhiteSpace(_searchText))
-        {
-            query = query.Where(photo =>
-                photo.FileName.Contains(_searchText, StringComparison.CurrentCultureIgnoreCase) ||
-                photo.Folder.Contains(_searchText, StringComparison.CurrentCultureIgnoreCase));
-        }
-
-        if (_showOnlyMissingCaptureDate)
-        {
-            query = query.Where(static photo => !photo.IsVideo && photo.CaptureDate is null);
-        }
-
-        query = _viewMode switch
-        {
-            LibraryViewMode.Folder when !string.IsNullOrWhiteSpace(_activeFolder) =>
-                query.Where(photo => IsUnderFolder(photo.Path, _activeFolder)),
-            LibraryViewMode.Favorites => query.Where(static photo => photo.IsFavorite),
-            LibraryViewMode.Recent => query.OrderByDescending(static photo => photo.FileModifiedAt ?? DateTime.MinValue).Take(500),
-            _ => query
-        };
-
-        return _sortNewestFirst
-            ? query.OrderByDescending(GetSortDateForCurrentMode)
-            : query.OrderBy(GetSortDateForCurrentMode);
-    }
-
-    private bool IsFolderIncluded(string folder)
-    {
-        var current = NormalizePath(folder);
-        while (!string.IsNullOrWhiteSpace(current))
-        {
-            if (_folderNodes.TryGetValue(current, out var node) && !node.IsIncluded)
-            {
-                return false;
-            }
-
-            var parent = Directory.GetParent(current);
-            if (parent is null)
-            {
-                break;
-            }
-
-            current = NormalizePath(parent.FullName);
-        }
-
-        return true;
-    }
+    private bool IsFolderIncluded(string folder) => !_excludedFolders.Any(excluded => IsUnderFolder(folder, excluded));
 
     private bool IsVisibleByType(PhotoItem item)
     {
@@ -964,57 +896,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void RebuildRows()
     {
-        PhotoRows.Clear();
-        var visiblePhotos = GetVisiblePhotos().ToArray();
-        foreach (var group in visiblePhotos.GroupBy(GetYearMonthKey))
-        {
-            var groupKey = FormatYearMonthKey(group.Key);
-            var isCollapsed = _collapsedDateGroups.Contains(groupKey);
-            PhotoRows.Add(PhotoRow.CreateHeader(FormatYearMonthHeader(group.Key), groupKey, isCollapsed));
-            if (isCollapsed)
-            {
-                continue;
-            }
-
-            foreach (var chunk in group.Chunk(_columns))
-            {
-                PhotoRows.Add(new PhotoRow(chunk));
-            }
-        }
-    }
-
-    private (int Year, int Month, bool HasDate) GetYearMonthKey(PhotoItem item)
-    {
-        var date = GetDisplayDate(item);
-        return date is null ? (0, 0, false) : (date.Value.Year, date.Value.Month, true);
-    }
-
-    private string FormatYearMonthHeader((int Year, int Month, bool HasDate) key)
-    {
-        if (!key.HasDate || key.Year <= 1 || key.Month is < 1 or > 12)
-        {
-            return _dateGroupingMode == DateGroupingMode.CaptureDate ? "Без даты съёмки" : "Без даты файла";
-        }
-
-        var month = CultureInfo.GetCultureInfo("ru-RU").DateTimeFormat.GetMonthName(key.Month);
-        month = CultureInfo.GetCultureInfo("ru-RU").TextInfo.ToTitleCase(month);
-        return $"{key.Year} / {month}";
-    }
-
-    private string FormatYearMonthKey((int Year, int Month, bool HasDate) key)
-    {
-        var mode = _dateGroupingMode == DateGroupingMode.CaptureDate ? "capture" : "file";
-        return key.HasDate ? $"{mode}:{key.Year:D4}-{key.Month:D2}" : $"{mode}:none";
-    }
-
-    private DateTime? GetDisplayDate(PhotoItem item)
-    {
-        return _dateGroupingMode == DateGroupingMode.CaptureDate ? item.CaptureDate : item.FileModifiedAt;
-    }
-
-    private DateTime GetSortDateForCurrentMode(PhotoItem item)
-    {
-        return GetDisplayDate(item) ?? DateTime.MinValue;
+        if (_isInitializing || _lifetime.IsCancellationRequested) return;
+        _ = RebuildRowsAsync();
     }
 
     private void RefreshDateSortButton()
@@ -1028,93 +911,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return Math.Clamp((int)(Math.Max(1, width - 28) / TileOuterWidth), 1, 10);
     }
 
-    private void AddPhotoToRows(PhotoItem item)
+    public static async Task<LocalCatalogState> LoadInitialCatalogStateAsync()
     {
-        if (!IsVisibleByType(item))
+        return await Task.Run(async () =>
         {
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(_activeFolder) &&
-            !IsUnderFolder(item.Path, _activeFolder))
-        {
-            return;
-        }
-
-        if (PhotoRows.Count == 0 || PhotoRows[^1].IsHeader || PhotoRows[^1].Items.Count >= _columns)
-        {
-            PhotoRows.Add(new PhotoRow(new[] { item }));
-            return;
-        }
-
-        PhotoRows[^1].Items.Add(item);
-    }
-
-    private static async Task InitializeSqliteCatalogAsync()
-    {
-        try
-        {
-            var databasePath = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite");
-            var database = new SqliteCatalogDatabase(new SqliteCatalogOptions(databasePath));
-            await database.InitializeAsync().ConfigureAwait(false);
-        }
-        catch
-        {
-            // JSON-каталог остаётся безопасным fallback'ом; SQLite не должен ломать запуск UI.
-        }
-    }
-
-    private async Task InitializeMetadataIndexAsync()
-    {
-        try
-        {
-            await _desktopCatalogStore.InitializeAsync();
-            await _metadataIndexStore.InitializeAsync();
-            await _duplicateHashStore.InitializeAsync();
-        }
-        catch
-        {
-            MetadataStatusText.Text = "Метаданные: база недоступна";
-        }
-    }
-
-    private LocalCatalogState LoadInitialCatalogState()
-    {
-        try
-        {
-            _desktopCatalogStore.InitializeAsync().GetAwaiter().GetResult();
-            var sqliteState = _desktopCatalogStore.LoadAsync().GetAwaiter().GetResult();
-            if (sqliteState.Items.Count > 0)
-            {
-                var jsonState = LocalCatalogStore.Load();
-                sqliteState.DuplicateHashes = jsonState.DuplicateHashes;
-                return sqliteState;
-            }
-        }
-        catch
-        {
-            // JSON остаётся fallback'ом, чтобы не потерять рабочий каталог.
-        }
-
-        return LocalCatalogStore.Load();
-    }
-
-    private IReadOnlyList<SavedDuplicateHash> LoadInitialDuplicateHashes(LocalCatalogState state)
-    {
-        try
-        {
-            _duplicateHashStore.InitializeAsync().GetAwaiter().GetResult();
-            var sqliteHashes = _duplicateHashStore.LoadAsync().GetAwaiter().GetResult();
-            if (sqliteHashes.Count > 0)
-            {
-                return sqliteHashes;
-            }
-        }
-        catch
-        {
-        }
-
-        return state.DuplicateHashes;
+            var store = new SqliteDesktopCatalogStore();
+            await store.InitializeAsync();
+            var state = await store.LoadAsync(includeItems: false);
+            if (!state.ReadItemsFromSqlite) state = LocalCatalogStore.Load();
+            return state;
+        });
     }
 
     private void StartMetadataIndexing(bool resetExisting)
@@ -1135,7 +941,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         MetadataStatusText.Text = $"Метаданные: 0 / {items.Length}";
-        _ = Task.Run(async () =>
+        _ = RunMetadataWorkerAsync(items, token);
+    }
+
+    private async Task RunMetadataWorkerAsync(PhotoItem[] items, CancellationToken token)
+    {
+        try { await Task.Run(async () =>
         {
             var indexed = 0;
             var changedSinceUiRefresh = 0;
@@ -1146,10 +957,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     break;
                 }
 
-                var changed = item.TryLoadCaptureDate();
+                var captureDate = PhotoItem.ReadCaptureDate(item.Path);
+                var changed = item.CaptureDate != captureDate;
+                await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) item.ApplyIndexedCaptureDate(captureDate); }, DispatcherPriority.Background, token);
                 try
                 {
-                    await _metadataIndexStore.SaveAsync(item, token).ConfigureAwait(false);
+                    await _metadataIndexStore.SaveAsync(item.Path, item.FileSizeBytes, item.FileModifiedAt, item.CaptureDate, token).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -1162,18 +975,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     changedSinceUiRefresh++;
                 }
 
-                if (indexed % 50 == 0 || indexed == items.Length)
+                if (indexed % 250 == 0 || indexed == items.Length)
                 {
                     var current = indexed;
                     var shouldRebuild = _dateGroupingMode == DateGroupingMode.CaptureDate && changedSinceUiRefresh > 0;
                     changedSinceUiRefresh = 0;
                     await Dispatcher.BeginInvoke(() =>
                     {
+                        if (token.IsCancellationRequested) return;
                         MetadataStatusText.Text = $"Метаданные: {current} / {items.Length}";
                         if (shouldRebuild)
                         {
-                            RebuildRows();
-                            RefreshChrome();
+                            QueueProjectionRefresh();
                         }
 
                         UpdateInfoPanel();
@@ -1185,6 +998,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 await Dispatcher.BeginInvoke(() =>
                 {
+                    if (token.IsCancellationRequested) return;
                     MetadataStatusText.Text = "Метаданные: готово";
                     if (_dateGroupingMode == DateGroupingMode.CaptureDate)
                     {
@@ -1193,103 +1007,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     }
                 });
             }
-        }, token);
+        }, token); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { MetadataStatusText.Text = $"Метаданные: {ex.Message}"; }
     }
 
     private async Task LoadSavedCatalogAsync()
     {
-        if (_catalogState.Items.Count == 0)
+        await Task.Run(async () =>
         {
-            return;
-        }
-
-        StatusText.Text = $"Загружаю каталог: 0 / {_catalogState.Items.Count}";
-        Dictionary<string, DateTime?> indexedCaptureDates;
-        try
-        {
-            indexedCaptureDates = await _metadataIndexStore.LoadCaptureDatesAsync();
-        }
-        catch
-        {
-            indexedCaptureDates = new Dictionary<string, DateTime?>(StringComparer.OrdinalIgnoreCase);
-        }
-
-        var loadedSinceUiRefresh = 0;
-        var progress = new Progress<IReadOnlyList<PhotoItem>>(batch =>
-        {
-            foreach (var item in batch)
+            await _desktopCatalogStore.InitializeAsync();
+            await _metadataIndexStore.InitializeAsync();
+            await _duplicateHashStore.InitializeAsync();
+            var dates = await _metadataIndexStore.LoadCaptureDatesAsync(_lifetime.Token);
+            var hashes = await _duplicateHashStore.LoadAsync(_lifetime.Token);
+            await Dispatcher.InvokeAsync(() => { foreach (var hash in hashes) _duplicateHashCache[hash.Path] = hash; });
+            async Task ApplyBatch(IReadOnlyList<SavedMediaItem> saved)
             {
-                if (!_knownPhotoPaths.Add(item.Path))
-                {
-                    continue;
-                }
-
-                Photos.Add(item);
-                loadedSinceUiRefresh++;
+                _lifetime.Token.ThrowIfCancellationRequested();
+                var items = saved.Where(x => !string.IsNullOrWhiteSpace(x.Path) && PhotoItem.IsSupported(x.Path))
+                    .Select(x =>
+                    {
+                        var item = _catalogState.ReadItemsFromSqlite ? new PhotoItem(x.Path, x.SizeBytes, x.FileModifiedAt) : new PhotoItem(x.Path);
+                        item.IsFavorite = x.IsFavorite;
+                        if (dates.TryGetValue(x.Path, out var cached) && cached.Size == item.FileSizeBytes && cached.ModifiedTicks == (item.FileModifiedAt?.ToUniversalTime().Ticks ?? 0))
+                            item.ApplyIndexedCaptureDate(cached.CaptureDate);
+                        return item;
+                    }).ToArray();
+                await Dispatcher.InvokeAsync(() => ApplyItems(items), DispatcherPriority.Background, _lifetime.Token);
             }
-
-            if (loadedSinceUiRefresh >= 5000)
-            {
-                loadedSinceUiRefresh = 0;
-                RebuildFolderTreeFromPhotos();
-                RebuildRows();
-                RefreshChrome();
-            }
-
-            StatusText.Text = $"Загружаю каталог: {Photos.Count} / {_catalogState.Items.Count}";
-        });
-
-        await Task.Run(() =>
-        {
-            var batch = new List<PhotoItem>(250);
-            foreach (var savedItem in _catalogState.Items)
-            {
-                if (string.IsNullOrWhiteSpace(savedItem.Path) ||
-                    PhotoScanner.IsIgnoredPath(savedItem.Path, _includeSystemFolders) ||
-                    !File.Exists(savedItem.Path) ||
-                    !PhotoItem.IsSupported(savedItem.Path))
-                {
-                    continue;
-                }
-
-                var item = new PhotoItem(savedItem.Path)
-                {
-                    IsFavorite = savedItem.IsFavorite
-                };
-                if (indexedCaptureDates.TryGetValue(savedItem.Path, out var captureDate))
-                {
-                    item.ApplyIndexedCaptureDate(captureDate);
-                }
-
-                batch.Add(item);
-
-                if (batch.Count < 250)
-                {
-                    continue;
-                }
-
-                ((IProgress<IReadOnlyList<PhotoItem>>)progress).Report(batch.ToArray());
-                batch.Clear();
-            }
-
-            if (batch.Count > 0)
-            {
-                ((IProgress<IReadOnlyList<PhotoItem>>)progress).Report(batch.ToArray());
-            }
-        });
-
-        RebuildFolderTreeFromPhotos();
-        foreach (var excludedFolder in _catalogState.ExcludedFolders)
-        {
-            var normalized = NormalizePath(excludedFolder);
-            if (_folderNodes.TryGetValue(normalized, out var node))
-            {
-                node.IsIncluded = false;
-            }
-        }
-
+            if (_catalogState.ReadItemsFromSqlite) await _desktopCatalogStore.ReadBatchesAsync(ApplyBatch, _lifetime.Token);
+            else foreach (var batch in _catalogState.Items.Chunk(128)) await ApplyBatch(batch);
+        }, _lifetime.Token);
+        _catalogLoaded = true;
         RebuildRows();
-        StatusText.Text = FormatPhotoCount(Photos.Count);
     }
 
     private void StartSavedCatalogLoading()
@@ -1312,6 +1063,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             StartBackgroundCatalogMaintenance();
             StartMetadataIndexing(resetExisting: false);
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { StatusText.Text = $"Не удалось загрузить каталог: {ex.Message}"; }
         finally
         {
             _isCatalogLoading = false;
@@ -1321,274 +1074,170 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private void StartBackgroundCatalogMaintenance()
+    private async void StartBackgroundCatalogMaintenance()
     {
-        _ = Task.Run(async () =>
+        var snapshot = Photos.ToArray();
+        try
         {
-            await Task.Delay(1500).ConfigureAwait(false);
-            await Dispatcher.InvokeAsync(() =>
+            await Task.Run(async () =>
             {
-                var before = Photos.Count;
-                RemoveMissingCatalogItems();
-                var removed = before - Photos.Count;
-                if (removed > 0)
+                foreach (var batch in snapshot.Chunk(128))
                 {
-                    StatusText.Text = $"Каталог очищен в фоне: убрано {removed}";
+                    _lifetime.Token.ThrowIfCancellationRequested();
+                    var changed = new List<PhotoItem>();
+                    foreach (var old in batch)
+                    {
+                        try
+                        {
+                            var file = new FileInfo(old.Path);
+                            if (file.Exists && (file.Length != old.FileSizeBytes || file.LastWriteTime != old.FileModifiedAt))
+                                changed.Add(new PhotoItem(old.Path, file.Length, file.LastWriteTime));
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                    }
+                    if (changed.Count > 0) await Dispatcher.InvokeAsync(() =>
+                    {
+                        // A file operation may have removed a path since this snapshot.
+                        if (!_fileOperationActive) ApplyItems(changed.Where(x => _knownPhotoPaths.Contains(x.Path)).ToArray());
+                    }, DispatcherPriority.Background, _lifetime.Token);
                 }
-            });
-        });
+            }, _lifetime.Token);
+            if (!_fileOperationActive) { StartMetadataIndexing(false); SaveCatalogState(); }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { StatusText.Text = $"Проверка каталога: {ex.Message}"; }
     }
 
     private void SaveCatalogState()
     {
-        if (_isCatalogLoading)
-        {
-            return;
-        }
-
-        if (!_catalogLoaded && _catalogState.Items.Count > 0)
-        {
-            return;
-        }
-
-        try
-        {
-            _catalogState.TileWidth = TileWidth;
-            _catalogState.ShowVideos = ShowVideos;
-            _catalogState.IncludeSystemFolders = _includeSystemFolders;
-            _catalogState.DateGroupingMode = _dateGroupingMode.ToString();
-            _catalogState.Items = Photos
-                .Select(static item => new SavedMediaItem
-                {
-                    Path = item.Path,
-                    IsFavorite = item.IsFavorite
-                })
-                .ToList();
-            _catalogState.ExcludedFolders = _folderNodes.Values
-                .Where(static node => !node.IsIncluded)
-                .Select(static node => node.FullPath)
-                .Order(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            _catalogState.DuplicateHashes = _duplicateHashCache.Values
-                .Where(hash => _knownPhotoPaths.Contains(hash.Path))
-                .OrderBy(static hash => hash.Path, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            LocalCatalogStore.Save(_catalogState);
-            _ = _desktopCatalogStore.SaveAsync(_catalogState);
-        }
-        catch
-        {
-            StatusText.Text = "Не удалось сохранить каталог";
-        }
+        if (_fileOperationActive || _isInitializing || !_catalogLoaded || _isCatalogLoading) return;
+        _saveCancellation?.Cancel();
+        _saveCancellation = new CancellationTokenSource();
+        _pendingSave = SaveAfterDelayAsync(_saveCancellation.Token);
     }
 
     private async Task FindExactDuplicatesAsync(DuplicateSearchScope scope)
     {
-        if (_duplicateCancellation is not null)
+        if (_duplicateCancellation is not null || _fileOperationActive) return;
+        if (_isCatalogLoading || !_catalogLoaded)
         {
-            return;
+            System.Windows.MessageBox.Show("Дождитесь загрузки каталога перед поиском дублей.", "PhotoShelf"); return;
         }
-
-        var duplicateScope = GetDuplicateScope(scope).ToArray();
-        var candidates = duplicateScope
-            .Where(static item => item.FileSizeBytes > 0)
-            .GroupBy(static item => item.FileSizeBytes)
-            .Where(static group => group.Count() > 1)
-            .SelectMany(static group => group)
-            .ToArray();
-
-        if (candidates.Length == 0)
-        {
-            System.Windows.MessageBox.Show("Точных дублей пока не найдено.", "Дубликаты", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        _duplicateCancellation = new CancellationTokenSource();
-        var token = _duplicateCancellation.Token;
-        var itemsNeedingHash = candidates.Count(item => !TryGetCachedHash(item, out _));
-        SetDuplicateSearch(true, Math.Max(1, itemsNeedingHash));
-        StatusText.Text = $"Дубли: проверяю {FormatDuplicateScopeLabel(scope)} ({duplicateScope.Length})";
-        var progress = new Progress<DuplicateSearchProgress>(state =>
-        {
-            DuplicateProgressBar.Value = state.Checked;
-            StatusText.Text = state.Total == 0
-                ? "Дубли: использую сохранённые данные"
-                : $"Дубли: {state.Checked} / {state.Total}";
-        });
-
-        DuplicateGroup[] duplicates;
-        List<SavedDuplicateHash> newHashes;
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _duplicateCancellation = operation;
+        var token = operation.Token;
+        var snapshot = Photos.ToArray();
+        var visible = _visiblePhotos;
+        var cache = new Dictionary<string, SavedDuplicateHash>(_duplicateHashCache, StringComparer.OrdinalIgnoreCase);
+        var excluded = _excludedFolders.ToArray();
+        var folder = _activeFolder;
+        var compareA = _duplicateCompareFolderA;
+        var compareB = _duplicateCompareFolderB;
+        var videos = ShowVideos;
+        SetDuplicateSearch(true, 1);
+        DuplicateProgressBar.IsIndeterminate = true;
+        StatusText.Text = "Подготавливаю поиск дублей…";
         try
         {
-            var result = await Task.Run(() =>
+            var result = await Task.Run(async () =>
             {
+                IEnumerable<PhotoItem> query = scope == DuplicateSearchScope.CurrentView ? visible : snapshot;
+                query = query.Where(x => videos || !x.IsVideo);
+                query = scope switch
+                {
+                    DuplicateSearchScope.IncludedFolders => query.Where(x => !excluded.Any(p => IsUnderFolder(x.Path, p))),
+                    DuplicateSearchScope.CurrentFolder when folder is not null => query.Where(x => IsUnderFolder(x.Path, folder)),
+                    DuplicateSearchScope.CompareTwoFolders when compareA is not null && compareB is not null => query.Where(x => IsUnderFolder(x.Path, compareA) || IsUnderFolder(x.Path, compareB)),
+                    _ => query
+                };
+                var fresh = new List<PhotoItem>();
+                foreach (var item in query)
+                {
+                    token.ThrowIfCancellationRequested();
+                    try { var file = new FileInfo(item.Path); if (file.Exists && file.Length > 0) fresh.Add(new PhotoItem(item.Path, file.Length, file.LastWriteTime)); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                }
+                var candidates = fresh.GroupBy(x => x.FileSizeBytes).Where(g => g.Count() > 1).SelectMany(g => g).ToArray();
                 var byHash = new Dictionary<(long Size, string Hash), List<PhotoItem>>();
-                var checkedCount = 0;
-                var newHashList = new List<SavedDuplicateHash>();
+                var newHashes = new List<SavedDuplicateHash>();
+                var count = 0;
                 foreach (var item in candidates)
                 {
                     token.ThrowIfCancellationRequested();
-                    if (!TryGetCachedHash(item, out var hash))
+                    string? hash = null;
+                    if (cache.TryGetValue(item.Path, out var saved) && saved.SizeBytes == item.FileSizeBytes && saved.FileModifiedAt == item.FileModifiedAt) hash = saved.Hash;
+                    if (string.IsNullOrEmpty(hash))
                     {
                         try
                         {
-                            using var stream = File.OpenRead(item.Path);
-                            hash = Convert.ToHexString(SHA256.HashData(stream));
-                            newHashList.Add(new SavedDuplicateHash
-                            {
-                                Path = item.Path,
-                                SizeBytes = item.FileSizeBytes,
-                                FileModifiedAt = item.FileModifiedAt,
-                                Hash = hash
-                            });
+                            await using var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                            hash = Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
+                            var after = new FileInfo(item.Path);
+                            if (after.Length != item.FileSizeBytes || after.LastWriteTime != item.FileModifiedAt) continue;
+                            newHashes.Add(new SavedDuplicateHash { Path = item.Path, SizeBytes = item.FileSizeBytes, FileModifiedAt = item.FileModifiedAt, Hash = hash });
                         }
-                        catch
-                        {
-                            hash = null;
-                        }
-
-                        checkedCount++;
-                        if (checkedCount == 1 || checkedCount % 25 == 0 || checkedCount == itemsNeedingHash)
-                        {
-                            ((IProgress<DuplicateSearchProgress>)progress).Report(new DuplicateSearchProgress(checkedCount, itemsNeedingHash));
-                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
                     }
-
-                    if (string.IsNullOrWhiteSpace(hash))
-                    {
-                        continue;
-                    }
-
-                    var key = (item.FileSizeBytes, hash);
-                    if (!byHash.TryGetValue(key, out var list))
-                    {
-                        list = new List<PhotoItem>();
-                        byHash.Add(key, list);
-                    }
-
-                    list.Add(item);
+                    if (!byHash.TryGetValue((item.FileSizeBytes, hash), out var group)) byHash[(item.FileSizeBytes, hash)] = group = new();
+                    group.Add(item);
+                    if (++count % 25 == 0)
+                        await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) StatusText.Text = $"Дубли: {count} / {candidates.Length}"; }, DispatcherPriority.Background, token);
                 }
-
-                var groups = byHash
-                    .Where(pair => IsDuplicateGroupInScope(pair.Value, scope))
-                    .Select(static pair => new DuplicateGroup(pair.Key.Size, pair.Key.Hash, pair.Value))
-                    .OrderByDescending(static group => group.Items.Count)
-                    .ToArray();
-
-                return (Groups: groups, NewHashes: newHashList);
+                var groups = byHash.Where(x => x.Value.Count > 1)
+                    .Where(x => scope != DuplicateSearchScope.CompareTwoFolders || (compareA is not null && compareB is not null && x.Value.Any(i => IsUnderFolder(i.Path, compareA)) && x.Value.Any(i => IsUnderFolder(i.Path, compareB))))
+                    .Select(x => new DuplicateGroup(x.Key.Size, x.Key.Hash, x.Value)).ToArray();
+                await _duplicateHashStore.SaveAsync(newHashes, token);
+                return (groups, newHashes);
             }, token);
-            duplicates = result.Groups;
-            newHashes = result.NewHashes;
+            token.ThrowIfCancellationRequested();
+            foreach (var hash in result.newHashes) _duplicateHashCache[hash.Path] = hash;
+            SaveCatalogState();
+            if (result.groups.Length == 0) System.Windows.MessageBox.Show("Точных дублей не найдено.", "Дубликаты");
+            else
+            {
+                var models = await Task.Run(() => new ObservableCollection<DuplicateGroupViewModel>(result.groups.Select((group, index) => new DuplicateGroupViewModel(group, index + 1))), token);
+                var review = new DuplicateReviewWindow(models, async entry =>
+                {
+                    await _saveGate.WaitAsync();
+                    try { await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination, removeFromLibrary: true); }
+                    finally { _saveGate.Release(); }
+                    await Dispatcher.InvokeAsync(() => ApplyMovedItem(entry.Source, null));
+                }) { Owner = this };
+                _fileOperationActive = true;
+                _scanCancellation?.Cancel();
+                _browseCancellation?.Cancel();
+                _metadataIndexCancellation?.Cancel();
+                _saveCancellation?.Cancel();
+                try
+                {
+                    await _pendingSave;
+                    await PersistStateAsync(CaptureState(), CancellationToken.None, _catalogRevision);
+                    review.ShowDialog();
+                }
+                finally { _fileOperationActive = false; SaveCatalogState(); RebuildRows(); }
+            }
         }
-        catch (OperationCanceledException)
-        {
-            StatusText.Text = "Проверка дублей остановлена";
-            return;
-        }
+        catch (OperationCanceledException) { StatusText.Text = "Поиск дублей отменён"; }
+        catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Поиск дублей"); }
         finally
         {
-            _duplicateCancellation.Dispose();
-            _duplicateCancellation = null;
+            if (ReferenceEquals(_duplicateCancellation, operation)) _duplicateCancellation = null;
             SetDuplicateSearch(false, 0);
-        }
-
-        foreach (var hash in newHashes)
-        {
-            _duplicateHashCache[hash.Path] = hash;
-        }
-
-        if (newHashes.Count > 0)
-        {
-            try
-            {
-                await _duplicateHashStore.SaveAsync(newHashes, CancellationToken.None);
-            }
-            catch
-            {
-            }
-        }
-
-        SaveCatalogState();
-        StatusText.Text = FormatPhotoCount(Photos.Count);
-        if (duplicates.Length == 0)
-        {
-            System.Windows.MessageBox.Show("Точных дублей пока не найдено.", "Дубликаты", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        try
-        {
-            var reviewWindow = new DuplicateReviewWindow(duplicates)
-            {
-                Owner = this
-            };
-            reviewWindow.ShowDialog();
-            RemoveMissingCatalogItems();
-        }
-        catch (Exception ex)
-        {
-            System.Windows.MessageBox.Show(
-                $"Не удалось открыть окно дублей.\n\n{ex.Message}",
-                "Дубликаты",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
         }
     }
 
-    private DuplicateSearchScope? AskDuplicateScope()
+    private async Task<DuplicateSearchScope?> AskDuplicateScopeAsync()
     {
-        var dialog = new DuplicateSearchDialog(
-            currentViewCount: GetVisiblePhotos().Count(),
-            includedFoldersCount: Photos.Where(photo => IsVisibleByType(photo) && IsFolderIncluded(photo.Folder)).Count(),
-            wholeLibraryCount: Photos.Where(IsVisibleByType).Count(),
-            currentFolder: _viewMode == LibraryViewMode.Folder ? _activeFolder : null)
-        {
-            Owner = this
-        };
-
-        if (dialog.ShowDialog() != true)
-        {
-            return null;
-        }
-
+        var snapshot = Photos.ToArray(); var visibleCount = _visiblePhotos.Length;
+        var excluded = _excludedFolders.ToArray(); var videos = ShowVideos;
+        var counts = await Task.Run(() => (All: snapshot.Count(x => videos || !x.IsVideo),
+            Included: snapshot.Count(x => (videos || !x.IsVideo) && !excluded.Any(p => IsUnderFolder(x.Path, p)))));
+        var dialog = new DuplicateSearchDialog(visibleCount, counts.Included, counts.All,
+            _viewMode == LibraryViewMode.Folder ? _activeFolder : null) { Owner = this };
+        if (dialog.ShowDialog() != true) return null;
         _duplicateCompareFolderA = dialog.CompareFolderA;
         _duplicateCompareFolderB = dialog.CompareFolderB;
         return dialog.SelectedScope;
-    }
-
-    private IEnumerable<PhotoItem> GetDuplicateScope(DuplicateSearchScope scope)
-    {
-        return scope switch
-        {
-            DuplicateSearchScope.WholeLibrary => Photos.Where(IsVisibleByType),
-            DuplicateSearchScope.IncludedFolders => Photos.Where(photo => IsVisibleByType(photo) && IsFolderIncluded(photo.Folder)),
-            DuplicateSearchScope.CurrentFolder when !string.IsNullOrWhiteSpace(_activeFolder) =>
-                Photos.Where(photo => IsVisibleByType(photo) && IsUnderFolder(photo.Path, _activeFolder)),
-            DuplicateSearchScope.CompareTwoFolders when !string.IsNullOrWhiteSpace(_duplicateCompareFolderA) && !string.IsNullOrWhiteSpace(_duplicateCompareFolderB) =>
-                Photos.Where(photo => IsVisibleByType(photo) &&
-                    (IsUnderFolder(photo.Path, _duplicateCompareFolderA) ||
-                     IsUnderFolder(photo.Path, _duplicateCompareFolderB))),
-            _ => GetVisiblePhotos()
-        };
-    }
-
-    private bool IsDuplicateGroupInScope(IReadOnlyCollection<PhotoItem> items, DuplicateSearchScope scope)
-    {
-        if (items.Count < 2)
-        {
-            return false;
-        }
-
-        if (scope != DuplicateSearchScope.CompareTwoFolders ||
-            string.IsNullOrWhiteSpace(_duplicateCompareFolderA) ||
-            string.IsNullOrWhiteSpace(_duplicateCompareFolderB))
-        {
-            return true;
-        }
-
-        var hasA = items.Any(item => IsUnderFolder(item.Path, _duplicateCompareFolderA));
-        var hasB = items.Any(item => IsUnderFolder(item.Path, _duplicateCompareFolderB));
-        return hasA && hasB;
     }
 
     private static bool IsUnderFolder(string path, string folder)
@@ -1607,37 +1256,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                normalizedPath.StartsWith(normalizedFolder + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string FormatDuplicateScopeLabel(DuplicateSearchScope scope)
-    {
-        return scope switch
-        {
-            DuplicateSearchScope.WholeLibrary => "всю библиотеку",
-            DuplicateSearchScope.IncludedFolders => "отмеченные папки",
-            DuplicateSearchScope.CurrentFolder => "текущую папку",
-            DuplicateSearchScope.CompareTwoFolders => "две папки",
-            _ => "текущий вид"
-        };
-    }
-
-    private bool TryGetCachedHash(PhotoItem item, out string? hash)
-    {
-        hash = null;
-        if (!_duplicateHashCache.TryGetValue(item.Path, out var cached))
-        {
-            return false;
-        }
-
-        if (cached.SizeBytes != item.FileSizeBytes ||
-            cached.FileModifiedAt != item.FileModifiedAt ||
-            string.IsNullOrWhiteSpace(cached.Hash))
-        {
-            return false;
-        }
-
-        hash = cached.Hash;
-        return true;
-    }
-
     private void SetDuplicateSearch(bool isSearching, int total)
     {
         DuplicatesButton.IsEnabled = !isSearching;
@@ -1646,53 +1264,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         DuplicateProgressBar.Minimum = 0;
         DuplicateProgressBar.Maximum = Math.Max(1, total);
         DuplicateProgressBar.Value = 0;
-    }
-
-    private sealed record DuplicateSearchProgress(int Checked, int Total);
-
-    private void RemoveMissingCatalogItems()
-    {
-        var removedAny = false;
-        for (var index = Photos.Count - 1; index >= 0; index--)
-        {
-            if (File.Exists(Photos[index].Path) && !PhotoScanner.IsIgnoredPath(Photos[index].Path, _includeSystemFolders))
-            {
-                continue;
-            }
-
-            _knownPhotoPaths.Remove(Photos[index].Path);
-            Photos.RemoveAt(index);
-            removedAny = true;
-        }
-
-        if (!removedAny)
-        {
-            return;
-        }
-
-        var excludedFolders = _folderNodes.Values
-            .Where(static node => !node.IsIncluded)
-            .Select(static node => node.FullPath)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _folderNodes.Clear();
-        FolderRoots.Clear();
-        foreach (var item in Photos)
-        {
-            AddFolder(item.Folder, incrementDirectCount: true);
-        }
-
-        foreach (var excludedFolder in excludedFolders)
-        {
-            if (_folderNodes.TryGetValue(NormalizePath(excludedFolder), out var node))
-            {
-                node.IsIncluded = false;
-            }
-        }
-
-        RebuildRows();
-        RefreshChrome();
-        SaveCatalogState();
     }
 
     private void SelectPhoto(PhotoItem item)
@@ -1713,14 +1284,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateInfoPanel();
     }
 
-    private void UpdateInfoPanel()
+    private async void UpdateInfoPanel()
     {
-        if (InfoPanel.Visibility != Visibility.Visible)
-        {
-            return;
-        }
-
-        InfoText.Text = _selectedPhoto?.MetadataText ?? "Выберите фото или видео.";
+        if (InfoPanel.Visibility != Visibility.Visible) return;
+        var item = _selectedPhoto;
+        var revision = ++_infoRevision;
+        InfoText.Text = item is null ? "Выберите фото или видео." : "Читаю сведения…";
+        if (item is null) return;
+        var text = await Task.Run(() => item.MetadataText);
+        if (revision == _infoRevision && ReferenceEquals(item, _selectedPhoto)) InfoText.Text = text;
     }
 
     private static string NormalizePath(string path)

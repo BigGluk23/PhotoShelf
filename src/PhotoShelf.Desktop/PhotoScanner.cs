@@ -16,6 +16,8 @@ public static class PhotoScanner
         }
 
         var normalized = Path.GetFullPath(path);
+        var quarantine = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "PhotoShelf_Quarantine");
+        if (normalized.Equals(quarantine, StringComparison.OrdinalIgnoreCase) || normalized.StartsWith(quarantine + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
         var appCatalog = Path.GetFullPath(LocalCatalogStore.CatalogDirectory);
         if (normalized.StartsWith(appCatalog, StringComparison.OrdinalIgnoreCase))
         {
@@ -89,59 +91,40 @@ public static class PhotoScanner
         return seen;
     }
 
-    public static Task ScanAsync(
-        IEnumerable<string> roots,
-        IProgress<PhotoScanBatch>? progress,
-        bool includeSystemFolders,
-        CancellationToken cancellationToken)
+    public static Task ScanAsync(IEnumerable<string> roots, Func<PhotoScanBatch, Task> apply,
+        bool includeSystemFolders, CancellationToken cancellationToken, string[]? excluded = null, bool recursive = true)
     {
-        return Task.Run(() =>
+        return Task.Run(async () =>
         {
-            var options = new EnumerationOptions
-            {
-                RecurseSubdirectories = true,
-                IgnoreInaccessible = true,
-                AttributesToSkip = FileAttributes.System | FileAttributes.Temporary
-            };
-            var batch = new List<string>(BatchSize);
-            var seenCount = 0;
-
-            foreach (var root in roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase))
+            var pending = new Queue<string>(roots.Distinct(StringComparer.OrdinalIgnoreCase));
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var batch = new List<string>(64);
+            var seen = 0;
+            bool Excluded(string path) => excluded?.Any(x => path.Equals(x, StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith(x.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) == true;
+            var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false,
+                AttributesToSkip = FileAttributes.ReparsePoint | (includeSystemFolders ? 0 : FileAttributes.Hidden | FileAttributes.System | FileAttributes.Temporary) };
+            while (pending.TryDequeue(out var folder))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                progress?.Report(new PhotoScanBatch(root, Array.Empty<string>(), seenCount));
-
+                if (!visited.Add(folder) || Excluded(folder) || IsIgnoredPath(folder, includeSystemFolders)) continue;
                 try
                 {
-                    foreach (var path in Directory.EnumerateFiles(root, "*.*", options))
+                    foreach (var path in Directory.EnumerateFiles(folder, "*", options))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        if (IsIgnoredPath(path, includeSystemFolders) || !PhotoItem.IsSupported(path))
-                        {
-                            continue;
-                        }
-
-                        batch.Add(path);
-                        seenCount++;
-
-                        if (batch.Count >= BatchSize)
-                        {
-                            progress?.Report(new PhotoScanBatch(root, batch.ToArray(), seenCount));
-                            batch.Clear();
-                            Thread.Sleep(20);
-                        }
+                        if (!PhotoItem.IsSupported(path) || IsIgnoredPath(path, includeSystemFolders)) continue;
+                        batch.Add(path); seen++;
+                        if (batch.Count < 64) continue;
+                        await apply(new PhotoScanBatch(folder, batch.ToArray(), seen)).ConfigureAwait(false);
+                        batch.Clear();
                     }
+                    if (recursive) foreach (var child in Directory.EnumerateDirectories(folder, "*", options)) pending.Enqueue(child);
                 }
-                catch (UnauthorizedAccessException)
-                {
-                }
-                catch (IOException)
-                {
-                }
-
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 if (batch.Count > 0)
                 {
-                    progress?.Report(new PhotoScanBatch(root, batch.ToArray(), seenCount));
+                    await apply(new PhotoScanBatch(folder, batch.ToArray(), seen)).ConfigureAwait(false);
                     batch.Clear();
                 }
             }

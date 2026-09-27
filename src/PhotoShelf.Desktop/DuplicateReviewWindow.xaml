@@ -108,7 +108,7 @@
 
                                         <Border Width="104" Height="76" Background="#FFECE5DC" CornerRadius="10" ClipToBounds="True">
                                             <Grid>
-                                                <Image Source="{Binding Photo.Thumbnail}" Stretch="UniformToFill" />
+                                                <Image local:AsyncMediaImage.Path="{Binding Photo.Path}" Stretch="UniformToFill" />
                                                 <TextBlock Text="{Binding Photo.KindLabel}" Foreground="#FF77706A" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
                                             </Grid>
                                         </Border>
