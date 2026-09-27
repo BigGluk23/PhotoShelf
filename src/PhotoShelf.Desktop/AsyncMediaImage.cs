@@ -5,10 +5,6 @@ using System.Windows;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using PhotoShelf.Application.Background;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using WpfImage = System.Windows.Controls.Image;
 
 namespace PhotoShelf.Desktop;
@@ -199,21 +195,22 @@ public static class AsyncMediaImage
     {
         token.ThrowIfCancellationRequested();
         var video = PhotoItem.IsVideoPath(path);
-        var animatedFormat = PhotoItem.IsAnimatedGifPath(path) || Path.GetExtension(path).Equals(".webp", StringComparison.OrdinalIgnoreCase);
+        var mediaInfo = video ? null : MediaBitmapLoader.ReadInfo(path);
+        var animatedFormat = mediaInfo?.IsAnimationFormat == true;
         // Read headers in a worker. Bounding frame dimensions also bounds portrait/panoramic images.
         var frameCount = 1;
         long sourceFrameBytes = 0;
         if (animatedFormat)
         {
-            var info = SixLabors.ImageSharp.Image.Identify(new DecoderOptions { Configuration = ImageSharpBitmapLoader.DecodeConfiguration, MaxFrames = 129 }, path);
-            frameCount = Math.Max(1, info.FrameMetadataCollection.Count);
-            sourceFrameBytes = checked((long)info.Width * info.Height * 4);
+            frameCount = mediaInfo!.FrameCount;
+            sourceFrameBytes = mediaInfo.SourceFrameBytes;
             if (sourceFrameBytes > 128L * 1024 * 1024) throw new MediaBudgetException();
         }
         var animate = animatedFormat && frameCount is > 1 and <= 128 && (long)width * width * 4 * frameCount <= 64L * 1024 * 1024;
         var count = animate ? frameCount : 1;
         // Budget includes decoded source frames + retained WPF frames + conversion scratch space.
-        long RequiredBytes(int size, int frames) => checked(sourceFrameBytes * frames + (long)size * size * 4 * (frames + 3));
+        long RequiredBytes(int size, int frames) => checked((animatedFormat ? mediaInfo!.EncodedBytes : 0) +
+            sourceFrameBytes * frames + (long)size * size * 4 * (frames + 3));
         var reservation = DecodedBudget.TryReserve(RequiredBytes(width, count));
         if (reservation is null && animate)
         {
@@ -236,21 +233,11 @@ public static class AsyncMediaImage
             }
             else if (animatedFormat)
             {
-                using var decoded = SixLabors.ImageSharp.Image.Load<Rgba32>(new DecoderOptions
-                {
-                    Configuration = ImageSharpBitmapLoader.DecodeConfiguration,
-                    TargetSize = new SixLabors.ImageSharp.Size(width, width), MaxFrames = animate ? (uint)frameCount : 1u
-                }, path);
-                if (decoded.Width > width || decoded.Height > width)
-                    decoded.Mutate(context => context.Resize(new ResizeOptions { Size = new SixLabors.ImageSharp.Size(width, width), Mode = SixLabors.ImageSharp.Processing.ResizeMode.Max }));
-                for (var i = 0; i < decoded.Frames.Count; i++)
-                {
-                    token.ThrowIfCancellationRequested();
-                    using var frame = decoded.Frames.CloneFrame(i);
-                    var delay = PhotoItem.IsAnimatedGifPath(path) ? decoded.Frames[i].Metadata.GetGifMetadata().FrameDelay * 10
-                        : (int)decoded.Frames[i].Metadata.GetWebpMetadata().FrameDelay;
-                    frames.Add(new(ImageSharpBitmapLoader.ToBitmapSource(frame), Math.Max(20, delay), !animate && frameCount > 1 ? "Анимация ограничена бюджетом памяти: показан первый кадр" : null));
-                }
+                var decoded = MediaBitmapLoader.ReadAnimation(path, width, animate ? frameCount : 1, token, mediaInfo);
+                var limited = frameCount > 1 && (!animate || decoded.Count != frameCount);
+                foreach (var frame in decoded)
+                    frames.Add(new(frame.Bitmap, frame.DelayMilliseconds,
+                        limited ? "Анимация ограничена бюджетом памяти или времени: показан первый кадр" : null));
             }
             else
             {
@@ -264,5 +251,5 @@ public static class AsyncMediaImage
         }
         catch { reservation.Dispose(); throw; }
     }
-    private static BitmapSource LoadStill(string path, int width) => ImageSharpBitmapLoader.LoadWicBounded(path, width);
+    private static BitmapSource LoadStill(string path, int width) => MediaBitmapLoader.LoadWicBounded(path, width);
 }

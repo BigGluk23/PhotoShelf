@@ -15,6 +15,7 @@ internal sealed class UiSmokeSession
     private bool _closed;
     public bool Ready { get; private set; }
     public bool PreviewRendered { get; private set; }
+    public bool NativeDecoderVerified { get; private set; }
     public double ElapsedReadySeconds { get; private set; }
     public int DispatcherTicks { get; private set; }
     public double MaxDispatcherGapMs { get; private set; }
@@ -26,6 +27,24 @@ internal sealed class UiSmokeSession
             throw new InvalidOperationException("UI smoke requires its own isolated catalog.");
         var media = Path.Combine(LocalCatalogStore.CatalogDirectory, "smoke-media");
         Directory.CreateDirectory(media);
+        NativeDecoderVerified = await Task.Run(() =>
+        {
+            // Exercise native-library extraction from the actual single-file EXE, not just test/bin.
+            var nativeFixture = Path.Combine(media, "native-codec.webp");
+            using (var pixels = new SkiaSharp.SKBitmap(2, 2))
+            {
+                pixels.Erase(SkiaSharp.SKColors.OrangeRed);
+                using var image = SkiaSharp.SKImage.FromBitmap(pixels);
+                using var encoded = image.Encode(SkiaSharp.SKEncodedImageFormat.Webp, 100)
+                    ?? throw new InvalidOperationException("Native WebP encoder is unavailable.");
+                using var output = new FileStream(nativeFixture, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                encoded.SaveTo(output);
+            }
+            var decoded = MediaBitmapLoader.ReadAnimation(nativeFixture, 16, 1);
+            if (decoded.Count != 1 || decoded[0].Bitmap.PixelWidth != 2 || decoded[0].Bitmap.PixelHeight != 2)
+                throw new InvalidOperationException("Published native WebP decoder failed its synthetic fixture.");
+            return true;
+        });
         _fixturePath = Path.Combine(media, "preview.png");
         // An embedded application illustration is the only media fixture; never discover user files.
         using (var embedded = AppResources.Open(AppResources.GiraffeUri))
@@ -88,7 +107,7 @@ internal sealed class UiSmokeSession
 
     public object CreateReport(int exitCode) => new
     {
-        status = exitCode == 0 && Ready && PreviewRendered && GracefulExit && DispatcherTicks >= 20 &&
+        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && GracefulExit && DispatcherTicks >= 20 &&
             MaxDispatcherGapMs <= 2000 && ErrorReporter.ErrorCount == 0 ? "passed" : "failed",
         check = "ui-smoke",
         version = ErrorReporter.Version,
@@ -96,6 +115,7 @@ internal sealed class UiSmokeSession
         logRoot = ErrorReporter.LogRoot,
         ready = Ready,
         previewRendered = PreviewRendered,
+        nativeDecoderVerified = NativeDecoderVerified,
         elapsedReadySeconds = ElapsedReadySeconds,
         dispatcherTicks = DispatcherTicks,
         maxDispatcherGapMs = MaxDispatcherGapMs,

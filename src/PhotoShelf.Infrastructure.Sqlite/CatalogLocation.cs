@@ -4,17 +4,34 @@ namespace PhotoShelf.Infrastructure.Sqlite;
 public sealed class CatalogLocation
 {
     private readonly object _gate = new();
+    private readonly string _localDirectory;
+    private readonly string _legacyDirectory;
     private string? _directory;
     public bool IsIsolatedSmoke { get; private set; }
+    public CatalogLocation() : this(
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PhotoShelf"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhotoShelf")) { }
+
+    public CatalogLocation(string localDirectory, string legacyDirectory)
+    {
+        _localDirectory = Path.GetFullPath(localDirectory);
+        _legacyDirectory = Path.GetFullPath(legacyDirectory);
+    }
 
     public string DirectoryPath
     {
         get
         {
             lock (_gate)
-                return _directory ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhotoShelf");
+                // Keep an existing catalog and its recovery journals together. Never silently start an empty replacement.
+                return _directory ??= Directory.Exists(_legacyDirectory) ? _legacyDirectory : _localDirectory;
         }
     }
+
+    public string DerivedDataDirectory { get { lock (_gate) { _ = DirectoryPath; return IsIsolatedSmoke ? _directory! : _localDirectory; } } }
+    public bool UsesLegacyStorage => !IsIsolatedSmoke &&
+        DirectoryPath.Equals(_legacyDirectory, StringComparison.OrdinalIgnoreCase) &&
+        !_legacyDirectory.Equals(_localDirectory, StringComparison.OrdinalIgnoreCase);
 
     public string CreateIsolatedSmokeDirectory()
     {

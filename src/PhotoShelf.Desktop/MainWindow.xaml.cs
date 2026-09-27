@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.2";
+    private const string VersionLabel = "Ultra v0.10.3";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -39,6 +39,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _catalogLoaded;
     private bool _isCatalogLoading;
     private readonly DispatcherTimer _folderFilterRefreshTimer;
+    private readonly DispatcherTimer _metadataRetryTimer;
     private bool _sortNewestFirst = true;
     private DateGroupingMode _dateGroupingMode = DateGroupingMode.FileDate;
     private bool _showOnlyMissingCaptureDate;
@@ -78,6 +79,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Interval = TimeSpan.FromMilliseconds(250)
         };
         _folderFilterRefreshTimer.Tick += OnFolderFilterRefreshTimerTick;
+        _metadataRetryTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(5) };
+        _metadataRetryTimer.Tick += (_, _) => { if (_metadataTask.IsCompleted) StartMetadataIndexing(false); };
+        _metadataRetryTimer.Start();
+        Closed += (_, _) => _metadataRetryTimer.Stop();
 
         if (_activeFolder is not null) AddFolder(_activeFolder);
         foreach (var path in _catalogState.ExpandedFolders) AddFolder(path);
@@ -934,7 +939,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 (PhotoRows as VirtualPhotoRows)?.ApplyMetadata(batch);
                 foreach (var saved in batch)
                     if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt)
-                        selected.ApplyIndexedCaptureDate(saved.CaptureDate);
+                        selected.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
                 MetadataStatusText.Text = $"Метаданные: {count:N0}";
                 if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate)) NoteCatalogChanged();
             }, DispatcherPriority.Background);
@@ -946,18 +951,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             MetadataStatusText.Text = "Индексирую метаданные…";
             await Task.Run(async () =>
             {
-                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true }, token))
+                if (resetExisting) await _desktopCatalogStore.ResetMetadataIndexAsync(token);
+                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true, MetadataDueAtUtc = DateTime.UtcNow }, token))
                 {
-                    if (item.IsVideo || (!resetExisting && item.MetadataIndexed)) continue;
                     var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
                         _ => ToSavedItem(item.Path), token);
-                    if (fresh is null) continue; // Disconnected media stays in the catalog.
-                    var date = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
-                        _ => PhotoItem.ReadCaptureDate(item.Path), token);
-                    await _desktopCatalogStore.UpdateCaptureDateAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, date, token);
-                    fresh.CaptureDate = date; fresh.MetadataIndexed = true;
+                    var result = fresh is null
+                        ? new PhotoShelf.Application.Metadata.CaptureDateReadResult(PhotoShelf.Application.Metadata.MetadataReadStatus.TransientError, ErrorCode: "unavailable-file")
+                        : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, _ => CaptureDateReader.Read(item.Path), token);
+                    // Bind the result to both the database fingerprint and the actual post-read file state.
+                    var after = fresh is null ? null : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, _ => ToSavedItem(item.Path), token);
+                    if (fresh is not null && (after is null || fresh.SizeBytes != after.SizeBytes || fresh.FileModifiedAt != after.FileModifiedAt)) continue;
+                    var previousDate = item.CaptureDate;
+                    if (fresh is not null && (fresh.SizeBytes != item.SizeBytes || fresh.FileModifiedAt != item.FileModifiedAt))
+                    {
+                        await _desktopCatalogStore.UpsertItemsAsync(new[] { fresh }, preserveFavorites: true, token);
+                        await Dispatcher.InvokeAsync(NoteCatalogChanged, DispatcherPriority.Background);
+                        item.CaptureDate = null;
+                    }
+                    fresh ??= item;
+                    var attempted = DateTime.UtcNow;
+                    if (!await _desktopCatalogStore.UpdateMetadataResultAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, result, attempted, token)) continue;
+                    var date = result.ApplyTo(item.CaptureDate);
+                    groupingChanged |= previousDate != date;
+                    fresh.CaptureDate = date; fresh.MetadataIndexed = result.IsTerminal; fresh.MetadataStatus = result.Status;
+                    fresh.MetadataAttemptedAtUtc = attempted; fresh.MetadataRetryAtUtc = result.RetryAtUtc(attempted); fresh.MetadataErrorCode = result.ErrorCode;
                     updates.Add(fresh); indexed++;
-                    groupingChanged |= item.CaptureDate != date;
                     if (updates.Count >= 128) await PublishBatchAsync();
                 }
             }, token);
@@ -1103,14 +1122,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Folder = scope == DuplicateSearchScope.CurrentFolder ? _activeFolder : null,
             ExcludedFolders = scope == DuplicateSearchScope.IncludedFolders ? _excludedFolders.ToArray() : Array.Empty<string>()
         };
-        query = query with { DuplicateCandidatesOnly = true };
+        // Recent is already bounded to the visible newest 500 files. Applying the size
+        // predicate before that limit would pull older candidates into this scope.
+        query = query with { DuplicateCandidatesOnly = query.ViewMode != "Recent" };
         SetDuplicateSearch(true, 1); DuplicateProgressBar.IsIndeterminate = true;
         StatusText.Text = "Подготавливаю поиск дублей…";
         try
         {
+            await using var session = await DuplicateSearchSession.CreateAsync(LocalCatalogStore.CatalogDirectory, token);
             var searchTask = Task.Run(async () =>
             {
-                var hashes = new Dictionary<(long Size, string Hash), List<PhotoItem>>();
+                var matches = new List<DuplicateSearchMatch>(128);
                 var pending = new List<SavedDuplicateHash>(); var count = 0;
                 await foreach (var saved in _desktopCatalogStore.EnumerateAsync(query, token))
                 {
@@ -1121,7 +1143,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     if (fresh is null || fresh.SizeBytes <= 0) continue;
                     var cached = await _duplicateHashStore.TryGetAsync(fresh.Path, fresh.SizeBytes, fresh.FileModifiedAt, token);
                     var hash = cached?.Hash;
-                    if (string.IsNullOrEmpty(hash))
+                    if (hash is null || hash.Length != 64 || !hash.All(Uri.IsHexDigit))
                     {
                         try
                         {
@@ -1137,33 +1159,34 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
                     }
-                    if (!hashes.TryGetValue((fresh.SizeBytes, hash), out var entries)) hashes[(fresh.SizeBytes, hash)] = entries = new();
-                    entries.Add(new PhotoItem(fresh.Path, fresh.SizeBytes, fresh.FileModifiedAt));
+                    fresh.CaptureDate = saved.CaptureDate;
+                    var mask = (compareA is not null && IsUnderFolder(fresh.Path, compareA) ? 1 : 0) |
+                        (compareB is not null && IsUnderFolder(fresh.Path, compareB) ? 2 : 0);
+                    matches.Add(new DuplicateSearchMatch(fresh, hash, mask));
                     if (++count % 128 == 0)
                     {
                         await _duplicateHashStore.SaveAsync(pending.ToArray(), token); pending.Clear();
+                        await session.AddAsync(matches, token); matches.Clear();
                         var progress = count;
                         await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) StatusText.Text = $"Проверено кандидатов: {progress:N0}"; }, DispatcherPriority.Background, token);
                     }
                 }
                 await _duplicateHashStore.SaveAsync(pending, token);
-                return hashes.Where(x => x.Value.Count > 1)
-                    .Where(x => scope != DuplicateSearchScope.CompareTwoFolders || (compareA is not null && compareB is not null && x.Value.Any(i => IsUnderFolder(i.Path, compareA)) && x.Value.Any(i => IsUnderFolder(i.Path, compareB))))
-                    .Select(x => new DuplicateGroup(x.Key.Size, x.Key.Hash, x.Value)).ToArray();
+                if (matches.Count > 0) await session.AddAsync(matches, token);
+                await session.CompleteAsync(scope == DuplicateSearchScope.CompareTwoFolders, token);
             }, token);
             _duplicateWorkTask = searchTask;
-            var groups = await searchTask;
+            await searchTask;
             token.ThrowIfCancellationRequested();
-            if (groups.Length == 0) System.Windows.MessageBox.Show("Точных дублей не найдено.", "Дубликаты");
+            if (session.GroupCount == 0) System.Windows.MessageBox.Show("Точных дублей не найдено.", "Дубликаты");
             else
             {
-                var models = await Task.Run(() => new ObservableCollection<DuplicateGroupViewModel>(groups.Select((group, index) => new DuplicateGroupViewModel(group, index + 1))), token);
                 if (_fileOperationActive || token.IsCancellationRequested) return;
                 _fileOperationActive = true;
                 try
                 {
                     await StopCatalogWritersAsync(stopDuplicates: false);
-                    var review = new DuplicateReviewWindow(models, CommitFileMoveAsync) { Owner = this };
+                    var review = new DuplicateReviewWindow(session, CommitFileMoveAsync) { Owner = this };
                     _activeDuplicateReview = review;
                     foreach (var viewer in OwnedWindows.OfType<PhotoViewerWindow>().ToArray()) viewer.Close();
                     review.ShowDialog();

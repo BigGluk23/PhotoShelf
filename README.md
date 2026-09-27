@@ -1,4 +1,4 @@
-# PhotoShelf Ultra v0.10.2
+# PhotoShelf Ultra v0.10.3
 
 Локальный менеджер фото и видео для Windows x64, C# / .NET 10 / WPF.
 Реализованы этапы P0: быстрое измеримое ядро и безопасная организация файлов.
@@ -8,12 +8,13 @@
 Актуальные исходники и история изменений: [BigGluk23/PhotoShelf](https://github.com/BigGluk23/PhotoShelf).
 Для Windows скачайте артефакт `PhotoShelf-win-x64` успешного запуска [Windows CI](https://github.com/BigGluk23/PhotoShelf/actions/workflows/windows-ci.yml), распакуйте ZIP и запустите `PhotoShelf.exe`.
 .NET runtime, иконки и PNG интерфейса встроены в EXE. Внешняя папка `Assets` для запуска не требуется.
-Настройки, SQLite-каталог, диагностика и журналы находятся в `%APPDATA%\PhotoShelf`.
+Новые установки хранят каталог и журналы в `%LOCALAPPDATA%\PhotoShelf`. Существующий каталог в `%APPDATA%\PhotoShelf` сохраняется вместе с журналами; настройки показывают фактические пути и предупреждение о roaming-хранении. Кэш и новая диагностика находятся в LocalAppData. Карантин выбирается явно перед первым использованием.
 Сканирование и просмотр не изменяют содержимое оригиналов.
 
 Для продолжения разработки: `git pull --ff-only`, затем [HANDOFF.md](HANDOFF.md).
 Сравнение с v0.9.7: [docs/ultra-comparison.md](docs/ultra-comparison.md).
 История исправления запуска: [docs/v0.10.1-startup-fix.md](docs/v0.10.1-startup-fix.md).
+Исправления ревью v0.10.3: [docs/v0.10.3-review-fixes.md](docs/v0.10.3-review-fixes.md).
 Изменения v0.10.2 и проверка стабильности сетки: [docs/v0.10.2-validation.md](docs/v0.10.2-validation.md).
 
 ## Быстрое ядро

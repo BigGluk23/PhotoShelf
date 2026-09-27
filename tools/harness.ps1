@@ -36,12 +36,22 @@ try {
     $result.version = (& $Python tools/harness_checks.py version).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify application version.' }
     Invoke-Checked $DotNet @('--info')
+    # Lockfiles pin direct/transitive package hashes; NuGet audit is required and warnings fail restore.
+    Invoke-Checked $DotNet @('restore', 'PhotoShelf.sln', '--locked-mode', '--force', '--disable-parallel')
+    & $DotNet list PhotoShelf.sln package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'dependencies.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not record resolved dependency inventory.' }
+    & $DotNet list PhotoShelf.sln package --vulnerable --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'dependency-audit.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not check dependency advisories.' }
     Invoke-Checked $DotNet @('build', 'PhotoShelf.sln', '-c', 'Release', '-m:1', '-nr:false', '-p:UseSharedCompilation=false')
     $hadTestFailure = $false
     foreach ($project in @('Domain', 'Application', 'Infrastructure.Sqlite', 'Desktop')) {
         $arguments = @('test', "tests/PhotoShelf.$project.Tests/PhotoShelf.$project.Tests.csproj", '-c', 'Release', '--no-build', '--no-restore',
             '-m:1', '-nr:false', '--results-directory', $results, '--logger', "trx;LogFileName=$project.trx")
         if (-not $Scale) { $arguments += @('--filter', 'Category!=CatalogScale') }
+        if ($project -eq 'Desktop') {
+            # Native malformed-image regressions run in a disposable testhost with a hard watchdog.
+            $arguments += @('--blame-hang-timeout', '30s', '--blame-hang-dump-type', 'none')
+        }
         # Collect every suite's result so one failure does not hide independent Windows regressions.
         & $DotNet @arguments
         if ($LASTEXITCODE -ne 0) { $hadTestFailure = $true }
@@ -88,7 +98,7 @@ try {
         throw 'New error logs were written during the isolated UI smoke.'
     }
     if ($smokeProcess.ExitCode -ne 0 -or $smoke.status -ne 'passed' -or $smoke.check -ne 'ui-smoke' -or $smoke.ready -ne $true -or $smoke.previewRendered -ne $true -or
-        $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
+        $smoke.nativeDecoderVerified -ne $true -or $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
         $smoke.dispatcherTicks -lt 20 -or $smoke.maxDispatcherGapMs -gt 2000 -or $smoke.exitCode -ne 0 -or
         -not ($smoke.version -eq $result.version -or $smoke.version.StartsWith($result.version + '+', [StringComparison]::Ordinal))) {
         throw 'UI smoke did not confirm the published version, ready window, at least 5 seconds of responsiveness, zero errors, and graceful exit.'

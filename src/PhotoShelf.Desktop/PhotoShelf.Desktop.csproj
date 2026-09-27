@@ -2,6 +2,7 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>PhotoShelf</AssemblyName>
@@ -16,10 +17,12 @@
     <ProjectReference Include="..\PhotoShelf.Infrastructure.Sqlite\PhotoShelf.Infrastructure.Sqlite.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+    <PackageReference Include="SkiaSharp" Version="4.152.1" />
+    <PackageReference Include="MetadataExtractor" Version="2.9.3" />
   </ItemGroup>
   <ItemGroup>
     <None Include="RUNNING.txt" CopyToOutputDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="..\..\docs\licenses\*" Link="licenses\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Remove="Assets\PhotoShelf.ico;Assets\giraffe-icon.png" />
     <Resource Include="Assets\PhotoShelf.ico" />
     <Resource Include="Assets\giraffe-icon.png" />

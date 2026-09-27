@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Metadata;
 
 namespace PhotoShelf.Infrastructure.Sqlite;
 
@@ -17,8 +18,8 @@ public sealed partial class SqliteDesktopCatalogStore
                 await using var command=connection.CreateCommand();command.Transaction=transaction;
                 command.CommandText="""
                     INSERT INTO desktop_media_items(asset_id,path,path_key,folder_key,search_key,is_favorite,size_bytes,
-                        file_modified_utc_ticks,file_local_ticks,file_month,is_video,capture_date_ticks,capture_month,metadata_indexed,is_hidden_or_system,last_seen_utc)
-                    VALUES($id,$path,$pathKey,$folder,$pathKey,$favorite,$size,$modified,$local,$fileMonth,$video,$capture,$captureMonth,$indexed,$system,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                        file_modified_utc_ticks,file_local_ticks,file_month,is_video,capture_date_ticks,capture_month,metadata_indexed,metadata_status,metadata_attempted_ticks,metadata_retry_ticks,metadata_error_code,is_hidden_or_system,last_seen_utc)
+                    VALUES($id,$path,$pathKey,$folder,$pathKey,$favorite,$size,$modified,$local,$fileMonth,$video,$capture,$captureMonth,$indexed,$status,$attempted,$retry,$error,$system,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                     ON CONFLICT(path_key) DO UPDATE SET
                         path=excluded.path,folder_key=excluded.folder_key,search_key=excluded.search_key,
                         is_favorite=CASE WHEN $preserveFavorite=1 THEN desktop_media_items.is_favorite ELSE excluded.is_favorite END,
@@ -28,6 +29,14 @@ public sealed partial class SqliteDesktopCatalogStore
                             WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.capture_month ELSE NULL END,
                         metadata_indexed=CASE WHEN excluded.metadata_indexed=1 THEN 1
                             WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_indexed ELSE 0 END,
+                        metadata_status=CASE WHEN excluded.metadata_indexed=1 THEN excluded.metadata_status
+                            WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_status ELSE 0 END,
+                        metadata_attempted_ticks=CASE WHEN excluded.metadata_indexed=1 THEN excluded.metadata_attempted_ticks
+                            WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_attempted_ticks ELSE NULL END,
+                        metadata_retry_ticks=CASE WHEN excluded.metadata_indexed=1 THEN excluded.metadata_retry_ticks
+                            WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_retry_ticks ELSE NULL END,
+                        metadata_error_code=CASE WHEN excluded.metadata_indexed=1 THEN excluded.metadata_error_code
+                            WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_error_code ELSE NULL END,
                         size_bytes=excluded.size_bytes,file_modified_utc_ticks=excluded.file_modified_utc_ticks,
                         file_local_ticks=excluded.file_local_ticks,file_month=excluded.file_month,
                         is_video=excluded.is_video,is_hidden_or_system=excluded.is_hidden_or_system,last_seen_utc=excluded.last_seen_utc;
@@ -45,6 +54,12 @@ public sealed partial class SqliteDesktopCatalogStore
                     command.Parameters.AddWithValue("$video",item.IsVideo ? 1 : 0);command.Parameters.AddWithValue("$capture",(object?)item.CaptureDate?.Ticks??DBNull.Value);
                     command.Parameters.AddWithValue("$captureMonth",(object?)Month(item.CaptureDate)??DBNull.Value);
                     command.Parameters.AddWithValue("$indexed",item.MetadataIndexed ? 1 : 0);command.Parameters.AddWithValue("$system",item.IsHiddenOrSystem ? 1 : 0);
+                    var status = item.MetadataStatus == MetadataReadStatus.Pending && item.MetadataIndexed
+                        ? (item.CaptureDate is null ? MetadataReadStatus.Absent : MetadataReadStatus.Found) : item.MetadataStatus;
+                    command.Parameters.AddWithValue("$status", (int)status);
+                    command.Parameters.AddWithValue("$attempted", (object?)item.MetadataAttemptedAtUtc?.Ticks ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$retry", (object?)item.MetadataRetryAtUtc?.Ticks ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$error", (object?)item.MetadataErrorCode ?? DBNull.Value);
                     command.Parameters.AddWithValue("$preserveFavorite",preserveFavorites ? 1 : 0);
                     await command.ExecuteNonQueryAsync(token);
                 }
@@ -61,24 +76,43 @@ public sealed partial class SqliteDesktopCatalogStore
         await command.ExecuteNonQueryAsync(token);
     },token),token);
 
-    public Task UpdateCaptureDateAsync(string path,long size,DateTime? modified,DateTime? captureDate,CancellationToken token=default)=>Task.Run(()=>CatalogDatabaseAccess.WriteAsync(_directory,async()=>
+    public Task UpdateCaptureDateAsync(string path,long size,DateTime? modified,DateTime? captureDate,CancellationToken token=default) =>
+        UpdateMetadataResultAsync(path,size,modified,new(captureDate is null ? MetadataReadStatus.Absent : MetadataReadStatus.Found,captureDate),DateTime.UtcNow,token);
+
+    public Task<bool> UpdateMetadataResultAsync(string path,long size,DateTime? modified,CaptureDateReadResult result,DateTime attemptedUtc,CancellationToken token=default) => Task.Run(async () =>
     {
-        await using var connection=await OpenAsync(token);await using var command=connection.CreateCommand();
-        command.CommandText="""
-            UPDATE desktop_media_items SET capture_date_ticks=$capture,capture_month=$month,metadata_indexed=1
-            WHERE path_key=$path AND size_bytes=$size AND file_modified_utc_ticks=$modified AND is_quarantined=0;
-            """;
-        command.Parameters.AddWithValue("$capture",(object?)captureDate?.Ticks??DBNull.Value);
-        command.Parameters.AddWithValue("$month",(object?)Month(captureDate)??DBNull.Value);command.Parameters.AddWithValue("$path",NormalizePathKey(path));
-        command.Parameters.AddWithValue("$size",size);command.Parameters.AddWithValue("$modified",modified?.ToUniversalTime().Ticks??0);
-        await command.ExecuteNonQueryAsync(token);
-    },token),token);
+        var updated = false;
+        await CatalogDatabaseAccess.WriteAsync(_directory,async () =>
+        {
+            await using var connection=await OpenAsync(token);await using var command=connection.CreateCommand();
+            command.CommandText="""
+                UPDATE desktop_media_items SET
+                    capture_date_ticks=CASE WHEN $authoritative=1 THEN $capture ELSE capture_date_ticks END,
+                    capture_month=CASE WHEN $authoritative=1 THEN $month ELSE capture_month END,
+                    metadata_indexed=$terminal,metadata_status=$status,metadata_attempted_ticks=$attempted,
+                    metadata_retry_ticks=$retry,metadata_error_code=$error
+                WHERE path_key=$path AND size_bytes=$size AND file_modified_utc_ticks=$modified AND is_quarantined=0;
+                """;
+            command.Parameters.AddWithValue("$authoritative",result.IsAuthoritative?1:0);
+            command.Parameters.AddWithValue("$capture",(object?)result.CaptureDate?.Ticks??DBNull.Value);
+            command.Parameters.AddWithValue("$month",(object?)Month(result.CaptureDate)??DBNull.Value);
+            command.Parameters.AddWithValue("$terminal",result.IsTerminal?1:0);
+            command.Parameters.AddWithValue("$status",(int)result.Status);
+            command.Parameters.AddWithValue("$attempted",attemptedUtc.ToUniversalTime().Ticks);
+            command.Parameters.AddWithValue("$retry",(object?)result.RetryAtUtc(attemptedUtc.ToUniversalTime())?.Ticks??DBNull.Value);
+            command.Parameters.AddWithValue("$error",(object?)result.ErrorCode??DBNull.Value);
+            command.Parameters.AddWithValue("$path",NormalizePathKey(path));
+            command.Parameters.AddWithValue("$size",size);command.Parameters.AddWithValue("$modified",modified?.ToUniversalTime().Ticks??0);
+            updated=await command.ExecuteNonQueryAsync(token)==1;
+        },token);
+        return updated;
+    },token);
 
     public Task ResetMetadataIndexAsync(CancellationToken token=default)=>Task.Run(()=>CatalogDatabaseAccess.WriteAsync(_directory,async()=>
     {
         await using var connection=await OpenAsync(token);
         // Retain previous dates while a cancellable reindex is in progress.
-        await ExecuteAsync(connection,null,"UPDATE desktop_media_items SET metadata_indexed=0 WHERE is_quarantined=0;",token);
+        await ExecuteAsync(connection,null,"UPDATE desktop_media_items SET metadata_indexed=0,metadata_retry_ticks=NULL WHERE is_quarantined=0;",token);
     },token),token);
 
     /// <summary>Remove from displayed library only; retain identity and user data for recovery.</summary>

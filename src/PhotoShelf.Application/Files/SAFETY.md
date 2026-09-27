@@ -28,12 +28,16 @@
 
 Every journal record has a sequence and SHA-256 chain. A torn final record is preserved separately and recovery resumes from the verified prefix. Complete corrupted records stop automatic recovery. A group manifest is indivisible for journal parsing, so an interruption before staging cannot produce a partial companion plan.
 
+v0.10.3 reads journals in bounded chunks, retaining only the latest state per source. New plans are limited to 50,000 files / 256 members per group; the estimated latest-state budget is 64 MiB. Exceeding a read budget refuses automatic processing without trimming/deleting the journal. Undo writes bounded inverse manifests, then links original groups; recovery validates every inverse entry against the original path/hash/size/group before executing it. Checksums establish consistency, not cryptographic authorship.
+
 ## Groups and conservative refusals
 
 - Unique RAW+JPEG with the same basename and exact XMP/AAE sidecars are grouped. Rename suffixes remain aligned across members.
 - Same-basename photo+MOV is ambiguous without a verified content identifier. It is blocked unless the caller supplies `MoveRequest.ConfirmedCompanions` from a proven relation.
 - Reparse points/symlinks/mounted-directory traversal are refused until an explicit physical-path workflow exists.
 - Cross-volume copying of EFS-encrypted files or files containing additional NTFS data streams is refused. Same-volume rename preserves them. This avoids silently dropping streams or encryption.
+- Windows copies preserve owner/group and the effective source DACL as protected explicit rules at creation, before any media bytes are written. Both source and target permissions are checked again before cleanup. Destinations without persistent ACLs (including FAT/exFAT), insufficient permissions, mandatory-integrity labels, resource attributes and central access policies are refused. SACL auditing is not promised. Same-volume rename preserves the existing file object.
+- The common domain format registry covers every supported RAW/image extension. Unclassified same-stem companions require explicit confirmation; they are never silently split away.
 - Legacy v0.9.7 journals lack sufficient integrity/snapshot information for automatic recovery and are shown as requiring manual inspection.
 - Partial or corrupt temporary copies are retained. Recovery allocates a new temporary name; it does not silently remove uncertain data.
 

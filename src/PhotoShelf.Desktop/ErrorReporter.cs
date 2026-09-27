@@ -12,7 +12,7 @@ public static class ErrorReporter
     private static int _errorCount;
     internal static bool AutomatedCheck { get; set; }
     internal static int ErrorCount => Volatile.Read(ref _errorCount);
-    internal static string LogRoot => Path.Combine(LocalCatalogStore.CatalogDirectory, "diagnostics", "errors");
+    internal static string LogRoot => Path.Combine(LocalCatalogStore.DerivedDataDirectory, "diagnostics", "errors");
     public static string Version => typeof(App).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "unknown";
 
     public static void Show(Exception exception, string context)

@@ -71,6 +71,7 @@ public partial class App : System.Windows.Application
             if (Dispatcher.HasShutdownStarted) return;
             if (_uiSmoke is not null) await _uiSmoke.SeedCatalogAsync();
             var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
+            QuarantineConfiguration.ApplyLoaded(state);
             if (Dispatcher.HasShutdownStarted) return;
             var mainWindow = new MainWindow(state);
             MainWindow = mainWindow;

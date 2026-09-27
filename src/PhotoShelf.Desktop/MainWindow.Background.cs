@@ -104,7 +104,7 @@ public partial class MainWindow
             ?? new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
         item.ApplyFileInformation(saved.SizeBytes, saved.FileModifiedAt);
         item.IsFavorite = saved.IsFavorite; if (index >= 0) item.ViewIndex = index;
-        if (saved.MetadataIndexed) item.ApplyIndexedCaptureDate(saved.CaptureDate);
+        item.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
         return item;
     }
 

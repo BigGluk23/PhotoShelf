@@ -1,3 +1,4 @@
+using PhotoShelf.Application.Metadata;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
@@ -6,7 +7,8 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using SixLabors.ImageSharp.Metadata.Profiles.Exif;
+using MetadataExtractor;
+using MetadataExtractor.Formats.Xmp;
 
 namespace PhotoShelf.Desktop;
 
@@ -92,6 +94,7 @@ public sealed class PhotoItem : INotifyPropertyChanged
     public DateTime? CaptureDate { get; private set; }
 
     public bool IsCaptureDateLoaded { get; private set; }
+    public MetadataReadStatus MetadataStatus { get; private set; }
 
     public string Folder => System.IO.Path.GetDirectoryName(Path) ?? string.Empty;
 
@@ -115,25 +118,19 @@ public sealed class PhotoItem : INotifyPropertyChanged
             return false;
         }
 
-        IsCaptureDateLoaded = true;
-        var captureDate = IsVideo ? null : ReadCaptureDate(Path);
-        if (CaptureDate == captureDate)
-        {
-            return false;
-        }
-
-        CaptureDate = captureDate;
-        _metadataText = null;
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CaptureDate)));
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DetailLine)));
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(MetadataText)));
-        return true;
+        var result = IsVideo ? new CaptureDateReadResult(MetadataReadStatus.Unsupported) : CaptureDateReader.Read(Path);
+        var date = result.ApplyTo(CaptureDate);
+        var changed = CaptureDate != date;
+        ApplyIndexedCaptureDate(date, result.Status);
+        return changed;
     }
 
-    public void ApplyIndexedCaptureDate(DateTime? captureDate)
+    public void ApplyIndexedCaptureDate(DateTime? captureDate, MetadataReadStatus? status = null)
     {
-        if (IsCaptureDateLoaded && CaptureDate == captureDate) return;
-        IsCaptureDateLoaded = true;
+        var readStatus = status ?? (captureDate is null ? MetadataReadStatus.Absent : MetadataReadStatus.Found);
+        if (IsCaptureDateLoaded && CaptureDate == captureDate && MetadataStatus == readStatus) return;
+        IsCaptureDateLoaded = readStatus != MetadataReadStatus.Pending;
+        MetadataStatus = readStatus;
         CaptureDate = captureDate;
         _metadataText = null;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CaptureDate)));
@@ -145,7 +142,7 @@ public sealed class PhotoItem : INotifyPropertyChanged
     {
         if (FileSizeBytes == sizeBytes && FileModifiedAt == modifiedAt) return;
         FileSizeBytes = sizeBytes; FileModifiedAt = modifiedAt;
-        CaptureDate = null; IsCaptureDateLoaded = false; _metadataText = null;
+        CaptureDate = null; IsCaptureDateLoaded = false; MetadataStatus = MetadataReadStatus.Pending; _metadataText = null;
         foreach (var name in new[] { nameof(FileSizeBytes), nameof(FileModifiedAt), nameof(CaptureDate), nameof(DetailLine), nameof(MetadataText) })
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
@@ -155,75 +152,9 @@ public sealed class PhotoItem : INotifyPropertyChanged
         return IsPhotoPath(path) || IsVideoPath(path);
     }
 
-    public static bool IsPhotoPath(string path)
-    {
-        var extension = System.IO.Path.GetExtension(path);
-        return extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".png", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".webp", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".gif", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".bmp", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".tif", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".tiff", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".heic", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".heif", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".hif", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".avif", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".jxl", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".jp2", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".j2k", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".psd", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".svg", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".dng", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".cr2", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".cr3", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".nef", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".nrw", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".arw", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".srf", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".sr2", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".raf", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".orf", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".rw2", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".pef", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".x3f", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".erf", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".kdc", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".rwl", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".raw", StringComparison.OrdinalIgnoreCase);
-    }
+    public static bool IsPhotoPath(string path) => PhotoShelf.Domain.MediaFormatRegistry.IsPhoto(path);
 
-    public static bool IsVideoPath(string path)
-    {
-        var extension = System.IO.Path.GetExtension(path);
-        return extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".mov", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".avi", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".mkv", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".webm", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".wmv", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".mts", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".m2ts", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".3gp", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".3g2", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".mpg", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".mpeg", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".ts", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".m2v", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".vob", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".ogv", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".flv", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".f4v", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".asf", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".divx", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".dv", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".rm", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".rmvb", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".hevc", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".prores", StringComparison.OrdinalIgnoreCase);
-    }
+    public static bool IsVideoPath(string path) => PhotoShelf.Domain.MediaFormatRegistry.IsVideo(path);
 
     public static bool IsAnimatedGifPath(string path)
     {
@@ -242,9 +173,16 @@ public sealed class PhotoItem : INotifyPropertyChanged
             text.AppendLine($"Дата файла: {FileModifiedAt:dd.MM.yyyy HH:mm:ss}");
         }
         text.AppendLine(CaptureDate is null
-            ? IsCaptureDateLoaded ? "Дата съёмки: не найдена" : "Дата съёмки: ещё не индексировалась"
+            ? MetadataStatus == MetadataReadStatus.Absent ? "Дата съёмки: не найдена" : MetadataStatus == MetadataReadStatus.Pending ? "Дата съёмки: ещё не индексировалась" : "Дата съёмки: не прочитана"
             : $"Дата съёмки: {CaptureDate:dd.MM.yyyy HH:mm:ss}");
 
+        if (MetadataStatus is MetadataReadStatus.TransientError or MetadataReadStatus.Corrupt or MetadataReadStatus.Unsupported)
+            text.AppendLine(MetadataStatus switch
+            {
+                MetadataReadStatus.TransientError => "Последнее чтение: временная ошибка; повтор в фоне. Ранее найденная дата сохранена.",
+                MetadataReadStatus.Corrupt => "Последнее чтение: повреждённые метаданные. Ранее найденная дата сохранена.",
+                _ => "Последнее чтение: формат пока не поддерживается. Ранее найденная дата сохранена."
+            });
         text.AppendLine($"Папка: {Folder}");
         text.AppendLine($"Путь: {Path}");
 
@@ -257,15 +195,24 @@ public sealed class PhotoItem : INotifyPropertyChanged
 
         try
         {
-            var info = SixLabors.ImageSharp.Image.Identify(Path);
-            text.AppendLine($"Пиксели: {info.Width} x {info.Height}");
-            text.AppendLine($"Кадров: {info.FrameMetadataCollection.Count}");
-            if (info.Metadata.ExifProfile is { } exif)
-                foreach (var value in exif.Values) text.AppendLine($"{value.Tag}: {value.GetValue()}");
-            if (info.Metadata.IptcProfile is { } iptc)
-                foreach (var value in iptc.Values) text.AppendLine($"IPTC {value.Tag}: {value.Value}");
-            if (info.Metadata.XmpProfile is { } xmp)
-                text.AppendLine(System.Text.Encoding.UTF8.GetString(xmp.ToByteArray()));
+            using var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var directories = ImageMetadataReader.ReadMetadata(stream, Path);
+            foreach (var directory in directories)
+            {
+                text.AppendLine($"[{directory.Name}]");
+                foreach (var tag in directory.Tags)
+                {
+                    text.AppendLine($"{tag.Name}: {tag.Description}");
+                    if (text.Length > 64 * 1024) { text.AppendLine("Показаны первые 64 КиБ метаданных."); return text.ToString(); }
+                }
+                if (directory is XmpDirectory xmp)
+                    foreach (var value in xmp.GetXmpProperties())
+                    {
+                        text.AppendLine($"XMP {value.Key}: {value.Value}");
+                        if (text.Length > 64 * 1024) { text.AppendLine("Показаны первые 64 КиБ метаданных."); return text.ToString(); }
+                    }
+                if (directory.Errors.Any()) text.AppendLine("Часть метаданных повреждена или не прочитана.");
+            }
             return text.ToString();
         }
         catch { /* A WIC metadata reader remains a fallback for legacy formats. */ }
@@ -332,46 +279,5 @@ public sealed class PhotoItem : INotifyPropertyChanged
         return string.IsNullOrWhiteSpace(second) ? first : $"{first} {second}";
     }
 
-    public static DateTime? ReadCaptureDate(string path)
-    {
-        try
-        {
-            var exif = SixLabors.ImageSharp.Image.Identify(path).Metadata.ExifProfile;
-            if (exif is not null && exif.TryGetValue(ExifTag.DateTimeOriginal, out var original) &&
-                DateTime.TryParseExact(original.Value, "yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out var capture))
-                return capture;
-        }
-        catch { }
-        try
-        {
-            using var stream = File.OpenRead(path);
-            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None);
-            if (decoder.Frames.FirstOrDefault()?.Metadata is not BitmapMetadata metadata ||
-                string.IsNullOrWhiteSpace(metadata.DateTaken))
-            {
-                return null;
-            }
-
-            var formats = new[]
-            {
-                "MM/dd/yyyy HH:mm:ss",
-                "yyyy:MM:dd HH:mm:ss",
-                "yyyy-MM-dd HH:mm:ss",
-                "yyyy-MM-ddTHH:mm:ss"
-            };
-
-            if (DateTime.TryParseExact(metadata.DateTaken, formats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var exact))
-            {
-                return exact;
-            }
-
-            return DateTime.TryParse(metadata.DateTaken, CultureInfo.CurrentCulture, DateTimeStyles.AssumeLocal, out var parsed)
-                ? parsed
-                : null;
-        }
-        catch
-        {
-            return null;
-        }
-    }
+    public static DateTime? ReadCaptureDate(string path) => CaptureDateReader.Read(path).CaptureDate;
 }

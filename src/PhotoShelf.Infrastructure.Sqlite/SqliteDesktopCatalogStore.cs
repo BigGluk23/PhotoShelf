@@ -24,20 +24,33 @@ public sealed partial class SqliteDesktopCatalogStore
             var exists = await TableExistsAsync(connection, null, "desktop_media_items", cancellationToken);
             var hasSizeCounts = await TableExistsAsync(connection, null, "desktop_size_counts", cancellationToken);
             var migrated = false;
+            var hasMetadataStatus = false;
             if (exists)
             {
                 await using var info = connection.CreateCommand();
                 info.CommandText = "PRAGMA table_info(desktop_media_items);";
                 await using var reader = await info.ExecuteReaderAsync(cancellationToken);
-                while (await reader.ReadAsync(cancellationToken)) if (reader.GetString(1) == "asset_id") migrated = true;
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    if (reader.GetString(1) == "asset_id") migrated = true;
+                    if (reader.GetString(1) == "metadata_status") hasMetadataStatus = true;
+                }
             }
             // SQLite backup includes committed WAL pages. Never copy the main file alone.
             if (exists && !migrated) await CreateVerifiedBackupAsync(connection, "before-paged-schema", cancellationToken);
+            else if (exists && !hasMetadataStatus) await CreateVerifiedBackupAsync(connection, "before-metadata-status", cancellationToken);
             await ExecuteAsync(connection, null, "PRAGMA journal_mode=WAL;", cancellationToken);
             await using var transaction = connection.BeginTransaction();
             if (exists && !migrated)
                 await ExecuteAsync(connection, transaction, "ALTER TABLE desktop_media_items RENAME TO desktop_media_items_v097;", cancellationToken);
             await ExecuteAsync(connection, transaction, Schema, cancellationToken);
+            if (exists && migrated && !hasMetadataStatus)
+                await ExecuteAsync(connection, transaction, """
+                    ALTER TABLE desktop_media_items ADD COLUMN metadata_status INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE desktop_media_items ADD COLUMN metadata_attempted_ticks INTEGER NULL;
+                    ALTER TABLE desktop_media_items ADD COLUMN metadata_retry_ticks INTEGER NULL;
+                    ALTER TABLE desktop_media_items ADD COLUMN metadata_error_code TEXT NULL;
+                    """, cancellationToken);
             if (exists && migrated && !hasSizeCounts)
                 await ExecuteAsync(connection, transaction, "INSERT INTO desktop_size_counts(size_bytes,item_count) SELECT size_bytes,COUNT(*) FROM desktop_media_items WHERE is_quarantined=0 GROUP BY size_bytes;", cancellationToken);
             if (exists && !migrated)
@@ -67,6 +80,12 @@ public sealed partial class SqliteDesktopCatalogStore
                         """, cancellationToken);
                 }
             }
+            // Older nulls could mean a swallowed decoder error. Recheck them once, preserve known dates.
+            if (!hasMetadataStatus)
+                await ExecuteAsync(connection, transaction, """
+                    UPDATE desktop_media_items SET metadata_status=CASE WHEN capture_date_ticks IS NOT NULL THEN 1 ELSE 0 END,
+                        metadata_indexed=CASE WHEN capture_date_ticks IS NOT NULL THEN 1 ELSE 0 END;
+                    """, cancellationToken);
             await ExecuteAsync(connection, transaction, """
                 CREATE UNIQUE INDEX IF NOT EXISTS ix_desktop_path_key ON desktop_media_items(path_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_file_sort ON desktop_media_items(is_quarantined,file_local_ticks DESC,path_key,is_hidden_or_system,is_video,is_favorite);
@@ -76,9 +95,10 @@ public sealed partial class SqliteDesktopCatalogStore
                 CREATE INDEX IF NOT EXISTS ix_desktop_folder ON desktop_media_items(folder_key,file_local_ticks DESC,path_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_file_group ON desktop_media_items(is_quarantined,file_month,file_local_ticks DESC,path_key,is_hidden_or_system,is_video,is_favorite);
                 CREATE INDEX IF NOT EXISTS ix_desktop_capture_group ON desktop_media_items(is_quarantined,capture_month,COALESCE(capture_date_ticks,0) DESC,path_key,is_hidden_or_system,is_video,is_favorite);
+                CREATE INDEX IF NOT EXISTS ix_desktop_metadata_due ON desktop_media_items(metadata_indexed,is_quarantined,is_video,metadata_retry_ticks);
                 CREATE INDEX IF NOT EXISTS ix_desktop_size ON desktop_media_items(size_bytes,is_quarantined);
                 CREATE INDEX IF NOT EXISTS ix_desktop_favorites ON desktop_media_items(is_favorite,file_local_ticks DESC,path_key);
-                INSERT INTO desktop_settings(key,value) VALUES('catalog_schema','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+                INSERT INTO desktop_settings(key,value) VALUES('catalog_schema','4') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
                 """, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }, cancellationToken), cancellationToken);
@@ -118,6 +138,8 @@ public sealed partial class SqliteDesktopCatalogStore
                     case "tile_width": if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var width)) state.TileWidth = width; break;
                     case "show_videos": if (bool.TryParse(value, out var videos)) state.ShowVideos = videos; break;
                     case "date_grouping_mode": state.DateGroupingMode = value; break;
+                    case "quarantine_directory": state.QuarantineDirectory = string.IsNullOrWhiteSpace(value) ? null : value; break;
+                    case "quarantine_batches": state.QuarantineBatchDirectories = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
                 }
             }
         }
@@ -226,7 +248,8 @@ public sealed partial class SqliteDesktopCatalogStore
             folder_key TEXT NOT NULL, search_key TEXT NOT NULL, is_favorite INTEGER NOT NULL DEFAULT 0,
             size_bytes INTEGER NOT NULL, file_modified_utc_ticks INTEGER NOT NULL, file_local_ticks INTEGER NOT NULL DEFAULT 0,
             file_month TEXT NULL, capture_date_ticks INTEGER NULL, capture_month TEXT NULL,
-            metadata_indexed INTEGER NOT NULL DEFAULT 0, is_video INTEGER NOT NULL DEFAULT 0,
+            metadata_indexed INTEGER NOT NULL DEFAULT 0, metadata_status INTEGER NOT NULL DEFAULT 0,
+            metadata_attempted_ticks INTEGER NULL, metadata_retry_ticks INTEGER NULL, metadata_error_code TEXT NULL, is_video INTEGER NOT NULL DEFAULT 0,
             is_hidden_or_system INTEGER NOT NULL DEFAULT 0, is_quarantined INTEGER NOT NULL DEFAULT 0, last_seen_utc TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS desktop_size_counts(size_bytes INTEGER NOT NULL PRIMARY KEY,item_count INTEGER NOT NULL);

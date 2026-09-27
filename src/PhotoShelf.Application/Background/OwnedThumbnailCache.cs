@@ -9,7 +9,9 @@ public sealed class OwnedThumbnailCache
     private const string Prefix = "ps-thumb-v2-";
     private readonly string _directory;
     private readonly object _sync = new();
+    private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private long _knownBytes = -1;
+    private long _generation;
     private bool _maintenance;
     public OwnedThumbnailCache(string directory, long quotaBytes)
     {
@@ -18,6 +20,8 @@ public sealed class OwnedThumbnailCache
         QuotaBytes = quotaBytes;
     }
     public long QuotaBytes { get; }
+    public string DirectoryPath => _directory;
+    public long Generation { get { lock (_sync) return _generation; } }
     public string GetKey(string sourcePath, long length, long lastWriteTicks, int width) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"v2|{sourcePath}|{length}|{lastWriteTicks}|{width}"))).ToLowerInvariant();
 
@@ -41,12 +45,13 @@ public sealed class OwnedThumbnailCache
 
     // Call Trim once in a background maintenance job to inventory the directory.
     // Until then, or while full, writes are skipped; viewing originals never waits for inventory.
-    public void Write(string key, Action<Stream> write)
+    public void Write(string key, Action<Stream> write, long? requestGeneration = null)
     {
         lock (_sync)
         {
             _ = EntryPath(key);
-            if (_knownBytes < 0 || _maintenance || _knownBytes >= QuotaBytes || !IsSafeDirectory()) return;
+            if ((requestGeneration.HasValue && requestGeneration != _generation) ||
+                _knownBytes < 0 || _maintenance || _knownBytes >= QuotaBytes || !IsSafeDirectory()) return;
             Directory.CreateDirectory(_directory);
             if (!IsSafeDirectory()) return;
             var path = EntryPath(key);
@@ -70,21 +75,41 @@ public sealed class OwnedThumbnailCache
     }
 
     public CacheTrimResult Trim(CancellationToken cancellationToken = default, long reserveBytes = 0)
+        => TrimCore(cancellationToken, reserveBytes, clear: false);
+
+    public CacheTrimResult Clear(CancellationToken cancellationToken = default)
+        => TrimCore(cancellationToken, QuotaBytes, clear: true);
+
+    private CacheTrimResult TrimCore(CancellationToken cancellationToken, long reserveBytes, bool clear)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(reserveBytes);
-        lock (_sync) { if (_maintenance) return new(0, 0, 0); _maintenance = true; }
+        _maintenanceGate.Wait(cancellationToken);
+        lock (_sync) { _maintenance = true; if (clear) _generation++; }
         long finalBytes = -1;
         try
         {
-            if (!IsSafeDirectory()) return new(0, 0, 0);
+            if (!IsSafeDirectory())
+            {
+                if (clear) throw new IOException("Cache cleanup refused: the directory path contains a link or reparse point.");
+                return new(0, 0, 0);
+            }
             if (!Directory.Exists(_directory)) { finalBytes = 0; return new(0, 0, 0); }
             var targetBytes = Math.Max(0, QuotaBytes - reserveBytes);
             var entries = new List<FileInfo>();
             long total = 0;
-            foreach (var path in Directory.EnumerateFiles(_directory, Prefix + "*.png", SearchOption.TopDirectoryOnly))
+            foreach (var path in Directory.EnumerateFiles(_directory, clear ? Prefix + "*" : Prefix + "*.png", SearchOption.TopDirectoryOnly))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!IsOwnedName(Path.GetFileName(path)) || !IsRegularFile(path)) continue;
+                var name = Path.GetFileName(path);
+                if (!IsOwnedName(name) && !(clear && IsOwnedTemporaryName(name))) continue;
+                if (!IsRegularFile(path))
+                {
+                    if (clear && new FileInfo(path) is { LinkTarget: not null })
+                        throw new IOException("Cache cleanup refused an owned-name link; its target was preserved.");
+                    if (clear && File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                        throw new IOException("Cache cleanup refused an owned-name reparse point.");
+                    continue;
+                }
                 try { var file = new FileInfo(path); total += file.Length; entries.Add(file); }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
@@ -94,8 +119,12 @@ public sealed class OwnedThumbnailCache
             foreach (var file in entries.OrderBy(entry => entry.LastWriteTimeUtc))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (total <= targetBytes) break;
-                if (!IsSafeDirectory()) break;
+                if (!clear && total <= targetBytes) break;
+                if (!IsSafeDirectory())
+                {
+                    if (clear) throw new IOException("Cache directory changed during cleanup; no further files were removed.");
+                    break;
+                }
                 try
                 {
                     if (!IsRegularFile(file.FullName)) continue;
@@ -110,7 +139,11 @@ public sealed class OwnedThumbnailCache
             finalBytes = total;
             return new(before, total, removed);
         }
-        finally { lock (_sync) { _knownBytes = finalBytes; _maintenance = false; } }
+        finally
+        {
+            lock (_sync) { _knownBytes = finalBytes; if (clear) _generation++; _maintenance = false; }
+            _maintenanceGate.Release();
+        }
     }
 
     private string EntryPath(string key)
@@ -120,6 +153,11 @@ public sealed class OwnedThumbnailCache
     }
     private static bool IsOwnedName(string name) => name.Length == Prefix.Length + 64 + 4 && name.StartsWith(Prefix, StringComparison.Ordinal)
         && name.EndsWith(".png", StringComparison.Ordinal) && name.AsSpan(Prefix.Length, 64).ToArray().All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+    private static bool IsOwnedTemporaryName(string name) => name.Length == Prefix.Length + 64 + 1 + 32 + 4 &&
+        name.StartsWith(Prefix, StringComparison.Ordinal) && name.EndsWith(".tmp", StringComparison.Ordinal) &&
+        name[Prefix.Length + 64] == '-' &&
+        name.AsSpan(Prefix.Length, 64).ToArray().All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f') &&
+        name.AsSpan(Prefix.Length + 65, 32).ToArray().All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
     private bool IsSafeDirectory()
     {
         // A redirect anywhere in the cache path must not turn cache cleanup into original-file cleanup.

@@ -20,6 +20,7 @@ public sealed class OperationsWindow : Window
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8) };
     private readonly Button _recover = new() { Content = "Продолжить / восстановить", Margin = new Thickness(6), Padding = new Thickness(8) };
     private readonly Button _undo = new() { Content = "Откатить перенос", Margin = new Thickness(6), Padding = new Thickness(8) };
+    private readonly Button _export = new() { Content = "Сохранить журнал для разбора", Margin = new Thickness(6), Padding = new Thickness(8) };
     private bool _busy;
     private int _revision;
     public OperationsWindow(string directory, Func<MoveOperationHistory, bool, Task> execute, Func<Task<string>> backup)
@@ -47,6 +48,8 @@ public sealed class OperationsWindow : Window
         AddColumn(_files, "Размер", nameof(MoveEntry.Length), 90);
         var buttons = new StackPanel { Orientation = Orientation.Horizontal };
         buttons.Children.Add(_recover); buttons.Children.Add(_undo);
+        buttons.Children.Add(_export);
+        _export.Click += async (_, _) => await ExportJournalAsync();
         var refresh = new Button { Content = "Обновить", Padding = new Thickness(8), Margin = new Thickness(6) };
         var backupButton = new Button { Content = "Резервная копия каталога", Padding = new Thickness(8), Margin = new Thickness(6) };
         backupButton.Click += async (_, _) =>
@@ -94,7 +97,27 @@ public sealed class OperationsWindow : Window
         var operation = _history.SelectedItem as MoveOperationHistory;
         _recover.IsEnabled = !_busy && operation is { PendingFiles: > 0 };
         _undo.IsEnabled = !_busy && operation?.CanUndo == true;
+        _export.IsEnabled = !_busy && operation is not null;
         _history.IsEnabled = !_busy;
+    }
+    private async Task ExportJournalAsync()
+    {
+        if (_busy || _history.SelectedItem is not MoveOperationHistory operation) return;
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Новое имя для копии журнала (содержит полные пути; перезапись запрещена)",
+            FileName = "PhotoShelf-operation-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".jsonl",
+            Filter = "Журнал PhotoShelf|*.jsonl", OverwritePrompt = false
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        _busy = true; SetButtons();
+        try
+        {
+            var hash = await JournalEvidenceExport.CopyAsync(_directory, operation.JournalPath, dialog.FileName);
+            _status.Text = $"Копия для ручного разбора: {dialog.FileName}\nSHA-256: {hash}\nОригинал журнала и медиа не изменены. Копия содержит полные пути; отправляйте её только осознанно. Не удаляйте журналы и .photoshelf-* файлы для снятия блокировки.";
+        }
+        catch (Exception ex) { _status.Text = $"Экспорт не завершён: {ex.Message}\nОригинал сохранён; незавершённая копия имеет суффикс .partial."; }
+        finally { _busy = false; SetButtons(); }
     }
     private async Task ExecuteAsync(bool undo)
     {

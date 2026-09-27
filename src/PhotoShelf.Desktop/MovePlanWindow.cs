@@ -28,6 +28,9 @@ public sealed class MovePlanWindow : Window
         var panel = new DockPanel(); Content = panel;
         var top = new StackPanel(); DockPanel.SetDock(top, Dock.Top); panel.Children.Add(top);
         top.Children.Add(new TextBlock { Text = $"Папка: {destination}\nВнутри тома — переименование, между томами — проверенная копия. Совпадения не перезаписываются. Связанные файлы показаны отдельными строками.", Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap });
+        if (StoragePrivacyPolicy.KnownSynchronizationWarning(destination) is { } synchronizationWarning)
+            top.Children.Add(new TextBlock { Text = synchronizationWarning, Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap,
+                Foreground = System.Windows.Media.Brushes.DarkOrange });
         top.Children.Add(_collision);
         var options = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
         _layout.SelectedIndex = byYear ? 2 : 0;

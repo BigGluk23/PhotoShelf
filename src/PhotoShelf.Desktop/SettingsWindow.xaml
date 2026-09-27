@@ -3,10 +3,11 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Настройки PhotoShelf"
         Width="720"
-        Height="560"
+        Height="720"
         MinWidth="620"
         MinHeight="440"
         WindowStartupLocation="CenterOwner"
+        Loaded="OnSettingsLoaded"
         Background="#FFF7F4EF"
         Icon="pack://application:,,,/PhotoShelf;component/Assets/PhotoShelf.ico">
     <Grid Margin="20">
@@ -19,7 +20,7 @@
         <StackPanel>
             <TextBlock Text="Настройки" FontSize="24" FontWeight="SemiBold" Foreground="#FF242424" />
             <TextBlock Margin="0,6,0,0"
-                       Text="Первые рабочие настройки. Позже сюда добавим декодеры, карту, RAW/HEIC и правила дублей."
+                       Text="Библиотека, расположение данных и обслуживание."
                        Foreground="#FF77706A"
                        TextWrapping="Wrap" />
         </StackPanel>
@@ -41,24 +42,31 @@
                     <TextBlock Text="Каталог и кэш" FontSize="16" FontWeight="SemiBold" />
                     <TextBlock Margin="0,8,0,0" Text="Служебная папка:" Foreground="#FF77706A" />
                     <TextBox x:Name="CatalogPathBox" Margin="0,4,0,0" IsReadOnly="True" TextWrapping="NoWrap" />
+                    <TextBlock x:Name="StorageWarningText" Margin="0,8,0,0" Foreground="#FF8C5A17" TextWrapping="Wrap" />
+                    <TextBlock Margin="0,12,0,0" Text="Новые миниатюры и диагностика:" Foreground="#FF77706A" />
+                    <TextBox x:Name="DerivedPathBox" Margin="0,4,0,0" IsReadOnly="True" />
 
                     <WrapPanel Margin="0,14,0,0">
                         <Button Width="150" Margin="0,0,10,8" Style="{StaticResource PillButton}" Content="Открыть каталог" Click="OnOpenCatalogClicked" />
-                        <Button Width="180" Margin="0,0,10,8" Style="{StaticResource PillButton}" Content="Очистить миниатюры" Click="OnClearThumbnailCacheClicked" />
+                        <Button x:Name="ClearCacheButton" Width="180" Margin="0,0,10,8" Style="{StaticResource PillButton}" Content="Очистить миниатюры" Click="OnClearThumbnailCacheClicked" />
+                        <Button Width="205" Margin="0,0,10,8" Style="{StaticResource PillButton}" Content="Экспорт для поддержки" Click="OnExportDiagnosticsClicked" />
                     </WrapPanel>
 
                     <TextBlock Margin="0,6,0,0"
-                               Text="Очистка миниатюр безопасна: оригиналы не трогаются, превью создадутся заново при следующем просмотре."
+                               Text="Очистка удаляет только созданные PhotoShelf файлы кэша v2; посторонние файлы, старый неизвестный кэш, база и журналы сохраняются. Новые превью появятся при следующем запросе. Экспорт для поддержки содержит только обезличенную сводку, без фото, путей и исходных журналов."
                                Foreground="#FF77706A"
                                TextWrapping="Wrap" />
 
                     <Separator Margin="0,18,0,14" />
 
-                    <TextBlock Text="Скоро здесь" FontSize="16" FontWeight="SemiBold" />
+                    <TextBlock Text="Карантин дублей" FontSize="16" FontWeight="SemiBold" />
+                    <TextBox x:Name="QuarantinePathBox" Margin="0,8,0,0" IsReadOnly="True" Text="Папка ещё не выбрана" />
+                    <Button x:Name="ChooseQuarantineButton" Width="210" HorizontalAlignment="Left" Margin="0,10,0,0" Style="{StaticResource PillButton}" Content="Выбрать папку карантина" Click="OnChooseQuarantineClicked" />
                     <TextBlock Margin="0,8,0,0"
-                               Text="Следующие настройки: HEIC/RAW/видео-декодеры, размер кэша, правила исключений, карта, правила дублей и обслуживание базы."
+                               Text="Карантин хранит полные оригиналы. Папку нужно выбрать явно; перед переносом будет показан план. Смена папки не перемещает прежний карантин и не сбрасывает историю отката. Даже локальные папки могут копироваться внешними программами синхронизации."
                                Foreground="#FF77706A"
                                TextWrapping="Wrap" />
+                    <TextBlock x:Name="SettingsStatusText" Margin="0,12,0,0" TextWrapping="Wrap" Foreground="#FF77706A" />
                 </StackPanel>
             </ScrollViewer>
         </Border>

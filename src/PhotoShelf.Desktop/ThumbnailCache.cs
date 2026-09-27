@@ -7,13 +7,26 @@ namespace PhotoShelf.Desktop;
 
 public static class ThumbnailCache
 {
-    private static readonly OwnedThumbnailCache Store = new(Path.Combine(LocalCatalogStore.CatalogDirectory, "thumb-cache-v2"), 512L * 1024 * 1024);
+    private static readonly OwnedThumbnailCache Store = new(Path.Combine(LocalCatalogStore.DerivedDataDirectory, "thumb-cache-v2"), 512L * 1024 * 1024);
     private static long _lastTrimTicks;
     private static int _trimScheduled;
+    public static string DirectoryPath => Store.DirectoryPath;
+    public static Task<CacheTrimResult> ClearAsync(CancellationToken token = default) => Task.Run(() =>
+    {
+        var result = Store.Clear(token);
+        if (LocalCatalogStore.UsesLegacyStorage)
+        {
+            var legacy = new OwnedThumbnailCache(Path.Combine(LocalCatalogStore.CatalogDirectory, "thumb-cache-v2"), Store.QuotaBytes).Clear(token);
+            result = new CacheTrimResult(result.BytesBefore + legacy.BytesBefore, result.BytesAfter + legacy.BytesAfter,
+                result.RemovedCount + legacy.RemovedCount);
+        }
+        return result;
+    }, token);
 
     // All callers run in background workers. This cache exclusively owns generated ps-thumb-v2-* entries.
     public static ImageSource? LoadOrCreate(string path, int decodeWidth, Func<string, int, ImageSource?> factory)
     {
+        var generation = Store.Generation;
         ScheduleTrim();
         string? key = null;
         try
@@ -40,7 +53,7 @@ public static class ThumbnailCache
                     var encoder = new PngBitmapEncoder();
                     encoder.Frames.Add(BitmapFrame.Create(bitmap));
                     encoder.Save(stream);
-                });
+                }, generation);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
         }
@@ -52,7 +65,7 @@ public static class ThumbnailCache
     {
         try
         {
-            return ImageSharpBitmapLoader.LoadWicBounded(path, decodeWidth);
+            return MediaBitmapLoader.LoadWicBounded(path, decodeWidth);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException or FileFormatException) { return null; }
     }

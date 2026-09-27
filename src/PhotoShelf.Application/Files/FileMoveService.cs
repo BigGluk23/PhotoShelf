@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace PhotoShelf.Application.Files;
 
@@ -17,7 +18,8 @@ public sealed record MoveJournalEntry(string Source, string Destination, string 
     string? Error, string? Temporary = null, long Length = 0, DateTime ModifiedUtc = default,
     string? GroupId = null, string? Mode = null, DateTime CreatedUtc = default, string? UndoJournalPath = null,
     IReadOnlyList<MoveJournalEntry>? Members = null, string? RetainedOriginal = null,
-    DateTime? DestinationModifiedUtc = null, DateTime? RestoreModifiedUtc = null);
+    DateTime? DestinationModifiedUtc = null, DateTime? RestoreModifiedUtc = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? WindowsSecurityDescriptor = null);
 public sealed record MoveOperationHistory(string JournalPath, DateTime StartedUtc, int TotalFiles, int CompletedFiles,
     int PendingFiles, bool IsUndone, bool CanUndo, string? UndoJournalPath, string? Error);
 
@@ -39,10 +41,6 @@ public sealed class MoveInterruptionException(string message) : Exception(messag
 public sealed class FileMoveService
 {
     private static readonly StringComparer Paths = StringComparer.OrdinalIgnoreCase;
-    private static readonly HashSet<string> RawExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".raw", ".dng", ".cr2", ".cr3", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf", ".rw2", ".raf", ".pef", ".srw" };
-    private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".jpg", ".jpeg", ".heic", ".heif", ".png", ".tif", ".tiff", ".webp", ".gif" };
     private readonly FileMoveOptions _options;
     public FileMoveService(FileMoveOptions? options = null) => _options = options ?? new();
 
@@ -76,6 +74,8 @@ public sealed class FileMoveService
             }
             if (eventName is not null) directory = Path.Combine(directory, eventName);
             var companions = FindCompanions(source, request.ConfirmedCompanions, directories, token, out var reason);
+            if (companions.Count > DurableMoveJournal.MaxGroupMembers || result.Count + companions.Count > DurableMoveJournal.MaxOperationFiles)
+                throw new IOException("План превышает безопасный размер операции или связанной группы; разделите выбор, файлы не изменены");
             if (companions.Any(used.Contains)) reason = "Связанный файл уже входит в другую группу";
             var baseStem = Path.GetFileNameWithoutExtension(source);
             var outputStem = layout.FileNameStyle == FileNameStyle.DatePrefix && request.CaptureDate is { } capture
@@ -123,26 +123,28 @@ public sealed class FileMoveService
         Func<MoveEntry, Task> commitCatalog, IProgress<int>? progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        ValidatePlanSize(plan);
         await using var journal = DurableMoveJournal.Create(journalPath);
         return await ExecuteGroupsAsync(plan, journal, commitCatalog, progress, token);
     }
 
-    public IReadOnlyList<MoveEntry> ReadPlan(string journalPath)
+    public IReadOnlyList<MoveEntry> ReadPlan(string journalPath, CancellationToken token = default)
     {
-        var records = Latest(DurableMoveJournal.Read(journalPath).Entries);
-        foreach (var entry in records) ValidateRecord(entry);
+        var records = Latest(DurableMoveJournal.Read(journalPath, token).Entries);
+        foreach (var entry in records) { token.ThrowIfCancellationRequested(); ValidateRecord(entry); }
         return records.Select(ToEntry).ToArray();
     }
 
-    public IReadOnlyList<MoveOperationHistory> ReadHistory(string journalDirectory)
+    public IReadOnlyList<MoveOperationHistory> ReadHistory(string journalDirectory, CancellationToken token = default)
     {
         if (!Directory.Exists(journalDirectory)) return [];
         var history = new List<MoveOperationHistory>();
         foreach (var path in Directory.EnumerateFiles(journalDirectory, "*.jsonl"))
         {
+            token.ThrowIfCancellationRequested();
             try
             {
-                var records = DurableMoveJournal.Read(path).Entries;
+                var records = DurableMoveJournal.Read(path, token).Entries;
                 var latest = Latest(records);
                 var completed = latest.Count(entry => entry.Status == "completed");
                 var undone = latest.Count > 0 && latest.All(entry => entry.Status == "undone");
@@ -162,28 +164,60 @@ public sealed class FileMoveService
         IProgress<int>? progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        await using var journal = DurableMoveJournal.Open(journalPath);
+        await using var journal = DurableMoveJournal.Open(journalPath, token);
         var records = Latest(journal.Entries);
         var results = new List<MoveResult>();
+        var undoHandled = new HashSet<string>(Paths);
         // Undo has its own durable forward operation. Never resume the original in the wrong direction.
         var pendingUndo = records.Where(entry => entry.Status == "undo_pending").ToList();
+        var originalsByDestination = new Dictionary<string, MoveJournalEntry>(Paths);
+        if (pendingUndo.Count > 0)
+            foreach (var record in records)
+                if (!originalsByDestination.TryAdd(record.Destination, record))
+                    throw new IOException("Неоднозначные целевые пути в исходном журнале; файлы сохранены");
         foreach (var undoGroup in pendingUndo.GroupBy(entry => entry.UndoJournalPath))
         {
             if (undoGroup.Key is null || Paths.Equals(Path.GetFullPath(undoGroup.Key), Path.GetFullPath(journalPath)))
                 throw new IOException("Некорректная ссылка на журнал отката");
-            var inverseResults = await RecoverAsync(undoGroup.Key, commitCatalog, progress, token);
-            foreach (var item in undoGroup)
+            var inversePlan = ReadPlan(undoGroup.Key, token);
+            // A crash can leave all inverse manifests durable but only some original groups
+            // linked to them. Validate the entire inverse before executing any of its entries.
+            // Hash/group/path equality prevents a substituted journal from moving unrelated files.
+            var matching = new List<MoveJournalEntry>();
+            var matchedSources = new HashSet<string>(Paths);
+            foreach (var inverse in inversePlan)
             {
-                var result = inverseResults.FirstOrDefault(candidate => Paths.Equals(candidate.Entry.Source, item.Destination));
+                token.ThrowIfCancellationRequested();
+                if (!originalsByDestination.TryGetValue(inverse.Source, out var item) || !IsInverseOf(inverse, item)
+                    || !(item.Status == "completed" && item.UndoJournalPath is null
+                        || (item.Status is "completed" or "undo_pending" or "undone") && Paths.Equals(item.UndoJournalPath, undoGroup.Key))
+                    || !matchedSources.Add(item.Source))
+                    throw new IOException("Журнал отката не соответствует исходной операции; файлы сохранены");
+                matching.Add(item);
+            }
+            if (undoGroup.Any(item => !matchedSources.Contains(item.Source)))
+                throw new IOException("В журнале отката отсутствует связанный файл; файлы сохранены");
+            foreach (var item in matching.Where(item => item.Status == "completed"))
+            {
+                token.ThrowIfCancellationRequested();
+                await journal.AppendAsync(item with { Status = "undo_pending", UndoJournalPath = undoGroup.Key, Error = null });
+            }
+            var inverseResults = await RecoverAsync(undoGroup.Key, commitCatalog, progress, token);
+            var resultsBySource = inverseResults.ToDictionary(result => result.Entry.Source, Paths);
+            foreach (var item in matching)
+            {
+                undoHandled.Add(item.Source);
+                resultsBySource.TryGetValue(item.Destination, out var result);
+                if (result is not null && !IsInverseOf(result.Entry, item)) throw new IOException("Результат отката не соответствует исходному файлу");
                 if (result?.Moved == true)
                 {
-                    await journal.AppendAsync(item with { Status = "undone", Error = null });
+                    await journal.AppendAsync(item with { Status = "undone", UndoJournalPath = undoGroup.Key, Error = null });
                     results.Add(new(ToEntry(item), true, null));
                 }
                 else results.Add(new(ToEntry(item), false, result?.Error ?? "Откат требует восстановления"));
             }
         }
-        foreach (var group in records.Where(entry => entry.Status != "undo_pending").GroupBy(entry => entry.GroupId ?? entry.Source))
+        foreach (var group in records.Where(entry => entry.Status != "undo_pending" && !undoHandled.Contains(entry.Source)).GroupBy(entry => entry.GroupId ?? entry.Source))
         {
             token.ThrowIfCancellationRequested();
             var pending = group.Where(entry => entry.Status is not ("completed" or "undone")).ToList();
@@ -232,11 +266,12 @@ public sealed class FileMoveService
     {
         token.ThrowIfCancellationRequested();
         if (Paths.Equals(Path.GetFullPath(journalPath), Path.GetFullPath(undoJournalPath))) throw new IOException("Откату нужен отдельный журнал");
-        await using var original = DurableMoveJournal.Open(journalPath);
+        await using var original = DurableMoveJournal.Open(journalPath, token);
         var records = Latest(original.Entries);
         if (records.Any(entry => entry.Status is not ("completed" or "undone")))
             throw new IOException("Сначала восстановите незавершённую операцию");
         var available = records.Where(entry => entry.Status == "completed").ToList();
+        var availableByDestination = available.ToDictionary(entry => entry.Destination, Paths);
         var inverse = new List<MoveEntry>();
         foreach (var group in available.GroupBy(entry => entry.GroupId ?? entry.Source))
         {
@@ -257,13 +292,20 @@ public sealed class FileMoveService
         // Create the inverse journal first. Its full plan is durable before the original points to it.
         await using var undo = DurableMoveJournal.Create(undoJournalPath);
         var validInverse = inverse.Where(entry => entry.SkipReason is null).ToArray();
-        if (validInverse.Length > 0)
+        ValidatePlanSize(validInverse);
+        foreach (var inverseGroup in validInverse.GroupBy(entry => entry.GroupId ?? entry.Source))
         {
-            var undoMembers = validInverse.Select(entry => NewState(entry) with { Hash = entry.ExpectedHash, Status = "planned" }).ToArray();
+            token.ThrowIfCancellationRequested();
+            var undoMembers = inverseGroup.Select(entry => NewState(entry) with { Hash = entry.ExpectedHash, GroupId = entry.GroupId, Status = "planned" }).ToArray();
             await undo.AppendAsync(undoMembers[0] with { Status = "group_manifest", Members = undoMembers });
-            var originals = validInverse.Select(entry => available.Single(item => Paths.Equals(item.Destination, entry.Source))
+        }
+        foreach (var inverseGroup in validInverse.GroupBy(entry => entry.GroupId ?? entry.Source))
+        {
+            token.ThrowIfCancellationRequested();
+            var originals = inverseGroup.Select(entry => availableByDestination[entry.Source]
                 with { Status = "undo_pending", UndoJournalPath = Path.GetFullPath(undoJournalPath), Error = null }).ToArray();
             await original.AppendAsync(originals[0] with { Status = "undo_manifest", Members = originals });
+            await Checkpoint("undo_manifest_written", originals[0]);
         }
         // Execute through recovery to reuse the durable staging names written above.
         await undo.DisposeAsync();
@@ -272,7 +314,7 @@ public sealed class FileMoveService
             : Array.Empty<MoveResult>();
         foreach (var result in completed.Where(result => result.Moved))
         {
-            var originalEntry = available.Single(item => Paths.Equals(item.Destination, result.Entry.Source));
+            var originalEntry = availableByDestination[result.Entry.Source];
             await original.AppendAsync(originalEntry with { Status = "undone", UndoJournalPath = Path.GetFullPath(undoJournalPath), Error = null });
         }
         return completed.Concat(inverse.Where(entry => entry.SkipReason is not null).Select(entry => new MoveResult(entry, false, entry.SkipReason))).ToArray();
@@ -281,6 +323,7 @@ public sealed class FileMoveService
     private async Task<IReadOnlyList<MoveResult>> ExecuteGroupsAsync(IReadOnlyList<MoveEntry> plan, DurableMoveJournal journal,
         Func<MoveEntry, Task> commitCatalog, IProgress<int>? progress, CancellationToken token)
     {
+        ValidatePlanSize(plan);
         var results = new List<MoveResult>();
         if (plan.Where(entry => entry.SkipReason is null).GroupBy(entry => Path.GetFullPath(entry.Destination), Paths).Any(group => group.Count() > 1))
             throw new IOException("Несколько файлов направлены в один путь; операция остановлена");
@@ -359,6 +402,15 @@ public sealed class FileMoveService
             {
                 // Only recovery can adopt an already published target; normal execution always rejects a racing name.
                 if (!recovering) throw new IOException("Целевое имя появилось после предварительного просмотра");
+                if (OperatingSystem.IsWindows() && state.Mode == "copy" && state.WindowsSecurityDescriptor is null)
+                {
+                    // Legacy recovery may derive permissions only from the original that
+                    // still exists. The possibly broader destination is never the authority.
+                    if (!File.Exists(state.Staging)) throw new IOException("У старой копии нет снимка ACL и исходного файла; требуется ручное согласование прав");
+                    await using var source = OpenLockedRead(state.Staging);
+                    state = state with { WindowsSecurityDescriptor = WindowsFileSecurity.Capture(source.SafeFileHandle) };
+                    states[i] = state; await journal.AppendAsync(state);
+                }
                 await VerifyAsync(state.Destination, state, token);
                 states[i] = state with { DestinationModifiedUtc = File.GetLastWriteTimeUtc(state.Destination) };
                 continue;
@@ -396,9 +448,23 @@ public sealed class FileMoveService
                 }
                 await using (var input = OpenLockedRead(state.Staging))
                 {
-                    await using (var output = new FileStream(state.Temporary!, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                        131072, FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
+                    if (OperatingSystem.IsWindows())
                     {
+                        if (state.WindowsSecurityDescriptor is null)
+                        {
+                            state = state with { WindowsSecurityDescriptor = WindowsFileSecurity.Capture(input.SafeFileHandle) };
+                            states[i] = state;
+                            await journal.AppendAsync(state); // Durable before the first destination byte exists.
+                        }
+                        WindowsFileSecurity.Verify(input.SafeFileHandle, state.WindowsSecurityDescriptor, requireProtected: false);
+                    }
+                    await using (var output = OperatingSystem.IsWindows()
+                        ? WindowsFileSecurity.CreateRestrictedCopy(state.Temporary!, state.WindowsSecurityDescriptor!)
+                        : new FileStream(state.Temporary!, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                            131072, FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
+                    {
+                        await Checkpoint("copy_created", state);
+                        if (OperatingSystem.IsWindows()) WindowsFileSecurity.Verify(output.SafeFileHandle, state.WindowsSecurityDescriptor, requireProtected: true);
                         await input.CopyToAsync(output, token);
                         output.Flush(true);
                     }
@@ -435,6 +501,8 @@ public sealed class FileMoveService
                 targets.Add(stream);
                 if (stream.Length != state.Length || await HashAsync(stream, CancellationToken.None) != state.Hash)
                     throw new IOException("Целевая копия изменилась; исходный файл сохранён");
+                if (OperatingSystem.IsWindows() && state.Mode == "copy")
+                    WindowsFileSecurity.Verify(stream.SafeFileHandle, state.WindowsSecurityDescriptor, requireProtected: true);
             }
             foreach (var state in states)
             {
@@ -459,6 +527,11 @@ public sealed class FileMoveService
                         WindowsFileStreams.RequirePlainFile(state.Staging);
                         if (original.Length != state.Length || File.GetLastWriteTimeUtc(state.Staging) != state.ModifiedUtc || await HashAsync(original, CancellationToken.None) != state.Hash)
                             throw new IOException("Временный оригинал изменился; все копии сохранены");
+                        if (state.Mode == "copy")
+                        {
+                            WindowsFileSecurity.Verify(original.SafeFileHandle, state.WindowsSecurityDescriptor, requireProtected: false);
+                            WindowsFileSecurity.Verify(targets[i].SafeFileHandle, state.WindowsSecurityDescriptor, requireProtected: true);
+                        }
                         await Checkpoint("source_locked_for_cleanup", state);
                         WindowsFileRemoval.MarkForDeletion(handle);
                     }
@@ -505,11 +578,20 @@ public sealed class FileMoveService
     }
 
     private Task Checkpoint(string phase, MoveJournalEntry state) => _options.Checkpoint?.Invoke(phase, state) ?? Task.CompletedTask;
+    private static void ValidatePlanSize(IReadOnlyList<MoveEntry> plan)
+    {
+        if (plan.Count > DurableMoveJournal.MaxOperationFiles || plan.GroupBy(entry => entry.GroupId ?? entry.Source).Any(group => group.Count() > DurableMoveJournal.MaxGroupMembers))
+            throw new IOException("План превышает безопасный размер операции или связанной группы; файлы не изменены");
+    }
     private static MoveJournalEntry NewState(MoveEntry entry) => new(entry.Source, entry.Destination,
         entry.Source + ".photoshelf-moving-" + Guid.NewGuid().ToString("N"), "planned", null, null,
         entry.Destination + ".photoshelf-copy-" + Guid.NewGuid().ToString("N"), entry.Length, entry.ModifiedUtc,
         entry.GroupId ?? Guid.NewGuid().ToString("N"), null, File.GetCreationTimeUtc(entry.Source), RestoreModifiedUtc: entry.RestoreModifiedUtc);
     private static MoveEntry ToEntry(MoveJournalEntry state) => new(state.Source, state.Destination, state.Length, state.ModifiedUtc, null, state.GroupId, state.Hash, state.RestoreModifiedUtc);
+    private static bool IsInverseOf(MoveEntry inverse, MoveJournalEntry original) =>
+        Paths.Equals(inverse.Source, original.Destination) && Paths.Equals(inverse.Destination, original.Source)
+        && inverse.Length == original.Length && inverse.ExpectedHash is not null && inverse.ExpectedHash == original.Hash
+        && inverse.GroupId == original.GroupId;
     private static List<MoveJournalEntry> Latest(IEnumerable<MoveJournalEntry> records) => records
         .SelectMany(entry => entry.Members ?? new[] { entry }).GroupBy(entry => entry.Source, Paths).Select(group => group.Last()).ToList();
     private static FileStream OpenLockedRead(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.Read,
@@ -598,7 +680,8 @@ public sealed class FileMoveService
                 directories.Add(directory, index);
             }
             candidates = index.ByStem.TryGetValue(stem, out var matching) ? matching.ToList() : [];
-            if (index.ByName.TryGetValue(Path.GetFileName(source) + ".xmp", out var sidecar)) candidates.Add(sidecar);
+            foreach (var extension in new[] { ".xmp", ".aae" })
+                if (index.ByName.TryGetValue(Path.GetFileName(source) + extension, out var sidecar)) candidates.Add(sidecar);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { reason = ex.Message; return result.ToList(); }
         if (confirmed is not null)
@@ -610,8 +693,8 @@ public sealed class FileMoveService
                 result.Add(path);
             }
         }
-        var primary = candidates.Where(path => ImageExtensions.Contains(Path.GetExtension(path)) || RawExtensions.Contains(Path.GetExtension(path))).ToList();
-        var raws = primary.Where(path => RawExtensions.Contains(Path.GetExtension(path))).ToList();
+        var primary = candidates.Where(path => PhotoShelf.Domain.MediaFormatRegistry.IsPhoto(path)).ToList();
+        var raws = primary.Where(path => PhotoShelf.Domain.MediaFormatRegistry.IsRaw(path)).ToList();
         var jpegs = primary.Where(path => Path.GetExtension(path).Equals(".jpg", StringComparison.OrdinalIgnoreCase) || Path.GetExtension(path).Equals(".jpeg", StringComparison.OrdinalIgnoreCase)).ToList();
         if (primary.Count > 1)
         {
@@ -626,8 +709,13 @@ public sealed class FileMoveService
             || Path.GetExtension(path).Equals(".aae", StringComparison.OrdinalIgnoreCase))) result.Add(path);
         foreach (var member in result.ToArray())
         {
-            if (index.ByName.TryGetValue(Path.GetFileName(member) + ".xmp", out var namedSidecar)) result.Add(namedSidecar);
+            foreach (var extension in new[] { ".xmp", ".aae" })
+                if (index.ByName.TryGetValue(Path.GetFileName(member) + extension, out var namedSidecar)) result.Add(namedSidecar);
         }
+        // An unclassified same-stem member might contain unique media or metadata.
+        // It must be explicitly confirmed, never silently left behind by an automatic move.
+        if (candidates.Any(path => !result.Contains(path)))
+            reason ??= "Одноимённые связанные файлы не подтверждены: требуется разбор всей группы";
         return result.OrderBy(path => Paths.Equals(path, source) ? 0 : 1).ThenBy(path => path, Paths).ToList();
     }
     private static string? ValidateEventName(string? value)

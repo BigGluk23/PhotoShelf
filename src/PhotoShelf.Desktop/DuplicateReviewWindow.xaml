@@ -16,13 +16,14 @@
 
     <Grid Margin="18">
         <Grid.RowDefinitions>
-            <RowDefinition Height="126" />
+            <RowDefinition Height="166" />
             <RowDefinition Height="*" />
             <RowDefinition Height="58" />
         </Grid.RowDefinitions>
 
         <Border Background="#FFFFFFFF" CornerRadius="18" BorderBrush="#FFE6DDD2" BorderThickness="1" Padding="18,12">
             <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <StackPanel VerticalAlignment="Center">
                     <TextBlock Text="Точные дубликаты" FontSize="22" FontWeight="SemiBold" Foreground="#FF242424" />
                     <TextBlock x:Name="SummaryText" Margin="0,4,0,0" Foreground="#FF77706A" />
@@ -33,11 +34,11 @@
                                TextWrapping="Wrap"
                                MaxWidth="760" />
                 </StackPanel>
-                <WrapPanel HorizontalAlignment="Right" VerticalAlignment="Center">
-                    <Button Style="{StaticResource PrimaryPillButton}" Content="Оставить новые" Click="OnKeepNewestClicked" />
-                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Оставить ближе к корню" ToolTip="Оставляет копию, которая лежит в более коротком и обычно более понятном пути, например D:\Фото вместо D:\Фото\Копии\Старое\..." Click="OnKeepShortestPathClicked" />
-                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Оставить крупный файл" Click="OnKeepLargestFileClicked" />
-                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Отметить лишние" Click="OnMarkExtrasClicked" />
+                <WrapPanel Grid.Row="1" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="0,10,0,0">
+                    <Button Style="{StaticResource PrimaryPillButton}" Content="Новые в блоке" Click="OnKeepNewestClicked" />
+                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Короткий путь в блоке" ToolTip="Оставляет копию, которая лежит в более коротком и обычно более понятном пути, например D:\Фото вместо D:\Фото\Копии\Старое\..." Click="OnKeepShortestPathClicked" />
+                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Крупный в блоке" Click="OnKeepLargestFileClicked" />
+                    <Button Margin="8,0,0,0" Style="{StaticResource PillButton}" Content="Отметить блок" Click="OnMarkExtrasClicked" />
                 </WrapPanel>
             </Grid>
         </Border>
@@ -51,6 +52,13 @@
 
             <Border Background="#FFFFFFFF" CornerRadius="18" BorderBrush="#FFE6DDD2" BorderThickness="1" Padding="8">
                 <DockPanel>
+                    <StackPanel DockPanel.Dock="Bottom" Margin="4,8,4,4">
+                        <TextBlock x:Name="GroupsPageText" HorizontalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <Button x:Name="PreviousGroupsButton" Content="← Группы" Click="OnPreviousGroupsClicked" Margin="2" Padding="8,4" />
+                            <Button x:Name="NextGroupsButton" Content="Группы →" Click="OnNextGroupsClicked" Margin="2" Padding="8,4" />
+                        </StackPanel>
+                    </StackPanel>
                     <TextBlock DockPanel.Dock="Top" Text="Группы" FontSize="15" FontWeight="SemiBold" Margin="8,4,8,8" Foreground="#FF242424" />
                     <ListBox x:Name="GroupList"
                              ItemsSource="{Binding Groups}"
@@ -83,6 +91,13 @@
                                FontWeight="SemiBold"
                                Margin="4,0,4,10"
                                Foreground="#FF242424" />
+                    <StackPanel DockPanel.Dock="Bottom" Margin="4,8,4,4">
+                        <TextBlock x:Name="MembersPageText" HorizontalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <Button x:Name="PreviousMembersButton" Content="← Файлы" Click="OnPreviousMembersClicked" Margin="2" Padding="8,4" />
+                            <Button x:Name="NextMembersButton" Content="Файлы →" Click="OnNextMembersClicked" Margin="2" Padding="8,4" />
+                        </StackPanel>
+                    </StackPanel>
                     <ListBox x:Name="ItemList"
                              ItemsSource="{Binding SelectedGroup.Items}"
                              BorderThickness="0"
@@ -141,7 +156,7 @@
 
         <Border Grid.Row="2" Background="#FF2F3136" CornerRadius="18" Padding="14,8">
             <Grid>
-                <TextBlock x:Name="StatusText" Foreground="#FFEFEFEF" VerticalAlignment="Center" />
+                <TextBlock x:Name="StatusText" Foreground="#FFEFEFEF" VerticalAlignment="Center" HorizontalAlignment="Left" MaxWidth="550" TextWrapping="Wrap" />
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                     <Button Style="{StaticResource DarkPillButton}" Content="Открыть карантин" Click="OnOpenQuarantineClicked" />
                     <Button Margin="8,0,0,0" Style="{StaticResource DangerPillButton}" Content="Перенести отмеченные" Click="OnMoveMarkedClicked" />

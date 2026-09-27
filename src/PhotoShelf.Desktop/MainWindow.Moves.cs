@@ -16,7 +16,6 @@ public partial class MainWindow
     private Task _fileOperationTask = Task.CompletedTask;
     private CancellationTokenSource? _fileOperationCancellation;
     private static string OperationsDirectory => Path.Combine(LocalCatalogStore.CatalogDirectory, "operations");
-    private static string QuarantineDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "PhotoShelf_Quarantine");
 
     private void OnPhotoTileMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
@@ -58,7 +57,8 @@ public partial class MainWindow
     }
     private async Task CommitFileMoveAsync(MoveEntry entry)
     {
-        await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination, removeFromLibrary: IsUnderFolder(entry.Destination, QuarantineDirectory));
+        await _desktopCatalogStore.MoveItemAsync(entry.Source, entry.Destination,
+            removeFromLibrary: await QuarantineConfiguration.IsQuarantineDestinationAsync(entry.Destination));
         // UI bookkeeping never participates in the durable commit/recovery protocol.
         _movedPaths.Enqueue(entry.Source);
     }

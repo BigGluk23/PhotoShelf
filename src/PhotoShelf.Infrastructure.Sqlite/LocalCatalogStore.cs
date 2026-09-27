@@ -11,6 +11,8 @@ public static class LocalCatalogStore
     };
 
     public static string CatalogDirectory => Location.DirectoryPath;
+    public static string DerivedDataDirectory => Location.DerivedDataDirectory;
+    public static bool UsesLegacyStorage => Location.UsesLegacyStorage;
 
     public static bool IsIsolatedSmokeCatalog => Location.IsIsolatedSmoke;
 

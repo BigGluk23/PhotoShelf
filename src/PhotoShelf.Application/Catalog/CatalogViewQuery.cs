@@ -9,6 +9,7 @@ public sealed record CatalogViewQuery
     public bool ShowVideos { get; init; } = true;
     public bool IncludeSystemFolders { get; init; }
     public bool DuplicateCandidatesOnly { get; init; }
+    public DateTime? MetadataDueAtUtc { get; init; }
     public bool MissingCaptureDateOnly { get; init; }
     public bool UseCaptureDate { get; init; }
     public bool NewestFirst { get; init; } = true;

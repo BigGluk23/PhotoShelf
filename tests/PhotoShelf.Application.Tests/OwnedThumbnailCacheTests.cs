@@ -100,6 +100,68 @@ public sealed class OwnedThumbnailCacheTests : IDisposable
     }
 
     [Fact]
+    public void ClearRemovesCurrentCachePreservesForeignFilesAndInvalidatesOldDecodeRequests()
+    {
+        var store = CreateStore(_root, 1000);
+        var oldRequest = store.Generation;
+        Write(store, Key(1), 12);
+        var orphan = Path.Combine(_root, "ps-thumb-v2-" + Key(3) + "-" + Guid.NewGuid().ToString("N") + ".tmp");
+        File.WriteAllText(orphan, "interrupted cache writer");
+        var foreign = Path.Combine(_root, "holiday.png"); File.WriteAllText(foreign, "original");
+        var nested = Path.Combine(_root, "nested"); Directory.CreateDirectory(nested);
+        var nestedFile = Path.Combine(nested, "ps-thumb-v2-" + Key(2) + ".png"); File.WriteAllText(nestedFile, "not owned here");
+        var result = store.Clear();
+        Assert.Equal(2, result.RemovedCount); Assert.Equal(0, result.BytesAfter); Assert.False(File.Exists(orphan));
+        Assert.Null(store.TryGetPath(Key(1)));
+        store.Write(Key(2), _ => throw new InvalidOperationException("Old decoder must not refill after cleanup"), oldRequest);
+        Assert.Null(store.TryGetPath(Key(2)));
+        store.Write(Key(2), stream => stream.WriteByte(7), store.Generation);
+        Assert.NotNull(store.TryGetPath(Key(2)));
+        Assert.Equal("original", File.ReadAllText(foreign));
+        Assert.Equal("not owned here", File.ReadAllText(nestedFile));
+    }
+
+    [Fact]
+    public async Task ClearWaitsForTheActiveWriterAndRemovesItsCompletedEntry()
+    {
+        var store = CreateStore(_root, 1000);
+        using var writing = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        var generation = store.Generation;
+        var writer = Task.Run(() => store.Write(Key(1), stream =>
+        {
+            writing.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+            stream.WriteByte(42);
+        }, generation));
+        Assert.True(writing.Wait(TimeSpan.FromSeconds(10)));
+        var clearing = Task.Run(() => store.Clear());
+        try
+        {
+            Assert.False(clearing.IsCompleted);
+        }
+        finally { release.Set(); }
+        await writer.WaitAsync(TimeSpan.FromSeconds(10));
+        var result = await clearing.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, result.BytesAfter); Assert.Null(store.TryGetPath(Key(1)));
+        store.Write(Key(2), _ => throw new InvalidOperationException("stale write"), generation);
+        Assert.Null(store.TryGetPath(Key(2)));
+    }
+
+    [Fact]
+    public void ClearRejectsRedirectedDirectoryAndOwnedNameLinks()
+    {
+        var original = Path.Combine(_root, "original.png"); File.WriteAllText(original, "original bytes");
+        var cache = Path.Combine(_root, "cache"); Directory.CreateDirectory(cache);
+        var link = Path.Combine(cache, "ps-thumb-v2-" + Key(1) + ".png"); File.CreateSymbolicLink(link, original);
+        var store = new OwnedThumbnailCache(cache, 1000);
+        Assert.Throws<IOException>(() => store.Clear());
+        Assert.Equal("original bytes", File.ReadAllText(original));
+        var redirect = Path.Combine(_root, "redirect"); Directory.CreateSymbolicLink(redirect, cache);
+        Assert.Throws<IOException>(() => new OwnedThumbnailCache(redirect, 1000).Clear());
+        Assert.Equal("original bytes", File.ReadAllText(original));
+    }
+
+    [Fact]
     public void InvalidKeyCannotEscapeCacheDirectory()
     {
         var store = CreateStore(_root, 100);

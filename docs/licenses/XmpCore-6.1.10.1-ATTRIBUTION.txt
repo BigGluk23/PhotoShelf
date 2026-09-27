@@ -1,0 +1,27 @@
+XmpCore 6.1.10.1
+https://github.com/drewnoakes/xmp-core-dotnet/tree/66b975558d9199cd3eb49093261a61deb30f8c06
+
+Package copyright notice: Copyright 2015-2021
+Package author: Drew Noakes
+
+Initially ported by Yakov Danila and Nathanael Jones, the project is now maintained
+by Drew Noakes and contributors on GitHub.
+
+Adobe notices retained from the source files of the above revision:
+
+ADOBE SYSTEMS INCORPORATED
+Copyright 2006 Adobe Systems Incorporated
+Copyright 2006-2007 Adobe Systems Incorporated
+All Rights Reserved
+
+NOTICE: Adobe permits you to use, modify, and distribute this file in accordance
+with the terms of the Adobe license agreement accompanying it.
+
+The project's README states that the same BSD license applies to this project
+as to Adobe's open source XMP SDK, from which it is derived. The license is
+included alongside this notice in XmpCore-6.1.10.1-Adobe-BSD-LICENSE.txt.
+
+Sources:
+https://raw.githubusercontent.com/drewnoakes/xmp-core-dotnet/66b975558d9199cd3eb49093261a61deb30f8c06/README.md
+https://raw.githubusercontent.com/drewnoakes/xmp-core-dotnet/66b975558d9199cd3eb49093261a61deb30f8c06/XmpCore/XmpCore.csproj
+https://raw.githubusercontent.com/drewnoakes/xmp-core-dotnet/66b975558d9199cd3eb49093261a61deb30f8c06/XmpCore/XmpMetaFactory.cs

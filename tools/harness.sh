@@ -29,6 +29,9 @@ filter=(--filter 'Category!=CatalogScale')
 if "$scale"; then filter=(); fi
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_NOLOGO=1
+"$dotnet_cmd" restore PhotoShelf.sln --locked-mode --force --disable-parallel
+"$dotnet_cmd" list PhotoShelf.sln package --include-transitive --no-restore --format json > "$results/dependencies.json"
+"$dotnet_cmd" list PhotoShelf.sln package --vulnerable --include-transitive --no-restore --format json > "$results/dependency-audit.json"
 for project in Domain Application Infrastructure.Sqlite; do
   echo "Checking $project..."
   "$dotnet_cmd" test "tests/PhotoShelf.$project.Tests/PhotoShelf.$project.Tests.csproj" \

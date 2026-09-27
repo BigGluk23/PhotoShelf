@@ -20,6 +20,8 @@ public sealed class LocalCatalogState
     public bool SortNewestFirst { get; set; } = true;
     public bool IncludeSubfolders { get; set; } = true;
     public List<string> ExpandedFolders { get; set; } = new();
+    public string? QuarantineDirectory { get; set; }
+    public List<string> QuarantineBatchDirectories { get; set; } = new();
     [System.Text.Json.Serialization.JsonIgnore]
     public bool ReadItemsFromSqlite { get; set; }
 
@@ -35,6 +37,10 @@ public sealed class SavedMediaItem
     public string AssetId { get; set; } = string.Empty;
     public DateTime? CaptureDate { get; set; }
     public bool MetadataIndexed { get; set; }
+    public PhotoShelf.Application.Metadata.MetadataReadStatus MetadataStatus { get; set; }
+    public DateTime? MetadataAttemptedAtUtc { get; set; }
+    public DateTime? MetadataRetryAtUtc { get; set; }
+    public string? MetadataErrorCode { get; set; }
     public bool IsHiddenOrSystem { get; set; }
     public string Path { get; set; } = string.Empty;
 
@@ -54,4 +60,3 @@ public sealed class SavedDuplicateHash
 
     public string Hash { get; set; } = string.Empty;
 }
-

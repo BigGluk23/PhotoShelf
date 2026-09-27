@@ -7,21 +7,25 @@ public sealed class DuplicateGroupViewModel : INotifyPropertyChanged
 {
     private DuplicateItemViewModel? _keepItem;
 
-    public DuplicateGroupViewModel(DuplicateGroup group, int index)
+    public DuplicateGroupViewModel(DuplicateGroup group, long index, long totalFiles = 0, long memberOffset = 0, string? keeperPath = null)
     {
         Index = index;
+        TotalFiles = totalFiles == 0 ? group.Items.Count : totalFiles;
+        MemberOffset = memberOffset;
         SizeBytes = group.SizeBytes;
         Hash = group.Hash;
         Items = new ObservableCollection<DuplicateItemViewModel>(
             group.Items.Select(item => new DuplicateItemViewModel(item, this)));
-        KeepItem = Items
+        KeepItem = Items.FirstOrDefault(item => item.Photo.Path == keeperPath) ?? Items
             .OrderByDescending(static item => item.Photo.FileModifiedAt ?? DateTime.MinValue)
             .FirstOrDefault();
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public int Index { get; }
+    public long Index { get; }
+    public long TotalFiles { get; }
+    public long MemberOffset { get; }
 
     public long SizeBytes { get; }
 
@@ -52,7 +56,7 @@ public sealed class DuplicateGroupViewModel : INotifyPropertyChanged
         }
     }
 
-    public string Summary => $"Группа {Index}: {Items.Count} файлов, {SizeBytes / 1024d / 1024d:0.0} MB";
+    public string Summary => $"Группа {Index}: {TotalFiles} файлов, {SizeBytes / 1024d / 1024d:0.0} MB";
 
     public string KeepPath => KeepItem?.Photo.Path ?? "";
 

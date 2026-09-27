@@ -235,6 +235,53 @@ public sealed class FileMoveRecoveryTests : IDisposable
         Assert.True(result.Moved, result.Error); Assert.Single(Directory.GetFiles(Path.GetDirectoryName(Journal)!, "*.torn-*"));
     }
 
+    [Fact] public async Task InterruptedUndoManifestPreparationReconcilesEveryInverseGroupExactlyOnce()
+    {
+        var sources = new[] { Write("in/first.jpg", "first"), Write("in/second.jpg", "second") };
+        var service = Service(false);
+        var plan = service.Plan(sources.Select(path => new MoveRequest(path, null)), Out, CollisionPolicy.Skip);
+        Assert.All(await service.ExecuteAsync(plan, Journal, Commit, null, default), result => Assert.True(result.Moved, result.Error));
+        var interrupted = Service(false, (phase, _) => phase == "undo_manifest_written"
+            ? throw new MoveInterruptionException("first original pointer durable, all inverse groups durable") : Task.CompletedTask);
+        await Assert.ThrowsAsync<MoveInterruptionException>(() => interrupted.UndoAsync(Journal,
+            Path.Combine(_root, "operations", "undo.jsonl"), Commit, null, default));
+        var callbacks = new List<string>();
+        var results = await service.RecoverAsync(Journal, entry => { callbacks.Add(entry.Destination); return Commit(entry); }, null, default);
+        Assert.Equal(2, results.Count); Assert.All(results, result => Assert.True(result.Moved, result.Error));
+        Assert.Equal(sources.Order(), callbacks.Order());
+        Assert.Equal("first", File.ReadAllText(sources[0])); Assert.Equal("second", File.ReadAllText(sources[1]));
+        Assert.All(plan, entry => Assert.False(File.Exists(entry.Destination)));
+        Assert.True(service.ReadHistory(Path.GetDirectoryName(Journal)!).Single(item => item.JournalPath == Journal).IsUndone);
+        Assert.Equal(2, (await service.RecoverAsync(Journal, _ => throw new Exception("undo must not repeat"), null, default)).Count);
+    }
+
+    [Fact] public async Task SubstitutedInverseJournalIsRejectedBeforeMovingUnrelatedFiles()
+    {
+        var source = Write("in/p.jpg"); var service = Service(false);
+        await service.ExecuteAsync(Plan(service, source), Journal, Commit, null, default);
+        var undoJournal = Path.Combine(_root, "operations", "undo.jsonl");
+        var interrupted = Service(false, (phase, _) => phase == "undo_manifest_written" ? throw new MoveInterruptionException(phase) : Task.CompletedTask);
+        await Assert.ThrowsAsync<MoveInterruptionException>(() => interrupted.UndoAsync(Journal, undoJournal, Commit, null, default));
+        var unrelated = Write("other/unrelated.jpg", "unrelated"); var unrelatedJournal = Path.Combine(_root, "operations", "other.jsonl");
+        var other = Service(false, (phase, _) => phase == "planned" ? throw new MoveInterruptionException(phase) : Task.CompletedTask);
+        await Assert.ThrowsAsync<MoveInterruptionException>(() => other.ExecuteAsync(Plan(other, unrelated), unrelatedJournal, Commit, null, default));
+        File.Copy(unrelatedJournal, undoJournal, true);
+        await Assert.ThrowsAsync<IOException>(() => service.RecoverAsync(Journal, _ => throw new Exception("no catalog writes"), null, default));
+        Assert.Equal("unrelated", File.ReadAllText(unrelated)); Assert.False(File.Exists(source));
+        Assert.Equal("unique original bytes", File.ReadAllText(Path.Combine(Out, "p.jpg")));
+    }
+
+    [Fact] public async Task UndoOfMoreThanOneManifestLimitUsesBoundedGroups()
+    {
+        var sources = Enumerable.Range(0, 257).Select(index => Write($"in/p{index}.jpg", $"photo {index}")).ToArray();
+        var service = Service(false);
+        var plan = service.Plan(sources.Select(path => new MoveRequest(path, null)), Out, CollisionPolicy.Skip);
+        Assert.All(await service.ExecuteAsync(plan, Journal, Commit, null, default), result => Assert.True(result.Moved, result.Error));
+        var results = await service.UndoAsync(Journal, Path.Combine(_root, "operations", "undo.jsonl"), Commit, null, default);
+        Assert.Equal(sources.Length, results.Count); Assert.All(results, result => Assert.True(result.Moved, result.Error));
+        for (var index = 0; index < sources.Length; index++) Assert.Equal($"photo {index}", File.ReadAllText(sources[index]));
+    }
+
     [Fact] public async Task DamagedJournalStopsRecoveryWithoutTouchingAnyMedia()
     {
         var source = Write("in/p.jpg");
@@ -336,6 +383,19 @@ public sealed class FileMoveRecoveryTests : IDisposable
         var duplicate = plan[0] with { Destination = Path.Combine(Out, "second.jpg") };
         await Assert.ThrowsAsync<IOException>(() => service.ExecuteAsync([plan[0], duplicate], Journal, Commit, null, default));
         Assert.Equal("unique original bytes", File.ReadAllText(source));
+    }
+
+    [Theory]
+    [InlineData(257, true)]
+    [InlineData(50001, false)]
+    public async Task OversizedPlanIsRejectedBeforeJournalCreationOrReadingSources(int count, bool oneGroup)
+    {
+        var plan = Enumerable.Range(0, count).Select(index => new MoveEntry(
+            Path.Combine(_root, "missing", $"p{index}.jpg"), Path.Combine(Out, $"p{index}.jpg"), 1,
+            DateTime.UnixEpoch, null, oneGroup ? "one-group" : $"group-{index}")).ToArray();
+        var error = await Assert.ThrowsAsync<IOException>(() => Service().ExecuteAsync(plan, Journal, Commit, null, default));
+        Assert.Contains("безопасный размер", error.Message);
+        Assert.False(File.Exists(Journal)); Assert.False(Directory.Exists(Out));
     }
 
     [Fact] public async Task ReplacementDuringCleanupIsNeverDeletedByItsPath()

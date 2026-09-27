@@ -38,7 +38,7 @@ internal static class PerformanceMetrics
         if (Interlocked.Exchange(ref _writing, 1) != 0) return;
         try
         {
-            var dir = Path.Combine(LocalCatalogStore.CatalogDirectory, "diagnostics"); Directory.CreateDirectory(dir);
+            var dir = Path.Combine(LocalCatalogStore.DerivedDataDirectory, "diagnostics"); Directory.CreateDirectory(dir);
             var path = Path.Combine(dir, "performance.csv");
             if (File.Exists(path) && new FileInfo(path).Length > 5 * 1024 * 1024)
                 File.Move(path, Path.Combine(dir, "performance.previous.csv"), true);

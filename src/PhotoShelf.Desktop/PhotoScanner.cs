@@ -16,8 +16,7 @@ public static class PhotoScanner
         }
 
         var normalized = Path.GetFullPath(path);
-        var quarantine = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "PhotoShelf_Quarantine");
-        if (normalized.Equals(quarantine, StringComparison.OrdinalIgnoreCase) || normalized.StartsWith(quarantine + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+        if (QuarantineConfiguration.IsKnownQuarantine(normalized)) return true;
         var appCatalog = Path.GetFullPath(LocalCatalogStore.CatalogDirectory);
         if (normalized.StartsWith(appCatalog, StringComparison.OrdinalIgnoreCase))
         {
