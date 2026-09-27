@@ -12,7 +12,7 @@ public sealed class FileMoveRecoveryTests : IDisposable
     public FileMoveRecoveryTests() => Directory.CreateDirectory(_root);
     private string Write(string name, string content = "unique original bytes")
     {
-        var path = Path.Combine(_root, name);
+        var path = Path.GetFullPath(Path.Combine(_root, name));
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, content);
         return path;
