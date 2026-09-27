@@ -52,8 +52,15 @@ public sealed class PhotoRow : INotifyPropertyChanged
 
     public void SetItems(IEnumerable<PhotoItem> items)
     {
-        Items.Clear();
-        foreach (var item in items) Items.Add(item);
+        var next = items.ToArray();
+        for (var index = 0; index < next.Length; index++)
+        {
+            if (index < Items.Count && ReferenceEquals(Items[index], next[index])) continue;
+            var existing = Items.IndexOf(next[index]);
+            if (existing >= 0) Items.Move(existing, index);
+            else Items.Insert(index, next[index]);
+        }
+        while (Items.Count > next.Length) Items.RemoveAt(Items.Count - 1);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

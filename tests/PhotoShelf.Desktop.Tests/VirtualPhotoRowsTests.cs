@@ -146,6 +146,86 @@ public sealed class VirtualPhotoRowsTests
         await WaitUntilAsync(() => placeholder.Items.Count > 0);
     });
 
+    [Fact]
+    public Task MetadataBatchKeepsRowsCardsAndSelectionWithoutCollectionReset() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await rows.PrimeAsync();
+        var row = (PhotoRow)rows[1]!;
+        var before = row.Items.ToArray();
+        var selected = before[0]; selected.IsSelected = true;
+        var collectionChanges = 0;
+        row.Items.CollectionChanged += (_, _) => collectionChanges++;
+        var dateChanges = 0;
+        selected.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(PhotoItem.CaptureDate)) dateChanges++; };
+        var update = new SavedMediaItem { Path = selected.Path, SizeBytes = selected.FileSizeBytes,
+            FileModifiedAt = selected.FileModifiedAt, CaptureDate = new DateTime(2021, 3, 4), MetadataIndexed = true };
+        for (var batch = 0; batch < 100; batch++) rows.ApplyMetadata([update]);
+        row.SetItems(before);
+        Assert.Same(row, rows[1]);
+        Assert.Equal(before, row.Items.ToArray());
+        Assert.True(selected.IsSelected);
+        Assert.Equal(update.CaptureDate, selected.CaptureDate);
+        Assert.Equal(1, dateChanges);
+        Assert.Equal(0, collectionChanges);
+    });
+
+    [Fact]
+    public Task LateMetadataForChangedFileCannotOverwriteVisibleCard() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await rows.PrimeAsync();
+        var item = ((PhotoRow)rows[1]!).Items[0];
+        rows.ApplyMetadata([new SavedMediaItem { Path = item.Path, SizeBytes = item.FileSizeBytes + 1,
+            FileModifiedAt = item.FileModifiedAt, CaptureDate = new DateTime(2020, 1, 1), MetadataIndexed = true }]);
+        Assert.False(item.IsCaptureDateLoaded);
+        Assert.Null(item.CaptureDate);
+    });
+
+    [Fact]
+    public Task DeepAnchorIsLoadedBeforePublicationWithoutLoadingFirstPage() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await rows.PrimeAsync(1500);
+        var anchor = (PhotoRow)rows[rows.RowForItem(1500)]!;
+        Assert.Contains(anchor.Items, item => item.ViewIndex == 1500);
+        Assert.All(rows.LoadedItems, item => Assert.InRange(item.ViewIndex, 1440, 1535));
+        Assert.Equal(1, rows.CachedPageCount);
+    });
+
+    [Fact]
+    public Task PrimeFailureIsReportedInsteadOfPublishingEmptyPlaceholderAsReady() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await using var connection = new SqliteConnection($"Data Source={Path.Combine(fixture.Directory, "catalog-v2.sqlite")};Pooling=False");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "ALTER TABLE desktop_media_items RENAME TO unavailable_for_prime;";
+        await command.ExecuteNonQueryAsync();
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => rows.PrimeAsync());
+        Assert.IsType<SqliteException>(failure.InnerException);
+        Assert.Empty(rows.LoadedItems);
+    });
+
+    [Fact]
+    public Task RowReorderRetainsUnchangedCardsWithoutReset() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await rows.PrimeAsync();
+        var row = (PhotoRow)rows[1]!;
+        var original = row.Items.ToArray();
+        var resets = 0;
+        row.Items.CollectionChanged += (_, args) => { if (args.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Reset) resets++; };
+        row.SetItems([original[2], original[0]]);
+        Assert.Same(original[2], row.Items[0]); Assert.Same(original[0], row.Items[1]);
+        Assert.Equal(0, resets);
+    });
+
     private static PhotoItem Item(SavedMediaItem saved, long index) => new(saved.Path, saved.SizeBytes, saved.FileModifiedAt) { ViewIndex = index };
     private static async Task WaitUntilAsync(Func<bool> predicate)
     {

@@ -1,4 +1,4 @@
-PhotoShelf Ultra v0.10.1 — Windows x64
+PhotoShelf Ultra v0.10.2 — Windows x64
 
 Распакуйте весь ZIP и запустите PhotoShelf.exe.
 .NET runtime, иконки и изображения интерфейса включены в EXE. Папка Assets для запуска не требуется.
@@ -13,6 +13,6 @@ Ctrl/Shift — массовое выделение. Перетащите выб�
 Сборка и переносимые тесты выполнены на macOS. Windows UI и нативные проверки требуют запуска на Windows. Сначала проверьте на копии библиотеки.
 Не удаляйте журналы и временные .photoshelf-* файлы вручную.
 Журнал не заменяет отдельную резервную копию оригиналов.
-Подробности: README.md и docs/v0.10.1-startup-fix.md в этом архиве.
+Подробности: README.md и docs/v0.10.2-startup-fix.md в этом архиве.
 
 При ошибке полный журнал: %APPDATA%\PhotoShelf\diagnostics\errors

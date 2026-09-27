@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.1";
+    private const string VersionLabel = "Ultra v0.10.2";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -409,24 +409,38 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (sender is not FrameworkElement { DataContext: PhotoItem item }) return;
         if (_isProjecting || _fileOperationActive) { StatusText.Text = _fileOperationActive ? "Выполняется безопасный перенос…" : "Обновляю порядок файлов…"; return; }
+        _rangeSelectionCancellation?.Cancel();
         _dragStart = e.GetPosition(this);
         if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && _selectedPhoto is not null && _currentQuery is not null)
         {
-            var start = Math.Min(_selectedPhoto.ViewIndex, item.ViewIndex);
-            var count = Math.Abs(_selectedPhoto.ViewIndex - item.ViewIndex) + 1;
             var query = _currentQuery;
+            using var selection = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            _rangeSelectionCancellation = selection;
             try
             {
-                for (long offset = 0; offset < count; offset += 256)
+                var records = await _desktopCatalogStore.QueryRangeAsync(query, _selectedPhoto.Path, item.Path, selection.Token);
+                selection.Token.ThrowIfCancellationRequested();
+                if (!ReferenceEquals(query, _currentQuery) || _fileOperationActive) return;
+                if (records.Count == 0) { StatusText.Text = "Границы выделения больше не входят в этот вид. Обновите вид."; return; }
+                var retained = (PhotoRows as VirtualPhotoRows)?.LoadedItems.DistinctBy(photo => photo.Path, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(photo => photo.Path, StringComparer.OrdinalIgnoreCase);
+                var count = 0;
+                foreach (var saved in records)
                 {
-                    var page = await _desktopCatalogStore.QueryPageAsync(query, checked((int)(start + offset)), (int)Math.Min(256, count - offset), token: _lifetime.Token);
-                    if (!ReferenceEquals(query, _currentQuery)) break;
-                    for (var i = 0; i < page.Items.Count; i++) { var selected = CreateVisibleItem(page.Items[i], start + offset + i); selected.IsSelected = true; _selection.Add(selected); }
-                    await Dispatcher.Yield(DispatcherPriority.Background);
+                    selection.Token.ThrowIfCancellationRequested();
+                    var selected = CreateVisibleItem(saved, -1, retained);
+                    selected.IsSelected = true; _selection.Add(selected);
+                    if (++count % 256 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
                 }
                 RefreshLoadedSelection();
             }
+            catch (OperationCanceledException) { return; }
             catch (Exception ex) { StatusText.Text = $"Выделение: {ex.Message}"; }
+            finally
+            {
+                SelectedText.Text = $"Выбрано: {_selection.Count:N0}";
+                if (ReferenceEquals(_rangeSelectionCancellation, selection)) _rangeSelectionCancellation = null;
+            }
         }
         else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0)
         {
@@ -585,11 +599,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             foreach (var root in roots) AddFolder(root);
             if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
             await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token, _excludedFolders.ToArray());
-            await RefreshCatalogCountAsync(); QueueProjectionRefresh(); SaveCatalogState(); StartMetadataIndexing(false);
+            await RefreshCatalogCountAsync(); SaveCatalogState(); StartMetadataIndexing(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Ошибка сканирования: {ex.Message}"; }
-        finally { if (ReferenceEquals(_scanCancellation, operation)) { _scanCancellation = null; SetScanning(false); } operation.Dispose(); }
+        finally { if (ReferenceEquals(_scanCancellation, operation)) { _scanCancellation = null; SetScanning(false); CompleteCatalogStage(); } operation.Dispose(); }
     }
 
 
@@ -905,6 +919,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task RunMetadataWorkerAsync(bool resetExisting, CancellationTokenSource operation, Task previous)
     {
+        var updates = new List<SavedMediaItem>(128);
+        var groupingChanged = false;
+        var indexed = 0;
+        async Task PublishBatchAsync()
+        {
+            if (updates.Count == 0) return;
+            var batch = updates.ToArray(); updates.Clear();
+            var orderChanged = groupingChanged; groupingChanged = false;
+            var count = indexed;
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (_lifetime.IsCancellationRequested || _closing) return;
+                (PhotoRows as VirtualPhotoRows)?.ApplyMetadata(batch);
+                foreach (var saved in batch)
+                    if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt)
+                        selected.ApplyIndexedCaptureDate(saved.CaptureDate);
+                MetadataStatusText.Text = $"Метаданные: {count:N0}";
+                if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate)) NoteCatalogChanged();
+            }, DispatcherPriority.Background);
+        }
         try
         {
             await previous;
@@ -912,7 +946,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             MetadataStatusText.Text = "Индексирую метаданные…";
             await Task.Run(async () =>
             {
-                var indexed = 0;
                 await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true }, token))
                 {
                     if (item.IsVideo || (!resetExisting && item.MetadataIndexed)) continue;
@@ -922,23 +955,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     var date = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
                         _ => PhotoItem.ReadCaptureDate(item.Path), token);
                     await _desktopCatalogStore.UpdateCaptureDateAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, date, token);
-                    if (++indexed % 128 == 0)
-                    {
-                        var count = indexed;
-                        await Dispatcher.InvokeAsync(() =>
-                        {
-                            if (token.IsCancellationRequested) return;
-                            MetadataStatusText.Text = $"Метаданные: {count:N0}";
-                            if (_dateGroupingMode == DateGroupingMode.CaptureDate) QueueProjectionRefresh();
-                        }, DispatcherPriority.Background, token);
-                    }
+                    fresh.CaptureDate = date; fresh.MetadataIndexed = true;
+                    updates.Add(fresh); indexed++;
+                    groupingChanged |= item.CaptureDate != date;
+                    if (updates.Count >= 128) await PublishBatchAsync();
                 }
             }, token);
-            if (!token.IsCancellationRequested) { MetadataStatusText.Text = "Метаданные: готово"; QueueProjectionRefresh(); }
+            await PublishBatchAsync();
+            if (!token.IsCancellationRequested) MetadataStatusText.Text = "Метаданные: готово";
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { MetadataStatusText.Text = $"Метаданные: {ex.Message}"; }
-        finally { if (ReferenceEquals(_metadataIndexCancellation, operation)) _metadataIndexCancellation = null; operation.Dispose(); }
+        finally
+        {
+            // These writes already committed. Cancellation must not lose the final partial batch.
+            await PublishBatchAsync();
+            if (ReferenceEquals(_metadataIndexCancellation, operation))
+            {
+                _metadataIndexCancellation = null;
+                CompleteCatalogStage();
+            }
+            operation.Dispose();
+        }
     }
 
 
@@ -965,7 +1003,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var roots = await Task.Run(() => DriveInfo.GetDrives().Select(x => x.Name).ToArray(), _lifetime.Token);
         foreach (var root in roots) AddFolder(root);
         await RefreshCatalogCountAsync();
-        await RebuildRowsAsync();
+        if (!await RebuildRowsAsync())
+        {
+            // A resize or a user's first filter choice may supersede the initial request.
+            // Wait for that replacement, but never certify a failed/placeholder-only view.
+            while (_isProjecting) await Task.Delay(20, _lifetime.Token);
+            if (_currentQuery is null) throw new InvalidOperationException("Initial catalog projection did not complete.");
+        }
         await CheckPendingOperationsAsync();
     }
 
@@ -1023,14 +1067,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ => ToSavedItem(old.Path), token);
                 if (fresh is not null && (fresh.SizeBytes != old.SizeBytes || fresh.FileModifiedAt != old.FileModifiedAt || fresh.IsHiddenOrSystem != old.IsHiddenOrSystem)) changed.Add(fresh);
                 if (changed.Count < 128) continue;
-                await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); changed.Clear();
+                await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); changed.Clear(); NoteCatalogChanged();
             }
-            if (changed.Count > 0) await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token);
-            QueueProjectionRefresh();
+            if (changed.Count > 0) { await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); NoteCatalogChanged(); }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Проверка каталога: {ex.Message}"; }
-        finally { if (ReferenceEquals(_maintenanceCancellation, operation)) _maintenanceCancellation = null; operation.Dispose(); }
+        finally { if (ReferenceEquals(_maintenanceCancellation, operation)) { _maintenanceCancellation = null; CompleteCatalogStage(); } operation.Dispose(); }
     }
 
 

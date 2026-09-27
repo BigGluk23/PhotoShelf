@@ -16,6 +16,7 @@ public sealed class VirtualPhotoRows : IList, IDisposable
     private readonly Func<SavedMediaItem, long, PhotoItem> _create;
     private readonly CancellationTokenSource _cancel;
     private readonly Dictionary<(int Group, int Page), DateTime> _retryAfter = new();
+    private readonly Dictionary<(int Group, int Page), Exception> _loadErrors = new();
     private readonly SemaphoreSlim _gate = new(2);
     private readonly List<Section> _sections = new();
     private readonly Dictionary<int, PhotoRow> _rows = new();
@@ -122,6 +123,7 @@ public sealed class VirtualPhotoRows : IList, IDisposable
         var entered = false;
         try
         {
+            _loadErrors.Remove(key);
             await _gate.WaitAsync(_cancel.Token); entered = true;
             var section = _sections[key.Group];
             var offset = key.Page * RowsPerPage * _columns;
@@ -149,7 +151,14 @@ public sealed class VirtualPhotoRows : IList, IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { _loading.Remove(key); _retryAfter[key] = DateTime.UtcNow.AddSeconds(1); if (!_disposed) LoadFailed?.Invoke(ex.Message); }
+        catch (Exception ex)
+        {
+            _loading.Remove(key); _loadErrors[key] = ex; _retryAfter[key] = DateTime.UtcNow.AddSeconds(1);
+            if (_loadErrors.Count > 128)
+                foreach (var expired in _loadErrors.Keys.Where(candidate => candidate != key).Take(_loadErrors.Count - 128).ToArray())
+                { _loadErrors.Remove(expired); _retryAfter.Remove(expired); }
+            if (!_disposed) LoadFailed?.Invoke(ex.Message);
+        }
         finally
         {
             if (entered) _gate.Release();
@@ -160,12 +169,31 @@ public sealed class VirtualPhotoRows : IList, IDisposable
             }
         }
     }
-    public async Task PrimeAsync()
+    public async Task PrimeAsync(long itemIndex = 0)
     {
         var first = _sections.FindIndex(x => x.RowCount > 0);
         if (first < 0) return;
-        _ = this[_sections[first].FirstRow + 1];
-        if (_loading.TryGetValue((first, 0), out var task)) await task;
+        var rowIndex = itemIndex > 0 ? RowForItem(Math.Min(itemIndex, ItemCount - 1)) : _sections[first].FirstRow + 1;
+        var group = FindSection(rowIndex);
+        if (rowIndex == _sections[group].FirstRow) return; // A collapsed group is already represented by its header.
+        _ = this[rowIndex];
+        var page = (rowIndex - _sections[group].FirstRow - 1) / RowsPerPage;
+        if (_loading.TryGetValue((group, page), out var task)) await task;
+        if (_loadErrors.TryGetValue((group, page), out var error))
+            throw new InvalidOperationException("Не удалось загрузить первую видимую страницу.", error);
+    }
+
+    // Read the existing viewport cache without initiating more I/O while capturing its anchor.
+    public string? LoadedPathForRow(int rowIndex) => _rows.GetValueOrDefault(rowIndex)?.Items.FirstOrDefault()?.Path;
+
+    public void ApplyMetadata(IReadOnlyList<SavedMediaItem> updates)
+    {
+        if (_disposed || updates.Count == 0) return;
+        var byPath = new Dictionary<string, SavedMediaItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var update in updates) byPath[update.Path] = update;
+        foreach (var item in LoadedItems)
+            if (byPath.TryGetValue(item.Path, out var saved) && item.FileSizeBytes == saved.SizeBytes && item.FileModifiedAt == saved.FileModifiedAt)
+                item.ApplyIndexedCaptureDate(saved.CaptureDate);
     }
     public long ItemIndexForRow(int rowIndex)
     {

@@ -13,6 +13,7 @@ public partial class MainWindow
     private readonly HashSet<string> _excludedFolders = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _saveGate = new(1, 1);
     private CancellationTokenSource? _projectionCancellation;
+    private CancellationTokenSource? _rangeSelectionCancellation;
     private CancellationTokenSource? _browseCancellation;
     private CancellationTokenSource? _saveCancellation;
     private CancellationTokenSource? _maintenanceCancellation;
@@ -23,6 +24,7 @@ public partial class MainWindow
     private Task _browseTask = Task.CompletedTask;
     private bool _isProjecting;
     private bool _projectionQueued;
+    private readonly CatalogRefreshBuffer _backgroundRefresh = new();
     private bool _includeSubfolders = true;
     private bool _closeReady;
     private bool _closing;
@@ -47,43 +49,86 @@ public partial class MainWindow
         ExcludedFolders = _viewMode == LibraryViewMode.Folder ? Array.Empty<string>() : _excludedFolders.ToArray()
     };
 
+    private void NoteCatalogChanged()
+    {
+        _backgroundRefresh.RecordChange();
+        UpdatePendingRefresh();
+        QueueProjectionRefresh();
+    }
+
+    private void CompleteCatalogStage()
+    {
+        _backgroundRefresh.CompleteStage();
+        QueueProjectionRefresh();
+    }
+
+    private void UpdatePendingRefresh()
+    {
+        RefreshViewButton.Visibility = _backgroundRefresh.HasPendingChanges ? Visibility.Visible : Visibility.Collapsed;
+        RefreshViewButton.IsEnabled = !_isProjecting && !_fileOperationActive;
+    }
+
+    private async void OnRefreshViewClicked(object sender, RoutedEventArgs e)
+    {
+        if (_fileOperationActive || _closing) return;
+        await RebuildRowsAsync();
+    }
+
     private async void QueueProjectionRefresh()
     {
-        if (_projectionQueued || _lifetime.IsCancellationRequested) return;
+        if (_projectionQueued || _lifetime.IsCancellationRequested || _closing || _fileOperationActive ||
+            !_backgroundRefresh.ShouldPublish((PhotoRows as VirtualPhotoRows)?.ItemCount > 0)) return;
         _projectionQueued = true;
         try
         {
-            await Task.Delay(750, _lifetime.Token);
-            while (_isProjecting) await Task.Delay(100, _lifetime.Token);
-            await RebuildRowsAsync();
+            // Only an empty view or an explicit worker boundary can reach publication.
+            // Ordinary scan/metadata batches leave the current ItemsSource untouched.
+            do
+            {
+                await Task.Delay(250, _lifetime.Token);
+                while (_isProjecting) await Task.Delay(100, _lifetime.Token);
+                if (_closing || _fileOperationActive || !_backgroundRefresh.ShouldPublish((PhotoRows as VirtualPhotoRows)?.ItemCount > 0)) break;
+                if (!await RebuildRowsAsync(background: true)) break;
+            }
+            while (_backgroundRefresh.ShouldPublish((PhotoRows as VirtualPhotoRows)?.ItemCount > 0));
         }
         catch (OperationCanceledException) { }
-        finally { _projectionQueued = false; }
+        finally { _projectionQueued = false; UpdatePendingRefresh(); }
     }
 
-    private PhotoItem CreateVisibleItem(SavedMediaItem saved, long index)
+    private PhotoItem CreateVisibleItem(SavedMediaItem saved, long index) => CreateVisibleItem(saved, index, null);
+
+    private PhotoItem CreateVisibleItem(SavedMediaItem saved, long index, IReadOnlyDictionary<string, PhotoItem>? retained)
     {
-        var item = _selection.Find(saved.Path)
+        var item = _selection.Find(saved.Path) ?? retained?.GetValueOrDefault(saved.Path)
             ?? new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
-        item.IsFavorite = saved.IsFavorite; item.ViewIndex = index;
+        item.ApplyFileInformation(saved.SizeBytes, saved.FileModifiedAt);
+        item.IsFavorite = saved.IsFavorite; if (index >= 0) item.ViewIndex = index;
         if (saved.MetadataIndexed) item.ApplyIndexedCaptureDate(saved.CaptureDate);
         return item;
     }
 
-    private async Task RebuildRowsAsync()
+    private async Task<bool> RebuildRowsAsync(bool background = false)
     {
-        if (!_catalogLoaded) return;
+        if (!_catalogLoaded) return false;
+        _rangeSelectionCancellation?.Cancel();
         _projectionCancellation?.Cancel();
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _projectionCancellation = operation;
         var token = operation.Token;
+        var revision = _backgroundRefresh.Revision;
         var timer = System.Diagnostics.Stopwatch.StartNew();
         var query = CreateQuery();
         var identity = $"{query.Folder}|{query.ViewMode}|{query.SearchText}|{query.ShowVideos}|{query.IncludeSubfolders}|{query.MissingCaptureDateOnly}";
         var preserve = identity == _viewIdentity;
-        var anchor = preserve ? GetGridAnchor() : 0;
+        var anchor = preserve ? GetGridAnchor() : new GridAnchor(0, null);
         var old = PhotoRows as VirtualPhotoRows;
+        // The cache is bounded by VirtualPhotoRows. Never materialize the whole catalog.
+        var retained = preserve ? old?.LoadedItems.DistinctBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(item => item.Path, StringComparer.OrdinalIgnoreCase) : null;
+        VirtualPhotoRows? pending = null;
         _isProjecting = true;
+        UpdatePendingRefresh();
         if (!preserve)
         {
             old?.Dispose(); PhotoRows = Array.Empty<PhotoRow>(); OnPropertyChanged(nameof(PhotoRows));
@@ -96,40 +141,61 @@ public partial class MainWindow
         {
             await Task.Delay(60, token);
             var groups = await _desktopCatalogStore.QueryGroupsAsync(query, token);
+            var anchorIndex = anchor.Index;
+            if (anchor.Path is not null)
+                anchorIndex = await _desktopCatalogStore.IndexOfAsync(query, anchor.Path, token) ?? anchorIndex;
             token.ThrowIfCancellationRequested();
-            var rows = new VirtualPhotoRows(_desktopCatalogStore, query, groups, _columns, TileImageHeight + 60,
-                _collapsedDateGroups, CreateVisibleItem, token);
+            var rows = pending = new VirtualPhotoRows(_desktopCatalogStore, query, groups, _columns, TileImageHeight + 60,
+                _collapsedDateGroups, (saved, index) => CreateVisibleItem(saved, index, retained), token);
             rows.LoadFailed += message => { if (ReferenceEquals(PhotoRows, rows)) StatusText.Text = $"Страница не загружена: {message}"; };
-            await rows.PrimeAsync();
-            if (token.IsCancellationRequested) { rows.Dispose(); token.ThrowIfCancellationRequested(); }
-            old?.Dispose(); PhotoRows = rows; _currentQuery = query; _viewIdentity = identity;
+            await rows.PrimeAsync(anchorIndex);
+            token.ThrowIfCancellationRequested();
+            // Do not undo a scroll made while the background query was preparing.
+            // The explicit update button remains available for this pending revision.
+            if (background && preserve && GetGridAnchor() != anchor) return false;
+            old?.Dispose(); PhotoRows = rows; pending = null; _currentQuery = query; _viewIdentity = identity;
             OnPropertyChanged(nameof(PhotoRows));
-            if (preserve && anchor > 0 && rows.Count > 0)
+            if (preserve && anchorIndex > 0 && rows.Count > 0)
             {
-                var row = rows[rows.RowForItem(anchor)];
+                var row = rows[rows.RowForItem(Math.Min(anchorIndex, rows.ItemCount - 1))];
                 PhotoGrid.ScrollIntoView(row);
+                // ScrollIntoView only guarantees visibility; restore the anchor as the top row.
+                if (FindVisualChild<System.Windows.Controls.ScrollViewer>(PhotoGrid) is { } scroll)
+                    scroll.ScrollToVerticalOffset(rows.RowForItem(Math.Min(anchorIndex, rows.ItemCount - 1)));
             }
+            _backgroundRefresh.Published(revision);
             StatusText.Text = $"В виде: {rows.ItemCount:N0} · Каталог: {_catalogCount:N0}";
             PerformanceMetrics.Record("catalog.first_page", timer.Elapsed.TotalMilliseconds, rows.ItemCount);
+            return true;
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusText.Text = $"Не удалось обновить вид: {ex.Message}"; }
+        catch (OperationCanceledException) { return false; }
+        catch (Exception ex)
+        {
+            if (ReferenceEquals(_projectionCancellation, operation)) StatusText.Text = $"Не удалось обновить вид: {ex.Message}";
+            return false;
+        }
         finally
         {
+            pending?.Dispose();
             if (ReferenceEquals(_projectionCancellation, operation))
             {
                 _projectionCancellation = null; _isProjecting = false;
                 CatalogProgressBar.Visibility = _isCatalogLoading ? Visibility.Visible : Visibility.Collapsed;
                 EmptyState.Visibility = !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+                UpdatePendingRefresh();
             }
         }
     }
 
-    private long GetGridAnchor()
+    private sealed record GridAnchor(long Index, string? Path);
+    private GridAnchor GetGridAnchor()
     {
         var scroll = FindVisualChild<System.Windows.Controls.ScrollViewer>(PhotoGrid);
-        if (scroll is null || PhotoRows is not VirtualPhotoRows rows || rows.Count == 0) return 0;
-        return rows.ItemIndexForRow(Math.Clamp((int)scroll.VerticalOffset, 0, rows.Count - 1));
+        if (scroll is null || PhotoRows is not VirtualPhotoRows rows || rows.Count == 0) return new(0, null);
+        var rowIndex = Math.Clamp((int)scroll.VerticalOffset, 0, rows.Count - 1);
+        // Headers have no media path; their first cached photo row is the same visual anchor.
+        var path = rows.LoadedPathForRow(rowIndex) ?? (rowIndex + 1 < rows.Count ? rows.LoadedPathForRow(rowIndex + 1) : null);
+        return new(rows.ItemIndexForRow(rowIndex), path);
     }
     private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
     {
@@ -159,11 +225,11 @@ public partial class MainWindow
             operation.Token.ThrowIfCancellationRequested();
             await PhotoScanner.ScanAsync(new[] { folder }, batch => IndexScanBatchAsync(batch, operation.Token),
                 system, operation.Token, recursive: recursive);
-            if (!operation.IsCancellationRequested) { await RefreshCatalogCountAsync(); QueueProjectionRefresh(); StartMetadataIndexing(false); }
+            if (!operation.IsCancellationRequested) { await RefreshCatalogCountAsync(); StartMetadataIndexing(false); }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!operation.IsCancellationRequested) StatusText.Text = ex.Message; }
-        finally { if (ReferenceEquals(_browseCancellation, operation)) _browseCancellation = null; operation.Dispose(); }
+        finally { if (ReferenceEquals(_browseCancellation, operation)) { _browseCancellation = null; CompleteCatalogStage(); } operation.Dispose(); }
     }
 
     private async Task IndexScanBatchAsync(PhotoScanBatch batch, CancellationToken token)
@@ -174,10 +240,10 @@ public partial class MainWindow
         await _desktopCatalogStore.UpsertItemsAsync(items, preserveFavorites: true, token);
         await Dispatcher.InvokeAsync(() =>
         {
-            if (token.IsCancellationRequested) return;
-            StatusText.Text = $"Сканирую: {batch.SeenCount:N0} · {batch.CurrentFolder}";
-            QueueProjectionRefresh();
-        }, DispatcherPriority.Background, token);
+            if (_lifetime.IsCancellationRequested || _closing) return;
+            if (!token.IsCancellationRequested) StatusText.Text = $"Сканирую: {batch.SeenCount:N0} · {batch.CurrentFolder}";
+            NoteCatalogChanged();
+        }, DispatcherPriority.Background);
     }
     private static SavedMediaItem? ToSavedItem(string path)
     {
@@ -254,7 +320,7 @@ public partial class MainWindow
     {
         _scanCancellation?.Cancel(); _browseCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel(); _maintenanceCancellation?.Cancel();
-        _saveCancellation?.Cancel(); _infoCancellation?.Cancel();
+        _saveCancellation?.Cancel(); _infoCancellation?.Cancel(); _rangeSelectionCancellation?.Cancel();
         if (stopDuplicates)
         {
             _duplicateCancellation?.Cancel();

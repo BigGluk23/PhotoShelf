@@ -10,6 +10,63 @@ namespace PhotoShelf.Infrastructure.Sqlite;
 
 public sealed partial class SqliteDesktopCatalogStore
 {
+    /// <summary>
+    /// Resolve both endpoints and read the inclusive Shift-selection range from one
+    /// SQLite snapshot. Only explicitly selected records are materialized. Scanning
+    /// may continue writing without shifting offsets between selection batches.
+    /// </summary>
+    public Task<IReadOnlyList<SavedMediaItem>> QueryRangeAsync(CatalogViewQuery query, string anchorPath, string targetPath,
+        CancellationToken token = default) => Task.Run<IReadOnlyList<SavedMediaItem>>(async () =>
+    {
+        await using var connection = await OpenAsync(token);
+        using var interrupt = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var date = SortExpression(query);
+        async Task<(long Ticks, string Key)?> EndpointAsync(string path)
+        {
+            await using var command = connection.CreateCommand(); command.Transaction = transaction;
+            command.CommandText = $"SELECT {date},path_key FROM {BuildFrom(query, command)} WHERE {BuildGroupFilter(query, command)} AND path_key=$endpoint;";
+            command.Parameters.AddWithValue("$endpoint", NormalizePathKey(path));
+            await using var reader = await command.ExecuteReaderAsync(token);
+            return await reader.ReadAsync(token) ? (reader.GetInt64(0), reader.GetString(1)) : null;
+        }
+        try
+        {
+            var anchor = await EndpointAsync(anchorPath);
+            var target = await EndpointAsync(targetPath);
+            if (anchor is null || target is null) return Array.Empty<SavedMediaItem>();
+            var first = anchor.Value; var last = target.Value;
+            var comparison = first.Ticks.CompareTo(last.Ticks) * (query.NewestFirst ? -1 : 1);
+            var reverseTie = false;
+            if (comparison == 0)
+            {
+                // Let SQLite apply exactly the same path collation as the page query,
+                // including non-BMP Unicode names whose UTF-16 ordinal order differs.
+                await using var order = connection.CreateCommand(); order.Transaction = transaction;
+                order.CommandText = "SELECT $first COLLATE BINARY > $last COLLATE BINARY;";
+                order.Parameters.AddWithValue("$first", first.Key); order.Parameters.AddWithValue("$last", last.Key);
+                reverseTie = Convert.ToInt64(await order.ExecuteScalarAsync(token)) != 0;
+            }
+            if (comparison > 0 || reverseTie)
+                (first, last) = (last, first);
+            await using var command = connection.CreateCommand(); command.Transaction = transaction;
+            var where = BuildGroupFilter(query, command); var from = BuildFrom(query, command);
+            command.CommandText = $"""
+                SELECT {ItemColumns} FROM {from} WHERE {where}
+                AND ({date} {(query.NewestFirst ? "<" : ">")} $firstTicks OR ({date}=$firstTicks AND path_key>=$firstKey))
+                AND ({date} {(query.NewestFirst ? ">" : "<")} $lastTicks OR ({date}=$lastTicks AND path_key<=$lastKey))
+                ORDER BY {date} {(query.NewestFirst ? "DESC" : "ASC")},path_key ASC;
+                """;
+            command.Parameters.AddWithValue("$firstTicks", first.Ticks); command.Parameters.AddWithValue("$firstKey", first.Key);
+            command.Parameters.AddWithValue("$lastTicks", last.Ticks); command.Parameters.AddWithValue("$lastKey", last.Key);
+            var selected = new List<SavedMediaItem>();
+            await using var reader = await command.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token)) { token.ThrowIfCancellationRequested(); selected.Add(ReadItem(reader)); }
+            return selected;
+        }
+        catch (SqliteException) when (token.IsCancellationRequested) { throw new OperationCanceledException(token); }
+    }, token);
+
     public Task<CatalogPage> QueryPageAsync(CatalogViewQuery query, int offset, int limit, string? groupKey=null, CancellationToken token=default)
         => QueryPageAsync(query with { Offset=offset, PageSize=limit, GroupKey=groupKey, Cursor=null },token);
 

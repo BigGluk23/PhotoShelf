@@ -1,16 +1,20 @@
-# PhotoShelf Ultra v0.10.1
+# PhotoShelf Ultra v0.10.2
 
 Локальный менеджер фото и видео для Windows x64, C# / .NET 10 / WPF.
 Реализованы этапы P0: быстрое измеримое ядро и безопасная организация файлов.
 
 ## Запуск
 
-Распакуйте `PhotoShelf-v0.10.1-ultra-complete.zip` целиком. Внутри папки проекта запустите `releases/PhotoShelf-v0.10.1-ultra-win-x64/PhotoShelf.exe`.
+Актуальные исходники и история изменений: [BigGluk23/PhotoShelf](https://github.com/BigGluk23/PhotoShelf).
+Для Windows скачайте артефакт `PhotoShelf-win-x64` успешного запуска [Windows CI](https://github.com/BigGluk23/PhotoShelf/actions/workflows/windows-ci.yml), распакуйте ZIP и запустите `PhotoShelf.exe`.
 .NET runtime, иконки и PNG интерфейса встроены в EXE. Внешняя папка `Assets` для запуска не требуется.
 Настройки, SQLite-каталог, диагностика и журналы находятся в `%APPDATA%\PhotoShelf`.
 Сканирование и просмотр не изменяют содержимое оригиналов.
 
-При передаче другому агенту начните с [HANDOFF.md](HANDOFF.md). Сравнение с v0.9.7: [docs/ultra-comparison.md](docs/ultra-comparison.md). Исправление запуска v0.10.1: [docs/v0.10.1-startup-fix.md](docs/v0.10.1-startup-fix.md). Приставка Ultra сохраняет название линейки; измерения производительности относятся к ядру v0.10.0.
+Для продолжения разработки: `git pull --ff-only`, затем [HANDOFF.md](HANDOFF.md).
+Сравнение с v0.9.7: [docs/ultra-comparison.md](docs/ultra-comparison.md).
+История исправления запуска: [docs/v0.10.1-startup-fix.md](docs/v0.10.1-startup-fix.md).
+Изменения v0.10.2 и проверка стабильности сетки: [docs/v0.10.2-validation.md](docs/v0.10.2-validation.md).
 
 ## Быстрое ядро
 
@@ -35,8 +39,9 @@
 
 ## Проверка и границы результата
 
-Сборка и переносимые тесты выполнены на macOS ARM64. Проверены реальные принудительные завершения дочернего процесса и восстановление; оригиналы пользователя в тестах не использовались.
-**Запуск WPF и нативные Windows-проверки ещё не выполнены.** Поэтому эту сборку следует сначала проверить на копии библиотеки в Windows. Отключение питания и физическая поломка диска не моделировались; журнал и контрольные суммы не заменяют независимую резервную копию оригиналов.
+Переносимые тесты работают на macOS/Linux; WPF, нативные Windows-проверки и запуск опубликованного EXE проверяет Windows CI. Результат относится к конкретному commit SHA и завершённому запуску workflow. Публикация исходников сама по себе не подтверждает успешный запуск.
+Тесты используют синтетические данные. Smoke-проверка создаёт отдельный временный каталог и не открывает пользовательскую библиотеку.
+Отключение питания и физическая поломка диска не моделируются; журнал и контрольные суммы не заменяют независимую резервную копию оригиналов.
 
 Результаты, измерения и обязательные проверки Windows: [docs/v0.10.0-validation.md](docs/v0.10.0-validation.md).
 Контракт безопасности: [SAFETY.md](src/PhotoShelf.Application/Files/SAFETY.md).
@@ -48,15 +53,19 @@ HEIC/HEIF/RAW/Live Photo предусмотрены доменной архит�
 
 ## Сборка и проверка
 
-Нужен .NET 10 SDK; версия задаётся в `global.json`.
+Нужны Git, .NET 10 SDK и Python 3 для проверки структуры; версия SDK задаётся в `global.json`.
 
-```powershell
-dotnet build PhotoShelf.sln -c Release
-# На Windows: все тесты, включая WPF и нативную безопасность
-./scripts/verify-windows.ps1
-# Дополнительно каталоги 10 тыс. / 100 тыс. / 1 млн записей
-./scripts/verify-windows.ps1 -Scale
-dotnet publish src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o artifacts/PhotoShelf-v0.10.1-ultra-win-x64
+```bash
+# macOS/Linux: структура, Git hygiene, версия, переносимые тесты
+./tools/harness.sh
 ```
 
-Исходники до изменений сохранены отдельно: `.backups/PhotoShelf-v0.9.7-before-P0.zip`.
+```powershell
+# Windows: сборка, все тесты, publish, ресурсы и запуск UI, release ZIP
+./tools/harness.ps1
+# Дополнительно каталоги 10 тыс. / 100 тыс. / 1 млн записей
+./scripts/verify-windows.ps1 -Scale
+```
+
+Скрипты не добавляют результаты в Git. Сборки, TRX, журналы и ZIP остаются локальными/CI-артефактами.
+Старые инструкции упаковки и manifest относятся к архивным поставкам до перехода на GitHub; для актуальной разработки используйте репозиторий.

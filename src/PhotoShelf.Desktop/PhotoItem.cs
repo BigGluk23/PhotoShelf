@@ -85,9 +85,9 @@ public sealed class PhotoItem : INotifyPropertyChanged
 
     public string FavoriteGlyph => IsFavorite ? "★" : "";
 
-    public long FileSizeBytes { get; }
+    public long FileSizeBytes { get; private set; }
 
-    public DateTime? FileModifiedAt { get; }
+    public DateTime? FileModifiedAt { get; private set; }
 
     public DateTime? CaptureDate { get; private set; }
 
@@ -132,12 +132,22 @@ public sealed class PhotoItem : INotifyPropertyChanged
 
     public void ApplyIndexedCaptureDate(DateTime? captureDate)
     {
+        if (IsCaptureDateLoaded && CaptureDate == captureDate) return;
         IsCaptureDateLoaded = true;
         CaptureDate = captureDate;
         _metadataText = null;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CaptureDate)));
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DetailLine)));
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(MetadataText)));
+    }
+
+    public void ApplyFileInformation(long sizeBytes, DateTime? modifiedAt)
+    {
+        if (FileSizeBytes == sizeBytes && FileModifiedAt == modifiedAt) return;
+        FileSizeBytes = sizeBytes; FileModifiedAt = modifiedAt;
+        CaptureDate = null; IsCaptureDateLoaded = false; _metadataText = null;
+        foreach (var name in new[] { nameof(FileSizeBytes), nameof(FileModifiedAt), nameof(CaptureDate), nameof(DetailLine), nameof(MetadataText) })
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
 
     public static bool IsSupported(string path)
