@@ -16,7 +16,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "v0.9.7";
+    private const string VersionLabel = "v0.9.8";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PhotoItem> _itemsByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _knownPhotoPaths = new(StringComparer.OrdinalIgnoreCase);

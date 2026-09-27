@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.7" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf v0.9.8" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -238,7 +238,6 @@
                                                         <Border Height="{Binding DataContext.TileImageHeight, RelativeSource={RelativeSource AncestorType=Window}}" Background="#FFE5E2DC" ClipToBounds="True">
                                                             <Grid>
                                                                 <Image x:Name="TileImage" media:AsyncMediaImage.Path="{Binding Path}" Stretch="UniformToFill" />
-                                                                <TextBlock Text="{Binding ElementName=TileImage, Path=(media:AsyncMediaImage.Status)}" TextWrapping="Wrap" FontSize="10" Background="#DDE5E2DC" VerticalAlignment="Bottom" />
                                                                 <TextBlock Text="{Binding KindLabel}"
                                                                            Foreground="{StaticResource MutedTextBrush}"
                                                                            FontWeight="SemiBold"

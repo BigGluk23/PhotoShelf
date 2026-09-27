@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -11,8 +12,9 @@ public partial class App : System.Windows.Application
         DispatcherUnhandledException += (_, args) =>
         {
             args.Handled = true;
+            var logPath = WriteCrashLog(args.Exception);
             System.Windows.MessageBox.Show(
-                $"PhotoShelf поймал ошибку и не будет молча закрываться.\n\n{args.Exception.Message}",
+                $"PhotoShelf поймал ошибку и не будет молча закрываться.\n\n{args.Exception.Message}\n\nПодробности:\n{logPath}",
                 "Ошибка PhotoShelf",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
@@ -30,12 +32,37 @@ public partial class App : System.Windows.Application
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show($"Не удалось открыть каталог. Данные сохранены.\n{ex.Message}", "PhotoShelf");
+            var logPath = WriteCrashLog(ex);
+            System.Windows.MessageBox.Show(
+                $"Не удалось открыть каталог. Данные сохранены.\n\n{ex.Message}\n\nПодробности:\n{logPath}",
+                "PhotoShelf",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
             Shutdown(1);
             return;
         }
+
         MainWindow = mainWindow;
         mainWindow.Show();
         loading.Close();
+    }
+
+    private static string WriteCrashLog(Exception exception)
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "PhotoShelf",
+                "logs");
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            File.WriteAllText(path, exception.ToString());
+            return path;
+        }
+        catch
+        {
+            return "лог не удалось записать";
+        }
     }
 }

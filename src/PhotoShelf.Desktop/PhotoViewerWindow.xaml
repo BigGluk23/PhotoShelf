@@ -49,7 +49,6 @@
                    Stretch="Uniform"
                    SnapsToDevicePixels="True" />
 
-            <TextBlock Text="{Binding ElementName=PhotoImage, Path=(local:AsyncMediaImage.Status)}" Foreground="White" Background="#BB202126" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="8" Padding="8" />
             <MediaElement x:Name="VideoPlayer"
                           LoadedBehavior="Manual"
                           UnloadedBehavior="Stop"
