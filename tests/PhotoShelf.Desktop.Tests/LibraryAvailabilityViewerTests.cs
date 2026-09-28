@@ -17,7 +17,6 @@ namespace PhotoShelf.Desktop.Tests;
 // observation injection, not evidence of physically disconnecting a Windows storage device.
 public sealed class LibraryAvailabilityViewerTests
 {
-    private static readonly Lazy<Task<Dispatcher>> ViewerDispatcher = new(StartViewerDispatcher);
     private static readonly DateTime Modified = new(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc);
 
     [Theory]
@@ -175,31 +174,5 @@ public sealed class LibraryAvailabilityViewerTests
         while (!predicate()) await Task.Delay(15, timeout.Token);
         await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
     }
-    private static async Task OnStaAsync(Func<Task> body)
-    {
-        var dispatcher = await ViewerDispatcher.Value.WaitAsync(TimeSpan.FromSeconds(15));
-        await dispatcher.InvokeAsync(body).Task.Unwrap().WaitAsync(TimeSpan.FromSeconds(60));
-    }
-    private static Task<Dispatcher> StartViewerDispatcher()
-    {
-        var ready = new TaskCompletionSource<Dispatcher>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                // Use plain WPF Application: PhotoShelf.App would execute application startup.
-                // One application/dispatcher is reused because WPF allows only one per AppDomain.
-                var application = new System.Windows.Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-                application.Resources.MergedDictionaries.Add(new ResourceDictionary
-                { Source = new Uri("pack://application:,,,/PhotoShelf;component/Themes/PhotoShelfTheme.xaml") });
-                var dispatcher = Dispatcher.CurrentDispatcher;
-                SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(dispatcher));
-                ready.TrySetResult(dispatcher);
-                Dispatcher.Run();
-            }
-            catch (Exception exception) { ready.TrySetException(exception); }
-        }) { IsBackground = true, Name = "PhotoShelf viewer regression STA" };
-        thread.SetApartmentState(ApartmentState.STA); thread.Start();
-        return ready.Task;
-    }
+    private static Task OnStaAsync(Func<Task> body) => WpfTestDispatcher.RunAsync(body);
 }

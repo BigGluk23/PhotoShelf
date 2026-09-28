@@ -275,23 +275,5 @@ public sealed class AsyncMediaImageTests
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         while (!predicate()) await Task.Delay(10, timeout.Token);
     }
-    private static Task OnStaAsync(Func<Task> body)
-    {
-        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread = new Thread(() =>
-        {
-            var dispatcher = Dispatcher.CurrentDispatcher;
-            SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(dispatcher));
-            dispatcher.InvokeAsync(async () =>
-            {
-                try { await body(); completed.TrySetResult(); }
-                catch (Exception exception) { completed.TrySetException(exception); }
-                finally { dispatcher.BeginInvokeShutdown(DispatcherPriority.Background); }
-            });
-            Dispatcher.Run();
-        }) { IsBackground = true };
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        return completed.Task.WaitAsync(TimeSpan.FromSeconds(30));
-    }
+    private static Task OnStaAsync(Func<Task> body) => WpfTestDispatcher.RunAsync(body);
 }
