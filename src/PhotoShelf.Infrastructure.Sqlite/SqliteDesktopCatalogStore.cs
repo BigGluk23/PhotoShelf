@@ -104,6 +104,7 @@ public sealed partial class SqliteDesktopCatalogStore
                 CREATE INDEX IF NOT EXISTS ix_desktop_capture_sort ON desktop_media_items(is_quarantined,COALESCE(capture_date_ticks,0) DESC,path_key,is_hidden_or_system,is_video,is_favorite);
                 CREATE INDEX IF NOT EXISTS ix_desktop_capture_sort_asc ON desktop_media_items(is_quarantined,COALESCE(capture_date_ticks,0) ASC,path_key,is_hidden_or_system,is_video,is_favorite);
                 CREATE INDEX IF NOT EXISTS ix_desktop_folder ON desktop_media_items(folder_key,file_local_ticks DESC,path_key);
+                CREATE INDEX IF NOT EXISTS ix_desktop_folder_path ON desktop_media_items(folder_key,path_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_file_group ON desktop_media_items(is_quarantined,file_month,file_local_ticks DESC,path_key,is_hidden_or_system,is_video,is_favorite);
                 CREATE INDEX IF NOT EXISTS ix_desktop_capture_group ON desktop_media_items(is_quarantined,capture_month,COALESCE(capture_date_ticks,0) DESC,path_key,is_hidden_or_system,is_video,is_favorite);
                 CREATE INDEX IF NOT EXISTS ix_desktop_metadata_due ON desktop_media_items(metadata_indexed,is_quarantined,is_video,metadata_retry_ticks);

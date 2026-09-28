@@ -13,16 +13,18 @@ public partial class App : System.Windows.Application
     private bool _startupCompleted;
     private readonly bool _verificationOnly;
     private readonly UiSmokeSession? _uiSmoke;
+    private readonly UiBrowseSmokeSession? _uiBrowseSmoke;
     internal bool VerificationFailed { get; private set; }
 
     public App() : this(false) { }
 
     public App(bool verificationOnly) : this(verificationOnly, null) { }
 
-    internal App(bool verificationOnly, UiSmokeSession? uiSmoke)
+    internal App(bool verificationOnly, UiSmokeSession? uiSmoke, UiBrowseSmokeSession? uiBrowseSmoke = null)
     {
         _verificationOnly = verificationOnly;
         _uiSmoke = uiSmoke;
+        _uiBrowseSmoke = uiBrowseSmoke;
         DispatcherUnhandledException += OnUnhandledDispatcherException;
     }
 
@@ -39,7 +41,7 @@ public partial class App : System.Windows.Application
         ErrorReporter.Show(args.Exception, _startupCompleted
             ? "Не удалось выполнить действие в PhotoShelf"
             : "Не удалось подготовить окно PhotoShelf");
-        if (!_startupCompleted || _uiSmoke is not null) Shutdown(1);
+        if (!_startupCompleted || _uiSmoke is not null || _uiBrowseSmoke is not null) Shutdown(1);
     }
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -70,16 +72,19 @@ public partial class App : System.Windows.Application
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             if (Dispatcher.HasShutdownStarted) return;
             if (_uiSmoke is not null) await _uiSmoke.SeedCatalogAsync();
+            if (_uiBrowseSmoke is not null) await _uiBrowseSmoke.SeedCatalogAsync();
             var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
             QuarantineConfiguration.ApplyLoaded(state);
             if (Dispatcher.HasShutdownStarted) return;
             var mainWindow = new MainWindow(state);
+            _uiBrowseSmoke?.PrepareWindow(mainWindow);
             MainWindow = mainWindow;
             mainWindow.Show();
             _startupCompleted = true;
             ShutdownMode = ShutdownMode.OnMainWindowClose;
             loading.Close();
             if (_uiSmoke is not null) await _uiSmoke.ObserveAndCloseAsync(mainWindow);
+            if (_uiBrowseSmoke is not null) await _uiBrowseSmoke.ObserveAndCloseAsync(mainWindow);
         }
         catch (Exception exception)
         {

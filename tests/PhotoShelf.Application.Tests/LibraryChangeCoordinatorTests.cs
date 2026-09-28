@@ -39,6 +39,107 @@ public sealed class LibraryChangeCoordinatorTests
     }
 
     [Fact]
+    public async Task UnsupportedNoiseCannotFillQueueOrInvalidateMediaWhileCallbackIsDrained()
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var scopeChecks = 0;
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions with { MaximumPendingPaths = 8 }, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root], ShouldObservePath: _ => { Interlocked.Increment(ref scopeChecks); return true; },
+            ShouldObserveFilePath: IsSyntheticMedia));
+        await Until(() => batches.Any(batch => batch.RootStates.Any(state => state.IsWatching)));
+        await monitor.PauseAsync();
+        var watcher = factory.Latest(root);
+        for (var index = 0; index < 5000; index++) watcher.Change(new(Path.Combine(root, $"noise-{index}.log")));
+        Assert.Equal(0, monitor.PendingPathCount);
+        Assert.Equal(0, scopeChecks);
+        var original = Path.Combine(root, "original.jpg"); var renamed = Path.Combine(root, "renamed.jpg");
+        watcher.Change(new(renamed, original));
+        // Renaming away from a supported extension must still observe the old media path.
+        var removed = Path.Combine(root, "removed.jpg");
+        watcher.Change(new(Path.Combine(root, "renamed-to-unsupported.tmp"), removed));
+        Assert.Equal(3, monitor.PendingPathCount);
+        await monitor.ResumeAsync();
+        await Until(() => batches.SelectMany(batch => batch.ChangedPaths).Distinct().Count() == 3);
+        Assert.Equal(new[] { original, renamed, removed }.Order(), batches.SelectMany(batch => batch.ChangedPaths).Order());
+        Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
+    }
+
+    [Fact]
+    public async Task NonrecursiveScopeIgnoresDeepDirectoryNoiseButReconcilesImmediateDirectoryChanges()
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, probe);
+        await monitor.ConfigureAsync(new([root], ShouldObserveFilePath: IsSyntheticMedia, NonRecursiveRoots: [root]));
+        await Until(() => probe.Calls >= 2 && batches.Any(batch => batch.ReconcileRoots.Contains(root)));
+        var watcher = factory.Latest(root); var baseline = batches.Count;
+        Assert.False(watcher.IncludeSubdirectories);
+        for (var index = 0; index < 2000; index++)
+        {
+            watcher.Change(new(Path.Combine(root, "child", $"nested-{index}"), RequiresReconciliation: true));
+            watcher.Change(new(Path.Combine(root, "child", $"nested-{index}.jpg")));
+        }
+        var direct = Path.Combine(root, "direct.jpg"); watcher.Change(new(direct));
+        await Until(() => batches.Skip(baseline).Any(batch => batch.ChangedPaths.Contains(direct)));
+        Assert.All(batches.Skip(baseline), batch => Assert.Empty(batch.ReconcileRoots));
+        Assert.Equal([direct], batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths));
+        var immediate = Path.Combine(root, "new-child"); watcher.Change(new(immediate, RequiresReconciliation: true));
+        await Until(() => batches.Skip(baseline).Any(batch => batch.ReconcileRoots.Contains(root)));
+        Assert.DoesNotContain(batches.SelectMany(batch => batch.ChangedPaths), path => path == immediate);
+        Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
+    }
+
+    [Fact]
+    public async Task RecursiveLibraryAndNonrecursiveBrowseKeepIndependentNotificationScopes()
+    {
+        var browse = RootPath(); var library = Path.Combine(browse, "library"); var factory = new FakeFactory(); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, probe);
+        await monitor.ConfigureAsync(new([browse, library], ShouldObserveFilePath: IsSyntheticMedia, NonRecursiveRoots: [browse]));
+        await Until(() => probe.Calls >= 4 && batches.SelectMany(batch => batch.ReconcileRoots).Distinct().Count() == 2);
+        Assert.False(factory.Latest(browse).IncludeSubdirectories); Assert.True(factory.Latest(library).IncludeSubdirectories);
+        var baseline = batches.Count;
+        var nested = Path.Combine(library, "child", "nested.jpg"); var direct = Path.Combine(browse, "direct.jpg");
+        factory.Latest(browse).Change(new(nested));
+        factory.Latest(browse).Change(new(Path.Combine(browse, "other", "ignored.jpg")));
+        factory.Latest(browse).Change(new(Path.Combine(library, "child"), RequiresReconciliation: true));
+        factory.Latest(library).Change(new(nested));
+        factory.Latest(library).Change(new(Path.Combine(library, "child"), RequiresReconciliation: true));
+        factory.Latest(browse).Change(new(direct));
+        await Until(() => batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths).Distinct().Count() == 2 &&
+            batches.Skip(baseline).Any(batch => batch.ReconcileRoots.Contains(library)));
+        Assert.Equal(new[] { direct, nested }.Order(), batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths).Order());
+        Assert.DoesNotContain(batches.Skip(baseline).SelectMany(batch => batch.ReconcileRoots), root => root == browse);
+    }
+
+    [Fact]
+    public async Task ChangingOnlyBrowseRecursionPreservesLibraryWatcherAndPendingLibraryPath()
+    {
+        var browse = RootPath(); var library = Path.Combine(browse, "library"); var factory = new FakeFactory(); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, probe);
+        await monitor.ConfigureAsync(new([browse, library], ShouldObserveFilePath: IsSyntheticMedia));
+        await Until(() => probe.Calls >= 4 && batches.SelectMany(batch => batch.ReconcileRoots).Distinct().Count() == 2);
+        await monitor.PauseAsync();
+        var originalBrowse = factory.Latest(browse); var originalLibrary = factory.Latest(library);
+        var pending = Path.Combine(library, "child", "pending.jpg"); originalBrowse.Change(new(pending));
+        await monitor.ConfigureAsync(new([browse, library], ShouldObserveFilePath: IsSyntheticMedia, NonRecursiveRoots: [browse]));
+        Assert.True(originalBrowse.Disposed); Assert.False(originalLibrary.Disposed);
+        Assert.Equal(1, monitor.PendingPathCount);
+        await monitor.ResumeAsync(); var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.ChangedPaths.Contains(pending)));
+        Assert.Equal(3, factory.Count);
+        Assert.False(factory.Latest(browse).IncludeSubdirectories);
+        Assert.Same(originalLibrary, factory.Latest(library));
+        Assert.Contains(batches, batch => batch.Generation == generation && batch.RevalidateContentRoots?.Contains(browse) == true);
+        Assert.DoesNotContain(batches, batch => batch.RevalidateContentRoots?.Contains(library) == true);
+    }
+
+    [Fact]
     public async Task RenameIncludesOldAndNewPathsAndIgnoresInternalDirectories()
     {
         var root = RootPath(); var cache = Path.Combine(root, "cache"); var factory = new FakeFactory();
@@ -554,9 +655,11 @@ public sealed class LibraryChangeCoordinatorTests
         await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
             FastOptions with { MaximumRoots = 1 }, new FakeFactory(), new FakeProbe());
         await Assert.ThrowsAsync<ArgumentException>(() => monitor.ConfigureAsync(new([RootPath(), RootPath()])));
+        await Assert.ThrowsAsync<ArgumentException>(() => monitor.ConfigureAsync(new([RootPath()], NonRecursiveRoots: [RootPath(), RootPath()])));
     }
 
     internal static string RootPath() => Path.Combine(OperatingSystem.IsMacOS() ? "/private/tmp" : Path.GetTempPath(), "photoshelf-monitor-" + Guid.NewGuid().ToString("N"));
+    private static bool IsSyntheticMedia(string path) => Path.GetExtension(path).Equals(".jpg", StringComparison.OrdinalIgnoreCase);
     private static async Task Until(Func<bool> predicate)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
@@ -580,7 +683,7 @@ public sealed class LibraryChangeCoordinatorTests
         public IDisposable Watch(string root, bool includeSubdirectories, Action<LibraryWatchEvent> onChange, Action<Exception> onError)
         {
             if (Interlocked.Increment(ref Attempts) <= FailAttempts) throw new IOException("Synthetic watcher setup failure");
-            var watcher = new FakeWatcher(root, onChange, onError); Items.Enqueue(watcher); return watcher;
+            var watcher = new FakeWatcher(root, includeSubdirectories, onChange, onError); Items.Enqueue(watcher); return watcher;
         }
     }
 
@@ -596,9 +699,10 @@ public sealed class LibraryChangeCoordinatorTests
         }
         public void Dispose() => Release.Dispose();
     }
-    private sealed class FakeWatcher(string root, Action<LibraryWatchEvent> change, Action<Exception> error) : IDisposable
+    private sealed class FakeWatcher(string root, bool includeSubdirectories, Action<LibraryWatchEvent> change, Action<Exception> error) : IDisposable
     {
         public string Root { get; } = root;
+        public bool IncludeSubdirectories { get; } = includeSubdirectories;
         public Action<LibraryWatchEvent> Change { get; } = change;
         public Action<Exception> Error { get; } = error;
         public volatile bool Disposed;

@@ -6,14 +6,19 @@ namespace PhotoShelf.Infrastructure.Sqlite;
 public sealed partial class SqliteDesktopCatalogStore
 {
     public Task<IReadOnlyList<SavedMediaItem>> QuerySubtreePageAsync(string folder, string? afterPath = null,
-        int pageSize = 256, CancellationToken token = default) => Task.Run<IReadOnlyList<SavedMediaItem>>(async () =>
+        int pageSize = 256, CancellationToken token = default, bool includeSubdirectories = true) => Task.Run<IReadOnlyList<SavedMediaItem>>(async () =>
     {
         if (pageSize is < 1 or > 1024) throw new ArgumentOutOfRangeException(nameof(pageSize));
         await using var connection = await OpenAsync(token);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT {ItemColumns} FROM desktop_media_items WHERE is_quarantined=0 AND path_key>=$start AND path_key<$end AND path_key>$after ORDER BY path_key LIMIT $take;";
+        var scope = includeSubdirectories ? "path_key>=$start AND path_key<$end" : "folder_key=$folder";
+        command.CommandText = $"SELECT {ItemColumns} FROM desktop_media_items WHERE is_quarantined=0 AND {scope} AND path_key>$after ORDER BY path_key LIMIT $take;";
         var root = NormalizePathKey(folder);
-        command.Parameters.AddWithValue("$start", root + "/"); command.Parameters.AddWithValue("$end", root + "0");
+        if (includeSubdirectories)
+        {
+            command.Parameters.AddWithValue("$start", root + "/"); command.Parameters.AddWithValue("$end", root + "0");
+        }
+        else command.Parameters.AddWithValue("$folder", root);
         command.Parameters.AddWithValue("$after", afterPath is null ? "" : NormalizePathKey(afterPath)); command.Parameters.AddWithValue("$take", pageSize);
         var result = new List<SavedMediaItem>(pageSize);
         await using var reader = await command.ExecuteReaderAsync(token);

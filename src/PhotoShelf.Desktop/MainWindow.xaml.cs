@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.7";
+    private const string VersionLabel = "Ultra v0.10.8";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -328,7 +328,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnFolderTreeSelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {
-        if (e.NewValue is not FolderNode folderNode)
+        if (e.NewValue is not FolderNode folderNode || folderNode.IsPlaceholder)
         {
             return;
         }
@@ -340,6 +340,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         RebuildRows();
         _ = BrowseFolderAsync(folderNode.FullPath);
         RefreshChrome();
+        SaveCatalogState();
     }
 
     private void OnFolderTreeItemExpanded(object sender, RoutedEventArgs e)
@@ -872,8 +873,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void RefreshChrome()
     {
-        EmptyState.Visibility = !_isProjecting && !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        RefreshEmptyState();
         if (!_isProjecting && !_isCatalogLoading) StatusText.Text = $"В виде: {(PhotoRows as VirtualPhotoRows)?.ItemCount ?? 0:N0} · Каталог: {_catalogCount:N0}";
+    }
+
+    private void RefreshEmptyState()
+    {
+        if (EmptyState is null) return;
+        EmptyState.Visibility = !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (EmptyState.Visibility != Visibility.Visible) return;
+        var folder = _viewMode == LibraryViewMode.Folder && _activeFolder is not null;
+        var loading = _isProjecting && !_projectionPreservesView || folder && _browseCancellation is { IsCancellationRequested: false };
+        EmptyStateTitle.Text = loading ? "Читаю выбранную папку…" : folder ? "В этой папке нет подходящих фото и видео" :
+            _catalogCount > 0 ? "В этом виде нет подходящих фото и видео" : "Добавьте папку или запустите поиск фото";
+        EmptyStateDescription.Text = loading ? "Первые файлы появятся по мере чтения" :
+            folder ? (_includeSubfolders ? "Проверьте фильтры и доступность папки" : "Показаны только файлы самой папки. Для вложенных папок включите «Подпапки»") :
+            _catalogCount > 0 ? "Проверьте выбранные папки и фильтры. Галка включает папку в библиотеку; нажатие на название открывает её" :
+            "Оригиналы останутся на своих местах";
+        EmptyStateActions.Visibility = !loading && !folder && _catalogCount == 0 ? Visibility.Visible : Visibility.Collapsed;
+        IncludeSubfoldersEmptyButton.Visibility = !loading && folder && !_includeSubfolders ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void OnEmptyIncludeSubfoldersClicked(object sender, RoutedEventArgs e)
+    {
+        SubfoldersCheckBox.IsChecked = true;
+        OnSubfoldersChanged(sender, e);
     }
 
 
@@ -949,7 +973,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt && selected.ObservationVersion == saved.ObservationVersion)
                         selected.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
                 MetadataStatusText.Text = $"Метаданные: {count:N0}";
-                if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate)) NoteCatalogChanged();
+                if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate) &&
+                    IsCurrentViewAffected(new(batch, [], [], false))) NoteCatalogChanged();
             }, DispatcherPriority.Background);
         }
         try
@@ -980,7 +1005,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                         var probe = new FileSystemObservationProbe().ProbeFile(item.Path);
                         if (probe.Availability == FileAvailability.Available)
                             await _desktopCatalogStore.ApplyObservationAsync(new(LibraryCatalogSynchronizer.Available(probe)), item, token);
-                        await Dispatcher.InvokeAsync(NoteCatalogChanged, DispatcherPriority.Background);
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            if (IsCurrentViewAffected(new([item], [], [], false))) NoteCatalogChanged();
+                        }, DispatcherPriority.Background);
                         continue;
                     }
                     fresh ??= item;
@@ -1075,6 +1103,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadSavedCatalogAsync();
             MarkInitialCatalogReady();
+            // A restored folder (or a click during startup) must discover its first
+            // files directly, without waiting behind the library monitor's root queue.
+            if (_viewMode == LibraryViewMode.Folder && _activeFolder is not null) _ = BrowseFolderAsync(_activeFolder);
             QueueLibraryMonitoring();
             if (!_hasPendingRecovery) StartMetadataIndexing(resetExisting: false);
         }

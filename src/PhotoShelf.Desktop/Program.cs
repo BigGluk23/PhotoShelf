@@ -31,6 +31,7 @@ public static class Program
         {
             var automated = options.Kind != StartupCheckKind.None;
             var uiSmoke = options.Kind == StartupCheckKind.UserInterface ? new UiSmokeSession() : null;
+            var uiBrowseSmoke = options.Kind == StartupCheckKind.UserInterfaceBrowse ? new UiBrowseSmokeSession() : null;
             try
             {
                 if (automated)
@@ -39,7 +40,7 @@ public static class Program
                     LocalCatalogStore.CreateIsolatedSmokeCatalog();
                     ErrorReporter.AutomatedCheck = true;
                 }
-                var app = new App(options.Kind == StartupCheckKind.Resources, uiSmoke);
+                var app = new App(options.Kind == StartupCheckKind.Resources, uiSmoke, uiBrowseSmoke);
                 // Includes merged theme dictionaries; failures here preceded OnStartup in the old entry point.
                 app.InitializeComponent();
                 if (options.Kind == StartupCheckKind.Resources)
@@ -49,6 +50,12 @@ public static class Program
                     return 0;
                 }
                 var exitCode = app.Run();
+                if (uiBrowseSmoke is not null)
+                {
+                    if (!uiBrowseSmoke.ChecksPassed || !uiBrowseSmoke.GracefulExit || ErrorReporter.ErrorCount != 0) exitCode = 1;
+                    WriteReport(report!, uiBrowseSmoke.CreateReport(exitCode));
+                    return exitCode;
+                }
                 if (uiSmoke is null) return exitCode;
                 if (!uiSmoke.Ready || !uiSmoke.PreviewRendered || !uiSmoke.GracefulExit ||
                     uiSmoke.DispatcherTicks < 20 || uiSmoke.MaxDispatcherGapMs > 2000 || ErrorReporter.ErrorCount != 0) exitCode = 1;
@@ -66,11 +73,14 @@ public static class Program
                         ErrorReporter.Save(ExceptionDiagnostics.Create(exception, "Автоматическая проверка запуска", ErrorReporter.Version).Details);
                     try
                     {
-                        WriteReport(report!, uiSmoke is not null && LocalCatalogStore.IsIsolatedSmokeCatalog
+                        WriteReport(report!, uiBrowseSmoke is not null && LocalCatalogStore.IsIsolatedSmokeCatalog
+                            ? uiBrowseSmoke.CreateReport(1)
+                            : uiSmoke is not null && LocalCatalogStore.IsIsolatedSmokeCatalog
                             ? uiSmoke.CreateReport(1)
                             : new
                             {
-                                status = "failed", check = options.Kind == StartupCheckKind.Resources ? "startup-resources" : "ui-smoke",
+                                status = "failed", check = options.Kind == StartupCheckKind.Resources ? "startup-resources" :
+                                    options.Kind == StartupCheckKind.UserInterfaceBrowse ? "ui-browse-smoke" : "ui-smoke",
                                 error = exception.Message,
                                 catalogRoot = LocalCatalogStore.IsIsolatedSmokeCatalog ? LocalCatalogStore.CatalogDirectory : null,
                                 logRoot = LocalCatalogStore.IsIsolatedSmokeCatalog ? ErrorReporter.LogRoot : null

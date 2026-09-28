@@ -1,6 +1,6 @@
 namespace PhotoShelf.Application.Diagnostics;
 
-public enum StartupCheckKind { None, Resources, UserInterface }
+public enum StartupCheckKind { None, Resources, UserInterface, UserInterfaceBrowse }
 
 /// <summary>Strict diagnostic entry points. They never accept a caller-selected catalog directory.</summary>
 public sealed record StartupCheckArguments(StartupCheckKind Kind, string? ReportPath)
@@ -13,6 +13,7 @@ public sealed record StartupCheckArguments(StartupCheckKind Kind, string? Report
         {
             "--verify-startup-resources" when args[1] == "--startup-report" => StartupCheckKind.Resources,
             "--ui-smoke" when args[1] == "--smoke-report" => StartupCheckKind.UserInterface,
+            "--ui-browse-smoke" when args[1] == "--smoke-report" => StartupCheckKind.UserInterfaceBrowse,
             _ => throw new ArgumentException("Unknown or incompatible startup arguments.")
         };
         if (!Path.IsPathFullyQualified(args[2])) throw new ArgumentException("Report path must be absolute.");

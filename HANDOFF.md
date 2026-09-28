@@ -1,7 +1,11 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.7** (`0.10.7-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.8** (`0.10.8-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Исправление v0.10.8
+
+`LibraryMonitorConfiguration` поддерживает отдельный фильтр файлов до очереди и `NonRecursiveRoots`. `LibraryFolderScope` сокращает исключённые широкие корни до явных включённых папок. `QuerySubtreePageAsync(includeSubdirectories:false)` использует индекс `folder_key,path_key`. UI пересчитывает метаданные/количество только после подтверждённых изменений и не перестраивает вид из-за чужой папки. `Completed.CatalogChanged` должен учитывать commit перед отменой; проверяйте finally-публикацию. Новый изолированный `--ui-browse-smoke` проверяет production MainWindow с реально включённым монитором; обычный `--ui-smoke` по-прежнему проверяет встроенные декодеры отдельно. Читайте [v0.10.8](docs/v0.10.8-folder-browse.md).
 
 ## Исправление v0.10.7
 

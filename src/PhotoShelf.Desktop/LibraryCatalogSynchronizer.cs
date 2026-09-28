@@ -5,7 +5,8 @@ namespace PhotoShelf.Desktop;
 
 public sealed record CatalogExternalRename(string Source, SavedMediaItem Destination);
 public sealed record LibraryCatalogUpdate(IReadOnlyList<SavedMediaItem> Items,
-    IReadOnlyList<CatalogExternalRename> Renames, IReadOnlyList<LibraryRootState> Roots, bool Completed);
+    IReadOnlyList<CatalogExternalRename> Renames, IReadOnlyList<LibraryRootState> Roots, bool Completed,
+    bool CatalogChanged = false);
 
 /// <summary>Worker-only reconciliation. Observes originals without modifying them; writes only the SQLite catalog.</summary>
 public sealed class LibraryCatalogSynchronizer(
@@ -27,49 +28,67 @@ public sealed class LibraryCatalogSynchronizer(
             (browseRecursively ? IsUnder(path, browsedFolder) :
                 string.Equals(Path.GetDirectoryName(path)?.TrimEnd('\\', '/'), browsedFolder.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase));
 
-        await publish(new([], [], batch.RootStates, false));
-        foreach (var paths in batch.ChangedPaths.Where(Observe).Where(PhotoItem.IsSupported).Chunk(128))
-            await ObservePathsAsync(paths, forceContent: true, token);
-
-        foreach (var root in batch.ReconcileRoots)
+        var catalogChanged = false;
+        void MarkCommitted() => catalogChanged = true;
+        try
         {
-            token.ThrowIfCancellationRequested();
-            var rootResult = _probe.ProbeRoot(root);
-            var recursive = libraryRoots.Any(parent => IsUnder(root, parent)) && inclusion.MayContainIncluded(root) || browseRecursively && browsedFolder is not null && IsUnder(root, browsedFolder);
-            if (rootResult.Availability == FileAvailability.Available)
-            {
-                // A browsed, unchecked subtree remains navigable without becoming part of the library.
-                var scanRules = inclusion.Snapshot();
-                if (browsedFolder is not null && IsUnder(root, browsedFolder)) scanRules.SetIncluded(root, true);
-                await PhotoScanner.ScanAsync([root], scan => ObservePathsAsync(scan.Paths.Where(Observe).ToArray(), batch.RevalidateContentRoots?.Contains(root, StringComparer.OrdinalIgnoreCase) == true, token),
-                    includeSystem, token, recursive: recursive, inclusion: scanRules);
-            }
+            await publish(new([], [], batch.RootStates, false));
+            foreach (var paths in batch.ChangedPaths.Where(Observe).Where(PhotoItem.IsSupported).Chunk(128))
+                await ObservePathsCoreAsync(paths, forceContent: true, token, MarkCommitted);
 
-            // A second bounded pass covers missing/inaccessible files which enumeration cannot report.
-            // Never interpret a failed directory enumeration as deletion of catalog rows.
-            string? after = null;
-            while (true)
+            foreach (var root in batch.ReconcileRoots)
             {
-                var page = await store.QuerySubtreePageAsync(root, after, 128, token);
-                if (page.Count == 0) break;
-                after = page[^1].Path;
-                var candidates = page.Where(item => Observe(item.Path)).ToArray();
-                if (rootResult.Availability != FileAvailability.Available)
+                token.ThrowIfCancellationRequested();
+                var rootResult = _probe.ProbeRoot(root);
+                var recursive = libraryRoots.Any(parent => IsUnder(root, parent)) && inclusion.MayContainIncluded(root) || browseRecursively && browsedFolder is not null && IsUnder(root, browsedFolder);
+                if (rootResult.Availability == FileAvailability.Available)
                 {
-                    var updates = candidates.Where(item => item.Availability != rootResult.Availability ||
-                        item.AvailabilityErrorCode != rootResult.ErrorCode).Select(item =>
-                        (new FileObservation(Unavailable(item.Path, rootResult)), (SavedMediaItem?)item)).ToArray();
-                    await ApplyAsync(updates, [], token);
+                    // A browsed, unchecked subtree remains navigable without becoming part of the library.
+                    var scanRules = inclusion.Snapshot();
+                    if (browsedFolder is not null && IsUnder(root, browsedFolder)) scanRules.SetIncluded(root, true);
+                    await PhotoScanner.ScanAsync([root], scan => ObservePathsCoreAsync(scan.Paths.Where(Observe).ToArray(),
+                        batch.RevalidateContentRoots?.Contains(root, StringComparer.OrdinalIgnoreCase) == true, token, MarkCommitted),
+                        includeSystem, token, recursive: recursive, inclusion: scanRules);
                 }
-                else await ObservePathsAsync(candidates.Select(item => item.Path).ToArray(), false, token);
+
+                // A second bounded pass covers missing/inaccessible files which enumeration cannot report.
+                // Never interpret a failed directory enumeration as deletion of catalog rows.
+                // A direct-folder browse must not enumerate nested library roots through this pass.
+                string? after = null;
+                while (true)
+                {
+                    var page = await store.QuerySubtreePageAsync(root, after, 128, token, includeSubdirectories: recursive);
+                    if (page.Count == 0) break;
+                    after = page[^1].Path;
+                    var candidates = page.Where(item => Observe(item.Path)).ToArray();
+                    if (rootResult.Availability != FileAvailability.Available)
+                    {
+                        var updates = candidates.Where(item => item.Availability != rootResult.Availability ||
+                            item.AvailabilityErrorCode != rootResult.ErrorCode).Select(item =>
+                            (new FileObservation(Unavailable(item.Path, rootResult)), (SavedMediaItem?)item)).ToArray();
+                        await ApplyAsync(updates, [], token, MarkCommitted);
+                    }
+                    else await ObservePathsCoreAsync(candidates.Select(item => item.Path).ToArray(), false, token, MarkCommitted);
+                }
             }
+            token.ThrowIfCancellationRequested();
         }
-        token.ThrowIfCancellationRequested();
-        await publish(new([], [], [], true));
+        finally
+        {
+            // Committed work still needs its metadata/count/publication boundary if this
+            // generation was cancelled midway. This notification performs no file reads.
+            await publish(new([], [], [], true, catalogChanged));
+        }
     }
 
-    public async Task ObservePathsAsync(IReadOnlyList<string> paths, bool forceContent, CancellationToken token)
+    public Task<bool> ObservePathsAsync(IReadOnlyList<string> paths, bool forceContent, CancellationToken token) =>
+        ObservePathsCoreAsync(paths, forceContent, token, null);
+
+    private async Task<bool> ObservePathsCoreAsync(IReadOnlyList<string> paths, bool forceContent, CancellationToken token,
+        Action? onCommitted)
     {
+        var catalogChanged = false;
+        void MarkCommitted() { catalogChanged = true; onCommitted?.Invoke(); }
         foreach (var part in paths.Distinct(StringComparer.OrdinalIgnoreCase).Chunk(128))
         {
             var known = await store.GetItemsByPathsAsync(part, token);
@@ -84,8 +103,8 @@ public sealed class LibraryCatalogSynchronizer(
                     if (result.IsDirectory) continue;
                     var current = result.Availability == FileAvailability.Available ? Available(result) : Unavailable(path, result);
                     known.TryGetValue(path, out var previous);
-                var revalidate = forceContent || previous?.Availability is FileAvailability.AccessDenied or FileAvailability.RootOffline ||
-                    previous is { Availability: FileAvailability.NeedsVerification, AvailabilityErrorCode: not null };
+                    var revalidate = forceContent || previous?.Availability is FileAvailability.AccessDenied or FileAvailability.RootOffline ||
+                        previous is { Availability: FileAvailability.NeedsVerification, AvailabilityErrorCode: not null };
                     if (previous is null && current.Availability != FileAvailability.Available) continue;
                     if (previous is null && current.FileIdentity is { Length: > 0 } identity)
                     {
@@ -100,6 +119,7 @@ public sealed class LibraryCatalogSynchronizer(
                             {
                                 // Record the committed identity change before any further cancellable work.
                                 renames.Add(new(matches[0].Path, current));
+                                MarkCommitted();
                                 if (forceContent && await store.GetItemAsync(path, CancellationToken.None) is { } moved)
                                     await store.ApplyObservationAsync(new(current, true), moved, CancellationToken.None);
                                 continue;
@@ -111,23 +131,25 @@ public sealed class LibraryCatalogSynchronizer(
                         previous.Availability == current.Availability && previous.AvailabilityErrorCode == current.AvailabilityErrorCode) continue;
                     changes.Add((new(current, revalidate && current.Availability == FileAvailability.Available), previous));
                 }
-                await ApplyAsync(changes, [], token);
+                await ApplyAsync(changes, [], token, MarkCommitted);
             }
             finally
             {
                 // Cancellation after commit must not leave selection/viewers on the old path.
-                await ApplyAsync([], renames, CancellationToken.None);
+                await ApplyAsync([], renames, CancellationToken.None, MarkCommitted);
             }
         }
+        return catalogChanged;
     }
 
-    private async Task ApplyAsync(IReadOnlyList<(FileObservation Observation, SavedMediaItem? Expected)> changes,
-        IReadOnlyList<CatalogExternalRename> renames, CancellationToken token)
+    private async Task<bool> ApplyAsync(IReadOnlyList<(FileObservation Observation, SavedMediaItem? Expected)> changes,
+        IReadOnlyList<CatalogExternalRename> renames, CancellationToken token, Action onCommitted)
     {
-        if (changes.Count == 0 && renames.Count == 0) return;
+        if (changes.Count == 0 && renames.Count == 0) return false;
         IReadOnlyList<bool> accepted = changes.Count == 0 ? [] : await store.ApplyObservationsAsync(changes, token);
         var committedPaths = changes.Where((_, index) => accepted[index]).Select(change => change.Observation.Item.Path)
             .Concat(renames.Select(rename => rename.Destination.Path)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (committedPaths.Length > 0) onCommitted();
         // Once a transaction commits, report it even if its generation is cancelled before UI publication.
         IReadOnlyList<SavedMediaItem> committed = committedPaths.Length == 0 ? [] :
             (await store.GetItemsByPathsAsync(committedPaths, CancellationToken.None)).Values.ToArray();
@@ -136,7 +158,8 @@ public sealed class LibraryCatalogSynchronizer(
             var destination = committed.FirstOrDefault(item => item.Path.Equals(rename.Destination.Path, StringComparison.OrdinalIgnoreCase));
             return destination is null ? rename : new CatalogExternalRename(rename.Source, destination);
         }).ToArray();
-        if (committed.Count > 0) await publish(new(committed, committedRenames, [], false));
+        if (committed.Count > 0) await publish(new(committed, committedRenames, [], false, CatalogChanged: true));
+        return committedPaths.Length > 0;
     }
 
     public static SavedMediaItem Available(FileSystemProbeResult result)

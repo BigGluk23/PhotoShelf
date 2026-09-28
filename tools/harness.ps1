@@ -16,6 +16,7 @@ $results = Join-Path $repoRoot ('TestResults/windows-' + $runId)
 New-Item -ItemType Directory -Path $results | Out-Null
 $transcriptStarted = $false
 $smokeProcess = $null
+$browseSmokeProcess = $null
 $result = [ordered]@{ status = 'failed'; platform = 'windows'; commit = ''; version = ''; scaleIncluded = $Scale.IsPresent; results = $results }
 
 function Invoke-Checked {
@@ -111,6 +112,58 @@ try {
         throw 'UI smoke did not confirm the published version, ready window, at least 5 seconds of responsiveness, zero errors, and graceful exit.'
     }
     Write-Output 'OK published EXE: embedded startup resources and full main window, isolated catalog, graceful close, no error logs.'
+    # A separate process preserves catalog/cache isolation while explicitly enabling
+    # the production watcher + metadata + browse path omitted by the basic smoke.
+    $browseReport = Join-Path $results 'ui-browse-smoke.json'
+    $browseSmokeProcess = Start-Process -FilePath $exe -ArgumentList @('--ui-browse-smoke', '--smoke-report', ('"' + $browseReport + '"')) -WorkingDirectory $emptyWork -PassThru
+    if (-not $browseSmokeProcess.WaitForExit(90000)) {
+        $browseSmokeProcess.Kill()
+        $browseSmokeProcess.WaitForExit()
+        throw 'Production browse/monitor smoke timed out after 90 seconds; isolated fixtures retained.'
+    }
+    if (-not (Test-Path -LiteralPath $browseReport -PathType Leaf)) { throw "Browse smoke exited $($browseSmokeProcess.ExitCode) without a report." }
+    $browseSmoke = Get-Content -LiteralPath $browseReport -Raw | ConvertFrom-Json
+    $browseCatalog = [System.IO.Path]::GetFullPath([string]$browseSmoke.catalogRoot).TrimEnd('\')
+    $browseLogs = [System.IO.Path]::GetFullPath([string]$browseSmoke.logRoot)
+    $browseMedia = [System.IO.Path]::GetFullPath([string]$browseSmoke.mediaRoot).TrimEnd('\')
+    if (-not $browseCatalog.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [System.IO.Path]::GetFileName($browseCatalog).StartsWith('PhotoShelf-ui-smoke-', [StringComparison]::Ordinal) -or
+        -not $browseLogs.StartsWith($browseCatalog + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([System.IO.Path]::GetDirectoryName($browseMedia) + '\').Equals($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [System.IO.Path]::GetFileName($browseMedia).StartsWith('PhotoShelf-browse-smoke-', [StringComparison]::Ordinal) -or
+        $browseMedia.StartsWith($browseCatalog + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Browse smoke did not use separate owned temporary catalog/media roots.'
+    }
+    if ((Test-Path -LiteralPath $browseLogs) -and @(Get-ChildItem -LiteralPath $browseLogs -File -Recurse).Count -gt 0) {
+        Copy-Item -LiteralPath $browseLogs -Destination (Join-Path $results 'browse-smoke-errors') -Recurse
+        throw 'New application errors were written during production browse/monitor smoke.'
+    }
+    if ($browseSmokeProcess.ExitCode -ne 0 -or $browseSmoke.status -ne 'passed' -or $browseSmoke.check -ne 'ui-browse-smoke' -or
+        $browseSmoke.version -ne ($result.version + '+' + $result.commit) -or $browseSmoke.isolatedCatalog -ne $true -or
+        $browseSmoke.monitoringObserved -ne $true -or $browseSmoke.directCountVerified -ne $true -or
+        $browseSmoke.recursiveCountVerified -ne $true -or $browseSmoke.checkboxVerified -ne $true -or
+        $browseSmoke.freshDiscoveryVerified -ne $true -or $browseSmoke.rapidSelectionVerified -ne $true -or
+        $browseSmoke.wrongFolderPublications -ne 0 -or $browseSmoke.originalHashesVerified -ne $true -or
+        $browseSmoke.originalsChecked -ne 4 -or $browseSmoke.decoderReadersDrained -ne $true -or
+        $browseSmoke.catalogWritersDrained -ne $true -or $browseSmoke.gracefulExit -ne $true -or
+        $browseSmoke.errorCount -ne 0 -or $browseSmoke.exitCode -ne 0) {
+        throw 'Production browse/monitor smoke did not pass every functional/safety assertion.'
+    }
+    foreach ($measurement in @($browseSmoke.firstDecodedPreviewMs, $browseSmoke.firstDiscoveryMs)) {
+        if ([double]::IsNaN([double]$measurement) -or [double]::IsInfinity([double]$measurement) -or $measurement -le 0 -or $measurement -gt 10000) {
+            throw 'Browse smoke did not decode its existing/fresh direct thumbnail within 10 seconds of selection.'
+        }
+    }
+    if (@($browseSmoke.stability).Count -ne 2) { throw 'Browse smoke is missing empty/nonempty stability observations.' }
+    foreach ($observation in $browseSmoke.stability) {
+        if ($observation.noiseDirectories -le 1024 -or $observation.noiseFiles -le 1024 -or
+            $observation.rowPublications -ne 0 -or $observation.emptyTransitions -ne 0 -or $observation.monitorGenerationChanges -ne 0 -or
+            $observation.quietWallMs -lt 3000 -or $observation.quietCpuMs -lt 0) {
+            throw 'Filesystem noise reset/flashed the grid or monitoring failed to settle.'
+        }
+    }
+    $result.browseSmokeVerified = $true
+    Write-Output 'OK production browse smoke: real isolated watcher, direct/fresh decoded PNG, nested video count, tree checkbox, cancellation, stable empty/nonempty views, unchanged originals, graceful close.'
     $archive = Join-Path $artifactRoot ($packageName + '.zip')
     Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $archive -CompressionLevel Optimal
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -134,6 +187,7 @@ catch {
 }
 finally {
     if ($null -ne $smokeProcess -and -not $smokeProcess.HasExited) { $smokeProcess.Kill() }
+    if ($null -ne $browseSmokeProcess -and -not $browseSmokeProcess.HasExited) { $browseSmokeProcess.Kill() }
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $results 'harness-summary.json') -Encoding utf8
     if ($transcriptStarted) { Stop-Transcript | Out-Null }
 }

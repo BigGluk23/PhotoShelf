@@ -22,6 +22,7 @@ public partial class MainWindow
     private Task _scanTask = Task.CompletedTask;
     private Task _browseTask = Task.CompletedTask;
     private bool _isProjecting;
+    private bool _projectionPreservesView;
     private bool _projectionQueued;
     private bool _projectionDeferredForScroll;
     private readonly CatalogRefreshBuffer _backgroundRefresh = new();
@@ -132,13 +133,14 @@ public partial class MainWindow
             .ToDictionary(item => item.Path, StringComparer.OrdinalIgnoreCase) : null;
         VirtualPhotoRows? pending = null;
         _isProjecting = true;
+        _projectionPreservesView = preserve;
         _projectionDeferredForScroll = false;
         UpdatePendingRefresh();
         if (!preserve)
         {
             old?.Dispose(); PhotoRows = Array.Empty<PhotoRow>(); OnPropertyChanged(nameof(PhotoRows));
         }
-        EmptyState.Visibility = Visibility.Collapsed;
+        RefreshEmptyState();
         StatusText.Text = "Обновляю вид…";
         CatalogProgressBar.Visibility = Visibility.Visible;
         CatalogProgressBar.IsIndeterminate = true;
@@ -146,6 +148,15 @@ public partial class MainWindow
         {
             await Task.Delay(60, token);
             var groups = await _desktopCatalogStore.QueryGroupsAsync(query, token);
+            // A relevant change can still be outside active search/type filters. Keep
+            // the existing empty surface instead of publishing another empty ItemsSource.
+            if (background && preserve && old is { ItemCount: 0 } && groups.Count == 0)
+            {
+                token.ThrowIfCancellationRequested();
+                _backgroundRefresh.Published(revision);
+                StatusText.Text = $"В виде: 0 · Каталог: {_catalogCount:N0}";
+                return true;
+            }
             var anchorIndex = anchor.Index;
             if (anchor.Path is not null)
                 anchorIndex = await _desktopCatalogStore.IndexOfAsync(query, anchor.Path, token) ?? anchorIndex;
@@ -184,9 +195,9 @@ public partial class MainWindow
             pending?.Dispose();
             if (ReferenceEquals(_projectionCancellation, operation))
             {
-                _projectionCancellation = null; _isProjecting = false;
+                _projectionCancellation = null; _isProjecting = false; _projectionPreservesView = false;
                 CatalogProgressBar.Visibility = _isCatalogLoading ? Visibility.Visible : Visibility.Collapsed;
-                EmptyState.Visibility = !_isCatalogLoading && PhotoRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+                RefreshEmptyState();
                 UpdatePendingRefresh();
             }
         }
@@ -235,7 +246,7 @@ public partial class MainWindow
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!operation.IsCancellationRequested) StatusText.Text = ex.Message; }
-        finally { if (ReferenceEquals(_browseCancellation, operation)) { _browseCancellation = null; CompleteCatalogStage(); } operation.Dispose(); }
+        finally { if (ReferenceEquals(_browseCancellation, operation)) { _browseCancellation = null; CompleteCatalogStage(); RefreshEmptyState(); } operation.Dispose(); }
     }
 
     private async Task IndexScanBatchAsync(PhotoScanBatch batch, CancellationToken token)
@@ -246,7 +257,8 @@ public partial class MainWindow
         {
             if (_lifetime.IsCancellationRequested || _closing) return;
             if (!token.IsCancellationRequested) StatusText.Text = $"Сканирую: {batch.SeenCount:N0} · {batch.CurrentFolder}";
-            NoteCatalogChanged();
+            // ObservePathsAsync already publishes actual committed changes. A scan
+            // progress tick alone must not rebuild an unrelated (possibly empty) view.
         }, DispatcherPriority.Background);
     }
     private static SavedMediaItem? ToSavedItem(string path)

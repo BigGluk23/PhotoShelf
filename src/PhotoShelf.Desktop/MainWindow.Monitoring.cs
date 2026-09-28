@@ -7,6 +7,9 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow
 {
+    internal bool AllowIsolatedLibraryMonitoring { get; set; }
+    private int _monitorCallbacksActive;
+    internal bool LibraryMonitorCallbackActive => Volatile.Read(ref _monitorCallbacksActive) > 0;
     private readonly HashSet<string> _watchedFolders = new(StringComparer.OrdinalIgnoreCase);
     private LibraryChangeCoordinator? _libraryMonitor;
     private LibraryCatalogSynchronizer? _librarySynchronizer;
@@ -24,7 +27,7 @@ public partial class MainWindow
 
     private void QueueLibraryMonitoring()
     {
-        if (LocalCatalogStore.IsIsolatedSmokeCatalog || !_catalogLoaded || _fileOperationActive || _hasPendingRecovery || _closing) return;
+        if (LocalCatalogStore.IsIsolatedSmokeCatalog && !AllowIsolatedLibraryMonitoring || !_catalogLoaded || _fileOperationActive || _hasPendingRecovery || _closing) return;
         var revision = ++_monitorConfigurationRevision;
         _monitorConfigurationTask = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision);
     }
@@ -59,7 +62,7 @@ public partial class MainWindow
             if (_closing || _fileOperationActive || revision != _monitorConfigurationRevision) return;
             var rules = _folderInclusion.Snapshot();
             var browse = _viewMode == LibraryViewMode.Folder ? _activeFolder : null;
-            var libraryRoots = _watchedFolders.Concat(rules.IncludedFolders).Where(rules.MayContainIncluded).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var libraryRoots = LibraryFolderScope.IncludedRoots(_watchedFolders, rules);
             var roots = libraryRoots.ToList();
             if (browse is not null) roots.Add(browse);
             roots = roots.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToList();
@@ -70,20 +73,28 @@ public partial class MainWindow
                 _librarySynchronizer = new(_desktopCatalogStore, PublishLibraryUpdateAsync);
                 _libraryMonitor = new LibraryChangeCoordinator(async (batch, token) =>
                 {
-                    var scope = _monitorScope;
-                    if (scope is not null) await _librarySynchronizer.ProcessAsync(batch, scope.Rules,
-                        scope.BrowseFolder, scope.Recursive, scope.IncludeSystem, token, scope.LibraryRoots);
+                    Interlocked.Increment(ref _monitorCallbacksActive);
+                    try
+                    {
+                        var scope = _monitorScope;
+                        if (scope is not null) await _librarySynchronizer.ProcessAsync(batch, scope.Rules,
+                            scope.BrowseFolder, scope.Recursive, scope.IncludeSystem, token, scope.LibraryRoots);
+                    }
+                    finally { Interlocked.Decrement(ref _monitorCallbacksActive); }
                 });
             }
             if (_monitorConfigurationKey != key)
             {
                 _monitorScope = new(rules, browse, _includeSubfolders, _includeSystemFolders, libraryRoots);
                 _monitorPathFilter ??= path => _monitorScope is { } scope && !PhotoScanner.IsIgnoredPath(path, scope.IncludeSystem) &&
-                    (scope.LibraryRoots.Any(root => LibraryCatalogSynchronizer.IsUnder(path, root)) && scope.Rules.MayContainIncluded(path) || scope.BrowseFolder is not null && LibraryCatalogSynchronizer.IsUnder(path, scope.BrowseFolder));
+                    (scope.LibraryRoots.Any(root => LibraryCatalogSynchronizer.IsUnder(path, root)) && scope.Rules.MayContainIncluded(path) ||
+                     scope.BrowseFolder is not null && LibraryFolderScope.Contains(path, scope.BrowseFolder, scope.Recursive));
                 foreach (var removed in _libraryRootStates.Keys.Except(roots, StringComparer.OrdinalIgnoreCase).ToArray()) _libraryRootStates.Remove(removed);
                 await _libraryMonitor.ConfigureAsync(new(roots,
                     [LocalCatalogStore.CatalogDirectory, LocalCatalogStore.DerivedDataDirectory],
-                    ShouldObservePath: _monitorPathFilter));
+                    ShouldObservePath: _monitorPathFilter, ShouldObserveFilePath: PhotoItem.IsSupported,
+                    NonRecursiveRoots: roots.Where(root => !_includeSubfolders &&
+                        !libraryRoots.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))).ToArray()));
                 if (_monitorRulesKey.Length > 0 && _monitorRulesKey != rulesKey) _libraryMonitor.RequestReconciliation();
                 _monitorRulesKey = rulesKey;
                 _monitorConfigurationKey = key;
@@ -141,10 +152,10 @@ public partial class MainWindow
             if (update.Items.Count > 0)
             {
                 foreach (var viewer in OwnedWindows.OfType<PhotoViewerWindow>()) viewer.CatalogItemsChanged(update.Items, update.Renames);
-                NoteCatalogChanged();
+                if (IsCurrentViewAffected(update)) NoteCatalogChanged();
                 if (_selectedPhoto is { } selected && update.Items.Any(item => item.Path.Equals(selected.Path, StringComparison.OrdinalIgnoreCase))) UpdateInfoPanel();
             }
-            if (update.Completed)
+            if (update.Completed && update.CatalogChanged)
             {
                 CompleteCatalogStage();
                 if (!_fileOperationActive && !_hasPendingRecovery)
@@ -154,11 +165,20 @@ public partial class MainWindow
                 }
             }
         }, DispatcherPriority.Background);
-        if (update.Completed && !_closing)
+        if (update.Completed && update.CatalogChanged && !_closing)
         {
             var count = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }, _lifetime.Token);
             await Dispatcher.InvokeAsync(() => _catalogCount = count, DispatcherPriority.Background);
         }
+    }
+
+    private bool IsCurrentViewAffected(LibraryCatalogUpdate update)
+    {
+        bool IncludesPath(string path) => _viewMode == LibraryViewMode.Folder && _activeFolder is not null
+            ? LibraryFolderScope.Contains(path, _activeFolder, _includeSubfolders)
+            : _folderInclusion.IsIncluded(path);
+        // Include a rename's former location too, so moving out of the view removes its tile.
+        return update.Items.Any(item => IncludesPath(item.Path)) || update.Renames.Any(rename => IncludesPath(rename.Source));
     }
 
     private static string RootAvailabilityText(LibraryRootState state) => state.Availability switch

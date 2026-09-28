@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.7" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.8" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -278,9 +278,10 @@
                             CornerRadius="4">
                         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
                             <TextBlock Text="▦" FontSize="46" Foreground="{StaticResource AccentBrush}" HorizontalAlignment="Center" />
-                            <TextBlock Margin="0,8,0,0" Text="Добавьте папку или запустите поиск фото" FontSize="16" FontWeight="SemiBold" />
-                            <TextBlock Margin="0,5,0,0" Text="Оригиналы останутся на своих местах" Foreground="{StaticResource MutedTextBrush}" HorizontalAlignment="Center" />
-                            <StackPanel Margin="0,16,0,0" Orientation="Horizontal" HorizontalAlignment="Center">
+                            <TextBlock x:Name="EmptyStateTitle" Margin="12,8,12,0" Text="Добавьте папку или запустите поиск фото" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap" TextAlignment="Center" />
+                            <TextBlock x:Name="EmptyStateDescription" Margin="12,5,12,0" Text="Оригиналы останутся на своих местах" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" TextAlignment="Center" HorizontalAlignment="Center" MaxWidth="560" />
+                            <Button x:Name="IncludeSubfoldersEmptyButton" Content="Показать подпапки" Click="OnEmptyIncludeSubfoldersClicked" Visibility="Collapsed" Padding="14,7" Margin="0,16,0,0" HorizontalAlignment="Center" />
+                            <StackPanel x:Name="EmptyStateActions" Margin="0,16,0,0" Orientation="Horizontal" HorizontalAlignment="Center">
                                 <Button Padding="14,7" Content="Добавить папку" Click="OnAddFolderClicked" />
                                 <Button Margin="8,0,0,0" Padding="14,7" Content="Найти все фото" Click="OnDiscoverPhotosClicked" />
                             </StackPanel>

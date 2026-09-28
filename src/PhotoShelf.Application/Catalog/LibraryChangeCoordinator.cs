@@ -2,7 +2,8 @@ namespace PhotoShelf.Application.Catalog;
 
 public sealed record LibraryMonitorConfiguration(IReadOnlyList<string> Roots,
     IReadOnlyList<string>? IgnoredDirectories = null, bool IncludeSubdirectories = true,
-    Func<string, bool>? ShouldObservePath = null);
+    Func<string, bool>? ShouldObservePath = null, Func<string, bool>? ShouldObserveFilePath = null,
+    IReadOnlyList<string>? NonRecursiveRoots = null);
 
 public sealed record LibraryRootState(string Path, FileAvailability Availability, bool IsWatching, string? ErrorCode = null);
 public sealed record LibraryMonitorBatch(long Generation, IReadOnlyList<string> ChangedPaths,
@@ -84,6 +85,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             throw new ArgumentException($"Monitoring supports at most {_options.MaximumRoots} roots; no roots were silently discarded.", nameof(configuration));
         var ignored = (configuration.IgnoredDirectories ?? []).Select(Normalize).Distinct(StringComparer.OrdinalIgnoreCase).Take(_options.MaximumRoots + 1).ToArray();
         if (ignored.Length > _options.MaximumRoots) throw new ArgumentException("Too many ignored directories.", nameof(configuration));
+        var nonRecursive = (configuration.NonRecursiveRoots ?? []).Select(Normalize).Distinct(StringComparer.OrdinalIgnoreCase).Take(_options.MaximumRoots + 1).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (nonRecursive.Count > _options.MaximumRoots) throw new ArgumentException("Too many nonrecursive roots.", nameof(configuration));
+        bool Recurse(string path) => configuration.IncludeSubdirectories && !nonRecursive.Contains(path);
         await _control.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -93,11 +97,10 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             lock (_sync)
             {
                 _generation++;
-                var filtersChanged = _configuration.IncludeSubdirectories != configuration.IncludeSubdirectories
-                    || _configuration.ShouldObservePath != configuration.ShouldObservePath
+                var filtersChanged = _configuration.ShouldObservePath != configuration.ShouldObservePath
+                    || _configuration.ShouldObserveFilePath != configuration.ShouldObserveFilePath
                     || !(_configuration.IgnoredDirectories ?? []).SequenceEqual(ignored, StringComparer.OrdinalIgnoreCase);
-                var recursionChanged = _configuration.IncludeSubdirectories != configuration.IncludeSubdirectories;
-                _configuration = configuration with { Roots = roots, IgnoredDirectories = ignored };
+                _configuration = configuration with { Roots = roots, IgnoredDirectories = ignored, NonRecursiveRoots = nonRecursive.ToArray() };
                 var requested = roots.Where(path => !IsIgnored(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
                 var uncoveredReplacements = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var root in _roots.Values.ToArray())
@@ -107,34 +110,44 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                         if (root.Watcher is not null) retired.Add(root.Watcher);
                         if (root.Watcher is not null || root.RevalidateWhenAvailable || root.RevalidateWhenWatched)
                         {
-                            foreach (var replacement in requested.Where(path => Under(root.Path, path) || Under(path, root.Path)))
+                            foreach (var replacement in requested.Where(path => ScopesOverlap(root.Path, root.IncludeSubdirectories, path, Recurse(path))))
                             {
                                 var overlap = Under(replacement, root.Path) ? replacement : root.Path;
-                                if (!requested.Any(cover => Under(overlap, cover) && _roots.TryGetValue(cover, out var live) && live.Watcher is not null))
+                                var overlapRecursive = root.Path.Equals(replacement, StringComparison.OrdinalIgnoreCase)
+                                    ? root.IncludeSubdirectories && Recurse(replacement)
+                                    : overlap == replacement ? Recurse(replacement) : root.IncludeSubdirectories;
+                                if (!requested.Any(cover => _roots.TryGetValue(cover, out var live) && live.Watcher is not null &&
+                                    live.IncludeSubdirectories == Recurse(cover) &&
+                                    (live.IncludeSubdirectories ? Under(overlap, cover) : !overlapRecursive && overlap.Equals(cover, StringComparison.OrdinalIgnoreCase))))
                                     uncoveredReplacements.Add(replacement);
                             }
                         }
                         // A temporary browse watcher can overlap a retained library scope.
                         // Transfer pending reconciliation intent before retiring its old owner.
                         if (_dirty.Contains(root.Path) || _revalidateContent.Contains(root.Path))
-                            foreach (var replacement in requested.Where(path => Under(root.Path, path) || Under(path, root.Path)))
+                            foreach (var replacement in requested.Where(path => ScopesOverlap(root.Path, root.IncludeSubdirectories, path, Recurse(path))))
                             {
                                 _dirty.Add(replacement);
                                 if (_revalidateContent.Contains(root.Path)) _revalidateContent.Add(replacement);
                             }
                         _roots.Remove(root.Path); _dirty.Remove(root.Path); _revalidateContent.Remove(root.Path);
                     }
-                    else if (recursionChanged && root.Watcher is not null)
+                    else if (root.IncludeSubdirectories != Recurse(root.Path))
                     {
-                        retired.Add(root.Watcher); root.Watcher = null; root.NextProbe = default;
-                        // Replacing a subscription creates a real notification gap, unlike a quiet pause.
-                        root.RevalidateWhenAvailable = true;
-                        root.RevalidateWhenWatched = true;
+                        root.IncludeSubdirectories = Recurse(root.Path);
+                        _dirty.Add(root.Path);
+                        if (root.Watcher is not null)
+                        {
+                            retired.Add(root.Watcher); root.Watcher = null; root.NextProbe = default;
+                            // Replacing a subscription creates a real notification gap, unlike a quiet pause.
+                            root.RevalidateWhenAvailable = true;
+                            root.RevalidateWhenWatched = true;
+                        }
                     }
                 }
                 foreach (var path in requested)
                 {
-                    if (!_roots.ContainsKey(path)) { _roots.Add(path, new Root(path)); _dirty.Add(path); }
+                    if (!_roots.ContainsKey(path)) { _roots.Add(path, new Root(path, Recurse(path))); _dirty.Add(path); }
                     if (uncoveredReplacements.Contains(path))
                     {
                         // Retiring the only covering subscription creates a real notification gap.
@@ -148,9 +161,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 foreach (var path in _paths.Keys.ToArray())
                 {
                     string? owner = _paths[path];
-                    if (!_roots.ContainsKey(owner))
-                        owner = _roots.Keys.FirstOrDefault(root => IsObserved(path, root));
-                    if (owner is null || !IsObserved(path, owner)) _paths.Remove(path);
+                    if (!_roots.ContainsKey(owner) || !IsObservedFile(path, owner))
+                        owner = _roots.Keys.FirstOrDefault(root => IsObservedFile(path, root));
+                    if (owner is null || !IsObservedFile(path, owner)) _paths.Remove(path);
                     else _paths[path] = owner;
                 }
                 _callbackRetryAt = default;
@@ -345,7 +358,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 {
                     try
                     {
-                        root.Watcher = _factory.Watch(root.Path, _configuration.IncludeSubdirectories,
+                        root.Watcher = _factory.Watch(root.Path, root.IncludeSubdirectories,
                             change => OnChange(root, change), _ => OnWatcherError(root));
                         root.Failures = 0; root.NextWatchAttempt = default;
                         lock (_sync)
@@ -401,38 +414,56 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
 
     private void OnChange(Root watchedRoot, LibraryWatchEvent change)
     {
+        var queued = false;
         lock (_sync)
         {
             var root = watchedRoot.Path;
             if (_disposed || !_roots.TryGetValue(root, out var current) || !ReferenceEquals(current, watchedRoot)) return;
-            if (change.RequiresReconciliation && (IsObserved(change.Path, root)
-                || change.OldPath is not null && IsObserved(change.OldPath, root))) _dirty.Add(root);
-            AddPath(change.Path, root);
-            if (change.OldPath is not null) AddPath(change.OldPath, root);
+            if (change.RequiresReconciliation)
+            {
+                if (IsObserved(change.Path, root) || change.OldPath is not null && IsObserved(change.OldPath, root))
+                { _dirty.Add(root); queued = true; }
+            }
+            else
+            {
+                queued = AddPath(change.Path, root);
+                if (change.OldPath is not null) queued |= AddPath(change.OldPath, root);
+            }
         }
-        Wake();
+        if (queued) Wake();
     }
 
-    private void AddPath(string path, string root)
+    private bool AddPath(string path, string root)
     {
         try { path = Normalize(path); }
-        catch (Exception exception) when (exception is ArgumentException or NotSupportedException) { _dirty.Add(root); return; }
-        if (!IsObserved(path, root)) return;
-        if (_paths.ContainsKey(path)) return;
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException) { _dirty.Add(root); return true; }
+        if (!IsObservedFile(path, root)) return false;
+        if (_paths.ContainsKey(path)) return false;
         if (_paths.Count >= _options.MaximumPendingPaths)
         {
             // Recover every overflowed root, rather than silently dropping a path notification.
-            _dirty.Add(root); _revalidateContent.Add(root); return;
+            _dirty.Add(root); _revalidateContent.Add(root); return true;
         }
         if (_paths.Count == 0) _firstChange = DateTime.UtcNow;
         _paths.Add(path, root);
+        return true;
     }
 
     private bool IsObserved(string path, string root)
     {
         if (!Under(path, root) || IsIgnored(path)) return false;
+        if (_roots.TryGetValue(root, out var scope) && !scope.IncludeSubdirectories &&
+            !path.Equals(root, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase)) return false;
         try { return _configuration.ShouldObservePath?.Invoke(path) != false; }
         catch { _dirty.Add(root); return false; }
+    }
+
+    private bool IsObservedFile(string path, string root)
+    {
+        try { if (_configuration.ShouldObserveFilePath?.Invoke(path) == false) return false; }
+        catch { _dirty.Add(root); return false; }
+        return IsObserved(path, root);
     }
 
     private bool IsIgnored(string path)
@@ -463,6 +494,8 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
 
     private static bool Under(string path, string root) => path.Equals(root, StringComparison.OrdinalIgnoreCase)
         || path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    private static bool ScopesOverlap(string first, bool firstRecursive, string second, bool secondRecursive) =>
+        first.Equals(second, StringComparison.OrdinalIgnoreCase) || firstRecursive && Under(second, first) || secondRecursive && Under(first, second);
     private static string Normalize(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
     private void Wake() { try { _wake.Release(); } catch (SemaphoreFullException) { } }
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
@@ -501,9 +534,10 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         public IEnumerable<string> Take(int count) => _order.Take(count);
     }
 
-    private sealed class Root(string path)
+    private sealed class Root(string path, bool includeSubdirectories)
     {
         public string Path { get; } = path;
+        public bool IncludeSubdirectories = includeSubdirectories;
         public IDisposable? Watcher;
         public DateTime NextProbe, NextReconciliation, NextWatchAttempt;
         public int Failures;

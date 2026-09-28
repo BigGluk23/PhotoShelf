@@ -17,6 +17,7 @@ public sealed class StartupCheckArgumentsTests : IDisposable
 
     [Theory]
     [InlineData("--ui-smoke", "--smoke-report", StartupCheckKind.UserInterface)]
+    [InlineData("--ui-browse-smoke", "--smoke-report", StartupCheckKind.UserInterfaceBrowse)]
     [InlineData("--verify-startup-resources", "--startup-report", StartupCheckKind.Resources)]
     public void OnlyKnownModesAcceptANewAbsoluteReport(string mode, string flag, StartupCheckKind kind)
     {
@@ -53,6 +54,8 @@ public sealed class StartupCheckArgumentsTests : IDisposable
             new[] { "--ui-smoke", "--startup-report", path },
             new[] { "--verify-startup-resources", "--smoke-report", path },
             new[] { "--ui-smoke", "--smoke-report", path, "--catalog", _root },
+            new[] { "--ui-browse-smoke", "--startup-report", path },
+            new[] { "--ui-browse-smoke", "--smoke-report", path, "--catalog", _root },
             new[] { "--unknown", "--smoke-report", path }
         })
             Assert.Throws<ArgumentException>(() => StartupCheckArguments.Parse(args));

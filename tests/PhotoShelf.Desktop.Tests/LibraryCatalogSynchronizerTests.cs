@@ -50,6 +50,142 @@ public sealed class LibraryCatalogSynchronizerTests : IDisposable
     }
 
     [Fact]
+    public async Task NonrecursiveBrowseDoesNotProbeExistingFilesInNestedLibraryRoots()
+    {
+        var store = new SqliteDesktopCatalogStore(Path.Combine(_directory, "catalog")); await store.InitializeAsync();
+        var root = Path.Combine(_directory, "browse"); var child = Path.Combine(root, "included-child");
+        Directory.CreateDirectory(child);
+        var nested = Enumerable.Range(0, 600).Select(i => new SavedMediaItem
+        {
+            Path = Path.Combine(child, $"{i:D4}.jpg"), SizeBytes = 42, FileModifiedAt = Modified,
+            Availability = FileAvailability.Available, AvailabilityCheckedAtUtc = Checked, FileIdentity = $"nested-{i}"
+        }).ToArray();
+        await store.UpsertItemsAsync(nested);
+        var probes = new List<string>(); var updates = new List<LibraryCatalogUpdate>();
+        var synchronizer = new LibraryCatalogSynchronizer(store, update => { updates.Add(update); return Task.CompletedTask; },
+            new Probe(path => { probes.Add(path); return Missing(path); }, path => Available(path) with { IsDirectory = true }));
+        await synchronizer.ProcessAsync(new(1, [], [root], []), new FolderInclusionRules([]), root,
+            browseRecursively: false, includeSystem: true, CancellationToken.None, libraryRoots: [child]);
+        Assert.Empty(probes);
+        Assert.False(Assert.Single(updates, update => update.Completed).CatalogChanged);
+        Assert.Equal(600, await store.CountAsync(new() { IncludeSystemFolders = true }));
+        Assert.Equal(FileAvailability.Available, (await store.GetItemAsync(nested[0].Path))!.Availability);
+
+        updates.Clear();
+        await synchronizer.ProcessAsync(new(2, [], [child], []), new FolderInclusionRules([]), root,
+            browseRecursively: false, includeSystem: true, CancellationToken.None, libraryRoots: [child]);
+        Assert.Equal(600, probes.Count);
+        Assert.True(Assert.Single(updates, update => update.Completed).CatalogChanged);
+        Assert.Equal(FileAvailability.Missing, (await store.GetItemAsync(nested[0].Path))!.Availability);
+    }
+
+    [Fact]
+    public async Task RootStateAndUnsupportedEventsCompleteWithoutCatalogChangesOrFileProbes()
+    {
+        var store = await CreateAsync(); var root = Path.GetDirectoryName(Source)!;
+        var before = (await store.GetItemAsync(Source))!; var updates = new List<LibraryCatalogUpdate>();
+        var synchronizer = new LibraryCatalogSynchronizer(store, update => { updates.Add(update); return Task.CompletedTask; },
+            new Probe(_ => throw new InvalidOperationException("No media path needs probing.")));
+        for (var generation = 1; generation <= 3; generation++)
+            await synchronizer.ProcessAsync(new(generation, [Path.Combine(root, "activity.log")], [],
+                [new(root, FileAvailability.AccessDenied, false, "AccessDenied")]), new FolderInclusionRules([]),
+                root, false, true, CancellationToken.None, libraryRoots: [root]);
+        Assert.Equal(3, updates.Count(update => update.Completed));
+        Assert.All(updates, update => { Assert.False(update.CatalogChanged); Assert.Empty(update.Items); });
+        Assert.Equal(before.ObservationVersion, (await store.GetItemAsync(Source))!.ObservationVersion);
+    }
+
+    [Fact]
+    public async Task StableReconciliationDoesNotAdvanceObservationOrReportCatalogChanges()
+    {
+        var store = await CreateAsync(); var root = Path.GetDirectoryName(Source)!;
+        var updates = new List<LibraryCatalogUpdate>();
+        var synchronizer = new LibraryCatalogSynchronizer(store, update => { updates.Add(update); return Task.CompletedTask; },
+            new Probe(path => Available(path), path => Available(path) with { IsDirectory = true }));
+        await synchronizer.ObservePathsAsync([Source], false, CancellationToken.None);
+        var before = (await store.GetItemAsync(Source))!; updates.Clear();
+        for (var generation = 1; generation <= 2; generation++)
+            await synchronizer.ProcessAsync(new(generation, [], [root], []), new FolderInclusionRules([]), root,
+                false, true, CancellationToken.None, libraryRoots: [root]);
+        Assert.Equal(2, updates.Count(update => update.Completed));
+        Assert.All(updates, update => { Assert.False(update.CatalogChanged); Assert.Empty(update.Items); });
+        Assert.Equal(before.ObservationVersion, (await store.GetItemAsync(Source))!.ObservationVersion);
+        Assert.True((await store.GetItemAsync(Source))!.MetadataIndexed);
+    }
+
+    [Fact]
+    public async Task CompletionTracksOnlyItsOwnCommittedWritesWhenAnotherInvocationPublishes()
+    {
+        var store = await CreateAsync(); var root = Path.GetDirectoryName(Source)!;
+        var updates = new List<LibraryCatalogUpdate>();
+        LibraryCatalogSynchronizer? synchronizer = null;
+        synchronizer = new LibraryCatalogSynchronizer(store, async update =>
+        {
+            updates.Add(update);
+            if (update.Items.Count > 0)
+                await synchronizer!.ProcessAsync(new(2, [], [], []), new FolderInclusionRules([]), root,
+                    false, true, CancellationToken.None, libraryRoots: [root]);
+        }, new Probe(path => Missing(path)));
+        await synchronizer.ProcessAsync(new(1, [Source], [], []), new FolderInclusionRules([]), root,
+            false, true, CancellationToken.None, libraryRoots: [root]);
+        Assert.True(Assert.Single(updates, update => update.Items.Count > 0).CatalogChanged);
+        Assert.Equal(new[] { false, true }, updates.Where(update => update.Completed).Select(update => update.CatalogChanged));
+    }
+
+    [Fact]
+    public async Task CancelledNoOpProcessStillCompletesWithoutClaimingCatalogChanges()
+    {
+        var store = await CreateAsync(); var root = Path.GetDirectoryName(Source)!;
+        var before = (await store.GetItemAsync(Source))!; var updates = new List<LibraryCatalogUpdate>();
+        using var cancellation = new CancellationTokenSource();
+        var synchronizer = new LibraryCatalogSynchronizer(store, update =>
+        {
+            updates.Add(update);
+            if (!update.Completed) cancellation.Cancel();
+            return Task.CompletedTask;
+        }, new Probe(_ => throw new InvalidOperationException("No media observation was requested.")));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => synchronizer.ProcessAsync(
+            new(1, [], [], [new(root, FileAvailability.Available, true)]), new FolderInclusionRules([]),
+            root, false, true, cancellation.Token, libraryRoots: [root]));
+        Assert.False(Assert.Single(updates, update => update.Completed).CatalogChanged);
+        Assert.All(updates, update => Assert.Empty(update.Items));
+        Assert.Equal(before.ObservationVersion, (await store.GetItemAsync(Source))!.ObservationVersion);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancelledProcessPublishesCommittedBoundaryEvenBeforeObserverReturns(bool interruptPublication)
+    {
+        var store = await CreateAsync(); var root = Path.GetDirectoryName(Source)!;
+        var updates = new List<LibraryCatalogUpdate>(); using var cancellation = new CancellationTokenSource();
+        var synchronizer = new LibraryCatalogSynchronizer(store, update =>
+        {
+            updates.Add(update);
+            if (update.Items.Count > 0)
+            {
+                cancellation.Cancel();
+                if (interruptPublication) cancellation.Token.ThrowIfCancellationRequested();
+            }
+            return Task.CompletedTask;
+        }, new Probe(path => Missing(path)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => synchronizer.ProcessAsync(
+            new(1, [Source], [], []), new FolderInclusionRules([]), root, false, true,
+            cancellation.Token, libraryRoots: [root]));
+        Assert.Equal(FileAvailability.Missing, (await store.GetItemAsync(Source))!.Availability);
+        Assert.True(Assert.Single(updates, update => update.Items.Count > 0).CatalogChanged);
+        Assert.True(Assert.Single(updates, update => update.Completed).CatalogChanged);
+
+        // The replay sees an equivalent unavailable observation. The original completion
+        // must already have reported the commit; this no-op cannot repair a missing boundary.
+        updates.Clear();
+        await synchronizer.ProcessAsync(new(2, [Source], [], []), new FolderInclusionRules([]),
+            root, false, true, CancellationToken.None, libraryRoots: [root]);
+        Assert.False(Assert.Single(updates, update => update.Completed).CatalogChanged);
+        Assert.All(updates, update => Assert.Empty(update.Items));
+    }
+
+    [Fact]
     public async Task PersistentExcludedAncestorStillDiscoversFilesInExplicitlyIncludedChild()
     {
         var store = new SqliteDesktopCatalogStore(Path.Combine(_directory, "catalog")); await store.InitializeAsync();

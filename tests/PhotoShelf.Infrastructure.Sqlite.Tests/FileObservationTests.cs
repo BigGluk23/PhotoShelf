@@ -215,6 +215,47 @@ public sealed class FileObservationTests : IDisposable
         Assert.Equal(602, seen.Count);
     }
 
+    [Theory]
+    [InlineData(@"D:\Photos")]
+    [InlineData(@"C:\")]
+    public async Task DirectFolderPagesExcludeDescendantsAndEnumerateEachDirectItemOnce(string folder)
+    {
+        var store = new SqliteDesktopCatalogStore(_root); await store.InitializeAsync();
+        var prefix = folder.TrimEnd('\\') + "\\";
+        var direct = Enumerable.Range(0, 261).Select(i => Observed($"{prefix}direct-{i:D4}.jpg", $"direct-{i}")).ToArray();
+        await store.UpsertItemsAsync(direct);
+        await store.UpsertItemsAsync(Enumerable.Range(0, 600).Select(i => Observed($"{prefix}nested\\{i:D4}.jpg", $"nested-{i}")));
+        await store.UpsertItemsAsync([Observed(folder.TrimEnd('\\') + "-neighbor\\safe.jpg")]);
+        var seen = new HashSet<string>(); var sizes = new List<int>(); string? after = null;
+        while (true)
+        {
+            var page = await store.QuerySubtreePageAsync(folder, after, 127, includeSubdirectories: false);
+            if (page.Count == 0) break;
+            sizes.Add(page.Count);
+            foreach (var item in page) Assert.True(seen.Add(item.Path));
+            after = page[^1].Path;
+        }
+        Assert.Equal(new[] { 127, 127, 7 }, sizes);
+        Assert.Equal(direct.Select(item => item.Path).Order(), seen.Order());
+        Assert.Empty(await store.QuerySubtreePageAsync(prefix + "nested\\empty", includeSubdirectories: false));
+
+        // The direct-folder/keyset predicate must seek within its folder, without scanning
+        // the global path index or sorting an entire folder again for every small page.
+        await using var connection = new SqliteConnection($"Data Source={Path.Combine(_root, "catalog-v2.sqlite")}");
+        await connection.OpenAsync(); await using var command = connection.CreateCommand();
+        command.CommandText = """
+            EXPLAIN QUERY PLAN SELECT * FROM desktop_media_items
+            WHERE is_quarantined=0 AND folder_key=$folder AND path_key>$after
+            ORDER BY path_key LIMIT 127;
+            """;
+        command.Parameters.AddWithValue("$folder", folder.Replace('\\', '/').TrimEnd('/').ToUpperInvariant());
+        command.Parameters.AddWithValue("$after", direct[126].Path.Replace('\\', '/').ToUpperInvariant());
+        var plan = new List<string>(); await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) plan.Add(reader.GetString(3));
+        Assert.Contains(plan, detail => detail.Contains("SEARCH", StringComparison.Ordinal) && detail.Contains("ix_desktop_folder_path", StringComparison.Ordinal));
+        Assert.DoesNotContain(plan, detail => detail.Contains("SCAN ", StringComparison.Ordinal) || detail.Contains("TEMP B-TREE", StringComparison.Ordinal));
+    }
+
     [Fact] public async Task BatchIsAtomicOnInvalidObservationAndPreservesOrdering()
     {
         var store = await CreateAsync(); var before = (await store.GetItemAsync(Original))!;
