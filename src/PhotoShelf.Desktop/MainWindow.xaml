@@ -19,7 +19,7 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="48" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="46" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <Border Grid.Row="0" Background="#FFFAFAF8" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.6" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.7" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -309,28 +309,37 @@
 
         <Border Grid.Row="2" Background="{StaticResource PanelDarkBrush}">
             <Grid Margin="10,4">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="360" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="560" />
-                </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                    <StackPanel Width="210" VerticalAlignment="Center">
-                        <TextBlock x:Name="StatusText" Text="0 фотографий" Foreground="#FFDEDEDE" TextTrimming="CharacterEllipsis" />
-                        <TextBlock x:Name="LibraryStatusText" Text="Автообновление: подготовка" FontSize="10" Foreground="#FFBFC5CC" TextTrimming="CharacterEllipsis" />
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid Margin="0,0,0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Margin="0,0,12,0" VerticalAlignment="Center">
+                        <TextBlock x:Name="StatusText" Text="0 фотографий" Foreground="#FFDEDEDE" TextTrimming="CharacterEllipsis"
+                                   ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                        <TextBlock x:Name="LibraryStatusText" Text="Автообновление: подготовка" FontSize="10" Foreground="#FFBFC5CC" TextTrimming="CharacterEllipsis"
+                                   ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
                     </StackPanel>
-                    <TextBlock x:Name="MetadataStatusText" Text="Метаданные: ждут" Width="130" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                    <ProgressBar x:Name="CatalogProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
-                    <ProgressBar x:Name="DuplicateProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
-                    <Button x:Name="CancelDuplicatesButton" Margin="8,0,0,0" Padding="7,2" Content="×" ToolTip="Остановить проверку дублей" Click="OnCancelDuplicatesClicked" Visibility="Collapsed" />
-                </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                    <TextBlock x:Name="MetadataStatusText" Grid.Column="1" Text="Метаданные: ждут" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                               ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                    <ProgressBar x:Name="CatalogProgressBar" Grid.Column="2" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
+                    <ProgressBar x:Name="DuplicateProgressBar" Grid.Column="3" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
+                    <Button x:Name="CancelDuplicatesButton" Grid.Column="4" Margin="8,0,0,0" Padding="7,2" Content="×" ToolTip="Остановить проверку дублей" Click="OnCancelDuplicatesClicked" Visibility="Collapsed" />
+                    <TextBlock x:Name="SelectedText" Grid.Column="5" Text="" MaxWidth="220" TextTrimming="CharacterEllipsis" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="12,0,0,0"
+                               ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                </Grid>
+                <WrapPanel Grid.Row="1" VerticalAlignment="Center">
                     <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="★  Избранное" Click="OnFavoriteActionClicked" />
                     <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="▣  Папка" Click="OnOpenFolderClicked" />
-                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="↻  Метаданные" Click="OnReindexMetadataClicked" ToolTip="Переиндексировать дату съёмки и базовые метаданные" />
-                </StackPanel>
-                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-                    <TextBlock x:Name="SelectedText" Text="" Width="140" TextTrimming="CharacterEllipsis" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="0,0,12,0" />
+                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="↻  Метаданные" Click="OnReindexMetadataClicked" ToolTip="Переиндексировать дату съёмки и базовые метаданные" Margin="0,0,14,0" />
                     <CheckBox x:Name="ShowInfoCheckBox"
                               Content="Сведения"
                               Foreground="#FFDEDEDE"
@@ -353,16 +362,18 @@
                               Margin="0,0,14,0"
                               Checked="OnIncludeSystemFoldersChanged"
                               Unchecked="OnIncludeSystemFoldersChanged" />
-                    <TextBlock Text="Размер" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="0,0,8,0" />
-                    <Slider x:Name="ThumbnailSizeSlider"
-                            Width="150"
-                            Minimum="72"
-                            Maximum="260"
-                            Value="178"
-                            TickFrequency="10"
-                            IsSnapToTickEnabled="False"
-                            ValueChanged="OnThumbnailSizeChanged" />
-                </StackPanel>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="Размер" Foreground="#FFDEDEDE" VerticalAlignment="Center" Margin="0,0,8,0" />
+                        <Slider x:Name="ThumbnailSizeSlider"
+                                Width="150"
+                                Minimum="72"
+                                Maximum="260"
+                                Value="178"
+                                TickFrequency="10"
+                                IsSnapToTickEnabled="False"
+                                ValueChanged="OnThumbnailSizeChanged" />
+                    </StackPanel>
+                </WrapPanel>
             </Grid>
         </Border>
     </Grid>

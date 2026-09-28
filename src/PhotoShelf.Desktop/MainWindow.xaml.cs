@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.6";
+    private const string VersionLabel = "Ultra v0.10.7";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
