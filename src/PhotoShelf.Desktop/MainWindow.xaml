@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.3" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.4" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -104,7 +104,7 @@
                                                    Foreground="#FFB9B5AE"
                                                    Margin="0,0,4,0"
                                                    VerticalAlignment="Center" />
-                                        <CheckBox IsChecked="{Binding IsIncluded, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Click="OnFolderIncludedChanged" VerticalAlignment="Center" />
+                                        <CheckBox IsChecked="{Binding CheckState, Mode=OneWay}" IsThreeState="True" Click="OnFolderIncludedChanged" VerticalAlignment="Center" ToolTip="Включить папку в библиотеку и сканирование. Промежуточная отметка: включена часть папки." />
                                         <TextBlock Text="{Binding DisplayText}" Margin="4,0,0,0" VerticalAlignment="Center" />
                                     </StackPanel>
                                 </HierarchicalDataTemplate>

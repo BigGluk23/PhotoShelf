@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.20)
+cmake_policy(SET CMP0091 NEW)
+project(PhotoShelfHeifWorker LANGUAGES CXX)
+
+# Keep LGPL libraries dynamically replaceable. Only the C/C++ runtime is static.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+find_package(libheif 1.23.5 CONFIG REQUIRED)
+find_package(libde265 1.1.3 CONFIG REQUIRED)
+add_executable(PhotoShelf.HeifWorker main.cpp)
+target_compile_features(PhotoShelf.HeifWorker PRIVATE cxx_std_20)
+target_link_libraries(PhotoShelf.HeifWorker PRIVATE heif de265)
+if(MSVC)
+  target_compile_options(PhotoShelf.HeifWorker PRIVATE /W4 /WX /utf-8 /guard:cf)
+  target_link_options(PhotoShelf.HeifWorker PRIVATE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /guard:cf)
+else()
+  target_compile_options(PhotoShelf.HeifWorker PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+install(TARGETS PhotoShelf.HeifWorker RUNTIME DESTINATION .)

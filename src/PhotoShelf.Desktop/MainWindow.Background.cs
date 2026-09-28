@@ -10,7 +10,8 @@ namespace PhotoShelf.Desktop;
 public partial class MainWindow
 {
     private readonly CancellationTokenSource _lifetime = new();
-    private readonly HashSet<string> _excludedFolders = new(StringComparer.OrdinalIgnoreCase);
+    private FolderInclusionRules _folderInclusion = new([]);
+    private readonly HashSet<string> _pendingFolderScans = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _saveGate = new(1, 1);
     private CancellationTokenSource? _projectionCancellation;
     private CancellationTokenSource? _rangeSelectionCancellation;
@@ -46,7 +47,8 @@ public partial class MainWindow
         MissingCaptureDateOnly = _showOnlyMissingCaptureDate,
         UseCaptureDate = _dateGroupingMode == DateGroupingMode.CaptureDate,
         NewestFirst = _sortNewestFirst, SearchText = _searchText,
-        ExcludedFolders = _viewMode == LibraryViewMode.Folder ? Array.Empty<string>() : _excludedFolders.ToArray()
+        ExcludedFolders = _viewMode == LibraryViewMode.Folder ? Array.Empty<string>() : _folderInclusion.ExcludedFolders,
+        IncludedFolders = _viewMode == LibraryViewMode.Folder ? Array.Empty<string>() : _folderInclusion.IncludedFolders
     };
 
     private void NoteCatalogChanged()
@@ -302,7 +304,8 @@ public partial class MainWindow
         DateGroupingMode = _dateGroupingMode.ToString(), ActiveFolder = _activeFolder, ViewMode = _viewMode.ToString(),
         SortNewestFirst = _sortNewestFirst, IncludeSubfolders = _includeSubfolders,
         ExpandedFolders = _folderNodes.Values.Where(x => x.IsExpanded).Select(x => x.FullPath).ToList(),
-        ExcludedFolders = _excludedFolders.ToList()
+        ExcludedFolders = _folderInclusion.ExcludedFolders.ToList(),
+        IncludedFolders = _folderInclusion.IncludedFolders.ToList()
     };
     private async Task SaveAfterDelayAsync(CancellationToken token)
     {

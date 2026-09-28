@@ -1,4 +1,5 @@
 using PhotoShelf.Application.Metadata;
+using PhotoShelf.Application.Media;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
@@ -168,6 +169,8 @@ public sealed class PhotoItem : INotifyPropertyChanged
         text.AppendLine(FileName);
         text.AppendLine();
         text.AppendLine($"Тип: {MediaTypeLabel}");
+        if (System.IO.Path.GetExtension(Path).ToLowerInvariant() is ".heic" or ".heif" or ".hif")
+            text.AppendLine("HEIC/HEIF: основной снимок в SDR. HDR и правки AAE пока не воспроизводятся.");
         text.AppendLine($"Размер файла: {FileSizeBytes / 1024d / 1024d:0.0} MB");
         if (FileModifiedAt is not null)
         {
@@ -194,9 +197,11 @@ public sealed class PhotoItem : INotifyPropertyChanged
             return text.ToString();
         }
 
+        var isHeif = System.IO.Path.GetExtension(Path).ToLowerInvariant() is ".heic" or ".heif" or ".hif";
         try
         {
             using var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            isHeif |= HeifDecoderClient.HasHeifSignature(stream);
             var directories = ImageMetadataReader.ReadMetadata(stream, Path);
             foreach (var directory in directories)
             {
@@ -217,6 +222,12 @@ public sealed class PhotoItem : INotifyPropertyChanged
             return text.ToString();
         }
         catch { /* A WIC metadata reader remains a fallback for legacy formats. */ }
+
+        if (isHeif)
+        {
+            text.AppendLine("Метаданные HEIC/HEIF повреждены или недоступны для чтения.");
+            return text.ToString();
+        }
 
         try
         {

@@ -1,6 +1,6 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.3** (`0.10.3-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.4** (`0.10.4-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
 
 ## Задача и история
@@ -10,7 +10,7 @@
 Читайте:
 
 1. `README.md` — возможности и команды.
-2. `docs/v0.10.3-review-fixes.md` — исправления F01–F07, текущие проверки и ограничения; `docs/v0.10.2-validation.md` — предыдущий выпуск.
+2. `docs/v0.10.4-folders-heif.md` — текущие изменения; `docs/v0.10.3-review-fixes.md` — исправления F01–F07; `docs/v0.10.2-validation.md` — предыдущий выпуск.
 3. `docs/github-integration.md` — объединение локальной версии и upstream.
 4. `src/PhotoShelf.Application/Files/SAFETY.md` — обязательный протокол переноса.
 5. `src/PhotoShelf.Infrastructure.Sqlite/CATALOG.md` — реальный каталог/запросы.
@@ -35,6 +35,10 @@
 
 ## Проверки
 
+v0.10.4: `FolderInclusionRules` хранит включения и исключения, самое вложенное правило побеждает. Родительская галка имеет промежуточное состояние; просмотр папки не меняет правила. `IncludedFolders` добавлены в desktop_settings без сброса каталога.
+
+HEIC/HEIF декодирует встроенный helper libheif 1.23.5/libde265 1.1.3. Один worker, timeout 15 s, Windows Job 1 GiB; parent держит исходник Read/FileShare.Read до фактического завершения. Не убирать Job, лимиты/lock и не добавлять fallback на WIC для HEIC. Это отдельный процесс, не OS sandbox. `tools/build-heif-codec.ps1` запускается Windows harness до .NET build. DLL, helper, LGPL sources/licenses должны попасть в `codecs/heif` рядом с EXE.
+
 ```bash
 ./tools/harness.sh
 ```
@@ -56,7 +60,7 @@ Lock-профили разделены: обычные build/test использ
 ## Оставшиеся ограничения
 
 - Нет сопоставимого измерения задержки UI старой и новой версии на Windows. Исторические 21×/24× — только улучшение SQL-индексов внутри новой реализации.
-- HEIC/HEIF/RAW decoding и Live Photo resolver по content ID ещё не реализованы; неоднозначные companions блокируются.
+- RAW/ProRAW decoding и Live Photo resolver по content ID ещё не реализованы; HEIC читает основной снимок в SDR, AAE/HDR gain map/ICC-only цветопрофили полностью не воспроизводятся; неоднозначные companions блокируются.
 - Reparse/symlink и межтомовый перенос ADS/EFS блокируются. NTFS/FAT/exFAT/USB и физические сбои требуют отдельной матрицы испытаний.
 - Старые журналы v0.9.7 требуют ручного разбора. Не удалять `.photoshelf-*`/журналы как кэш и не восстанавливать файлы подменой старой базы.
 - Видео использует WPF MediaElement и системные декодеры. Крупные GIF/WebP могут показывать первый кадр с пояснением.

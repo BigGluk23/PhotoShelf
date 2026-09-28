@@ -15,6 +15,7 @@ public sealed record CatalogViewQuery
     public bool NewestFirst { get; init; } = true;
     public string SearchText { get; init; } = "";
     public IReadOnlyList<string> ExcludedFolders { get; init; } = Array.Empty<string>();
+    public IReadOnlyList<string> IncludedFolders { get; init; } = Array.Empty<string>();
     public int PageSize { get; init; } = 256;
     public int Offset { get; init; }
     public string? Cursor { get; init; }

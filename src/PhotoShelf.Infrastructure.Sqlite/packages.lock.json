@@ -60,7 +60,7 @@
       "photoshelf.application": {
         "type": "Project",
         "dependencies": {
-          "PhotoShelf.Domain": "[0.10.3-ultra, )"
+          "PhotoShelf.Domain": "[0.10.4-ultra, )"
         }
       },
       "photoshelf.domain": {

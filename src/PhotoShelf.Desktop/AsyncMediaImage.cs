@@ -241,7 +241,7 @@ public static class AsyncMediaImage
             }
             else
             {
-                var bitmap = width <= 512 ? ThumbnailCache.LoadOrCreate(path, width, static (p, w) => LoadStill(p, w)) as BitmapSource : LoadStill(path, width);
+                var bitmap = width <= 512 ? ThumbnailCache.LoadOrCreate(path, width, (p, w) => MediaBitmapLoader.LoadStillBounded(p, w, token)) as BitmapSource : MediaBitmapLoader.LoadStillBounded(path, width, token);
                 if (bitmap is not null) frames.Add(new(bitmap, 100));
             }
             token.ThrowIfCancellationRequested();
@@ -251,5 +251,4 @@ public static class AsyncMediaImage
         }
         catch { reservation.Dispose(); throw; }
     }
-    private static BitmapSource LoadStill(string path, int width) => MediaBitmapLoader.LoadWicBounded(path, width);
 }

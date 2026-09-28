@@ -27,5 +27,12 @@
     <Resource Include="Assets\PhotoShelf.ico" />
     <Resource Include="Assets\giraffe-icon.png" />
     <None Include="Assets\giraffe-icon-source.png" />
+    <EmbeddedResource Include="..\..\tests\Fixtures\Heif\quadrants.heic" LogicalName="PhotoShelf.SyntheticHeif.heic" />
+    <None Include="..\..\artifacts\heif-codec\win-x64\**\*" Link="codecs\heif\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
+  <Target Name="RequireBundledHeifDecoder" BeforeTargets="PrepareForBuild"
+          Condition="('$(OS)' == 'Windows_NT' or '$(PhotoShelfPublish)' == 'true') and (!Exists('$(MSBuildProjectDirectory)/../../artifacts/heif-codec/win-x64/PhotoShelf.HeifWorker.exe') or !Exists('$(MSBuildProjectDirectory)/../../artifacts/heif-codec/win-x64/heif.dll') or !Exists('$(MSBuildProjectDirectory)/../../artifacts/heif-codec/win-x64/libde265.dll'))">
+    <Error Text="Build the bundled HEIF decoder first: pwsh tools/build-heif-codec.ps1" />
+  </Target>
 </Project>

@@ -25,7 +25,7 @@ public sealed partial class SqliteDesktopCatalogStore
         async Task<(long Ticks, string Key)?> EndpointAsync(string path)
         {
             await using var command = connection.CreateCommand(); command.Transaction = transaction;
-            command.CommandText = $"SELECT {date},path_key FROM {BuildFrom(query, command)} WHERE {BuildGroupFilter(query, command)} AND path_key=$endpoint;";
+            command.CommandText = $"SELECT {date},path_key FROM {BuildFrom(query, command, token)} WHERE {BuildGroupFilter(query, command)} AND path_key=$endpoint;";
             command.Parameters.AddWithValue("$endpoint", NormalizePathKey(path));
             await using var reader = await command.ExecuteReaderAsync(token);
             return await reader.ReadAsync(token) ? (reader.GetInt64(0), reader.GetString(1)) : null;
@@ -50,7 +50,7 @@ public sealed partial class SqliteDesktopCatalogStore
             if (comparison > 0 || reverseTie)
                 (first, last) = (last, first);
             await using var command = connection.CreateCommand(); command.Transaction = transaction;
-            var where = BuildGroupFilter(query, command); var from = BuildFrom(query, command);
+            var where = BuildGroupFilter(query, command); var from = BuildFrom(query, command, token);
             command.CommandText = $"""
                 SELECT {ItemColumns} FROM {from} WHERE {where}
                 AND ({date} {(query.NewestFirst ? "<" : ">")} $firstTicks OR ({date}=$firstTicks AND path_key>=$firstKey))
@@ -77,7 +77,7 @@ public sealed partial class SqliteDesktopCatalogStore
         await using var connection=await OpenAsync(token);
         using var interrupt=token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
         await using var command=connection.CreateCommand();
-        var from=BuildFrom(query,command); var where=BuildGroupFilter(query,command);
+        var from=BuildFrom(query,command,token); var where=BuildGroupFilter(query,command);
         var date=SortExpression(query);
         if(query.Cursor is not null)
         {
@@ -113,7 +113,7 @@ public sealed partial class SqliteDesktopCatalogStore
         await using var connection=await OpenAsync(token);
         using var interrupt=token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
         await using var command=connection.CreateCommand();
-        command.CommandText=$"SELECT COUNT(*) FROM {BuildFrom(query,command)} WHERE {BuildGroupFilter(query,command)};";
+        command.CommandText=$"SELECT COUNT(*) FROM {BuildFrom(query,command,token)} WHERE {BuildGroupFilter(query,command)};";
         try {return Convert.ToInt64(await command.ExecuteScalarAsync(token));}
         catch(SqliteException) when(token.IsCancellationRequested) {throw new OperationCanceledException(token);}
     },token);
@@ -124,7 +124,7 @@ public sealed partial class SqliteDesktopCatalogStore
         using var interrupt=token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
         await using var command=connection.CreateCommand();
         var month=query.UseCaptureDate ? "capture_month" : "file_month";
-        command.CommandText=$"SELECT {month},COUNT(*) FROM {BuildFrom(query,command)} WHERE {BuildGroupFilter(query,command)} GROUP BY {month} ORDER BY {month} {(query.NewestFirst ? "DESC" : "ASC")};";
+        command.CommandText=$"SELECT {month},COUNT(*) FROM {BuildFrom(query,command,token)} WHERE {BuildGroupFilter(query,command)} GROUP BY {month} ORDER BY {month} {(query.NewestFirst ? "DESC" : "ASC")};";
         var result=new List<CatalogDateGroup>();
         try
         {
@@ -164,13 +164,13 @@ public sealed partial class SqliteDesktopCatalogStore
             await using(var target=connection.CreateCommand())
             {
                 target.Transaction=transaction;
-                target.CommandText=$"SELECT {SortExpression(query)} FROM {BuildFrom(query,target)} WHERE {BuildGroupFilter(query,target)} AND path_key=$target;";
+                target.CommandText=$"SELECT {SortExpression(query)} FROM {BuildFrom(query,target,token)} WHERE {BuildGroupFilter(query,target)} AND path_key=$target;";
                 target.Parameters.AddWithValue("$target",NormalizePathKey(path));var value=await target.ExecuteScalarAsync(token);
                 if(value is null)return null;ticks=Convert.ToInt64(value);
             }
             await using var command=connection.CreateCommand();command.Transaction=transaction;
             var date=SortExpression(query);
-            command.CommandText=$"SELECT COUNT(*) FROM {BuildFrom(query,command)} WHERE {BuildGroupFilter(query,command)} AND ({date} {(query.NewestFirst ? ">" : "<")} $ticks OR ({date}=$ticks AND path_key<$target));";
+            command.CommandText=$"SELECT COUNT(*) FROM {BuildFrom(query,command,token)} WHERE {BuildGroupFilter(query,command)} AND ({date} {(query.NewestFirst ? ">" : "<")} $ticks OR ({date}=$ticks AND path_key<$target));";
             command.Parameters.AddWithValue("$ticks",ticks);command.Parameters.AddWithValue("$target",NormalizePathKey(path));
             return Convert.ToInt64(await command.ExecuteScalarAsync(token));
         }
@@ -209,7 +209,7 @@ public sealed partial class SqliteDesktopCatalogStore
         return result;
     },token);
 
-    private static string BuildFrom(CatalogViewQuery query,SqliteCommand command)
+    private static string BuildFrom(CatalogViewQuery query,SqliteCommand command, CancellationToken token = default)
     {
         var where=new List<string>{"is_quarantined=0"};
         if(query.MetadataDueAtUtc is { } due)
@@ -236,17 +236,46 @@ public sealed partial class SqliteDesktopCatalogStore
             }
             else {where.Add("folder_key=$folder");command.Parameters.AddWithValue("$folder",folder);}
         }
+        var source = "desktop_media_items";
         // Explorer folder views intentionally show that folder even when not included in the library.
-        if(query.ViewMode!="Folder")
+        if(query.ViewMode!="Folder" && query.ExcludedFolders.Count>0)
         {
-            for(var i=0;i<query.ExcludedFolders.Count;i++)
+            var ranges = FolderRuleIntervals.Compile(query.IncludedFolders, query.ExcludedFolders, token);
+            if (ranges.Bounded.Count <= 8)
             {
-                var folder=NormalizePathKey(query.ExcludedFolders[i]);
-                where.Add($"NOT(path_key>=$excludedStart{i} AND path_key<$excludedEnd{i})");
-                command.Parameters.AddWithValue($"$excludedStart{i}",folder+"/");command.Parameters.AddWithValue($"$excludedEnd{i}",folder+"0");
+                // A short predicate preserves date/keyset index access for the usual one-folder
+                // selection. The cap applies AFTER merging rules, so expression depth is bounded.
+                var alternatives = new List<string> { "path_key>=$folderTail" };
+                command.Parameters.AddWithValue("$folderTail", ranges.Tail);
+                for (var index = 0; index < ranges.Bounded.Count; index++)
+                {
+                    alternatives.Add($"(path_key>=$folderStart{index} AND path_key<$folderEnd{index})");
+                    command.Parameters.AddWithValue($"$folderStart{index}", ranges.Bounded[index][0]);
+                    command.Parameters.AddWithValue($"$folderEnd{index}", ranges.Bounded[index][1]);
+                }
+                where.Add("(" + string.Join(" OR ", alternatives) + ")");
+            }
+            else
+            {
+                // The separate covering path-key lookup prevents SQLite from choosing a status/date
+                // index and scanning the entire library for EACH rule. CROSS JOIN fixes loop order:
+                // JSON intervals -> indexed path range -> rowid lookup. Intervals never overlap.
+                source = """
+                    (SELECT media.* FROM json_each($folderRanges) AS ranges
+                        CROSS JOIN desktop_media_items AS paths
+                        CROSS JOIN desktop_media_items AS media ON media.rowid=paths.rowid
+                        WHERE paths.path_key>=json_extract(ranges.value,'$[0]')
+                          AND paths.path_key<json_extract(ranges.value,'$[1]')
+                     UNION ALL
+                     SELECT media.* FROM desktop_media_items AS paths
+                        CROSS JOIN desktop_media_items AS media ON media.rowid=paths.rowid
+                        WHERE paths.path_key>=$folderTail)
+                    """;
+                command.Parameters.AddWithValue("$folderRanges", JsonSerializer.Serialize(ranges.Bounded));
+                command.Parameters.AddWithValue("$folderTail", ranges.Tail);
             }
         }
-        var filtered=$"(SELECT * FROM desktop_media_items WHERE {string.Join(" AND ",where)}";
+        var filtered=$"(SELECT * FROM {source} WHERE {string.Join(" AND ",where)}";
         if(query.ViewMode=="Recent")filtered+=" ORDER BY file_modified_utc_ticks DESC,path_key ASC LIMIT 500";
         return filtered+") AS items";
     }

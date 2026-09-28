@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.3";
+    private const string VersionLabel = "Ultra v0.10.4";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -68,7 +68,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _viewMode = Enum.TryParse<LibraryViewMode>(_catalogState.ViewMode, out var view) ? view : LibraryViewMode.All;
         _includeSubfolders = _catalogState.IncludeSubfolders;
         SubfoldersCheckBox.IsChecked = _includeSubfolders;
-        foreach (var folder in _catalogState.ExcludedFolders) _excludedFolders.Add(NormalizePath(folder));
+        _folderInclusion = new(_catalogState.ExcludedFolders, _catalogState.IncludedFolders);
         DateModeBox.SelectedIndex = _dateGroupingMode == DateGroupingMode.CaptureDate ? 0 : 1;
         RefreshDateSortButton();
         FolderTree.ItemsSource = FolderRoots;
@@ -353,12 +353,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void OnFolderIncludedChanged(object sender, RoutedEventArgs e)
     {
         if (_isInitializing || sender is not System.Windows.Controls.CheckBox { DataContext: FolderNode node } || node.IsPlaceholder) return;
+        if (_fileOperationActive || _closing) { node.ApplyInclusion(_folderInclusion); return; }
         _scanCancellation?.Cancel();
-        _excludedFolders.RemoveWhere(x => IsUnderFolder(x, node.FullPath));
-        if (node.IsIncluded) _excludedFolders.RemoveWhere(x => IsUnderFolder(node.FullPath, x));
-        else _excludedFolders.Add(node.FullPath);
+        _metadataIndexCancellation?.Cancel();
+        _maintenanceCancellation?.Cancel();
+        var included = node.ToggleInclusion(_folderInclusion);
+        _pendingFolderScans.RemoveWhere(path => !_folderInclusion.MayContainIncluded(path));
+        if (included) _pendingFolderScans.Add(node.FullPath);
         _ = RefreshFolderChecksAsync();
-        if (node.IsIncluded) _ = ScanRootsAsync(new[] { node.FullPath }, changeView: false);
         QueueFolderFilterRefresh();
         e.Handled = true;
     }
@@ -368,21 +370,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         var revision = ++_folderCheckRevision;
         var nodes = _folderNodes.Values.ToArray();
-        var excluded = _excludedFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var rules = _folderInclusion.Snapshot();
         var included = await Task.Run(() => nodes.Select(node =>
-        {
-            string? current = node.FullPath;
-            while (!string.IsNullOrEmpty(current))
-            {
-                if (excluded.Contains(NormalizePath(current))) return false;
-                current = Path.GetDirectoryName(current.TrimEnd(Path.DirectorySeparatorChar));
-            }
-            return true;
-        }).ToArray());
+            (Included: rules.IsIncluded(node.FullPath), State: rules.GetCheckState(node.FullPath))).ToArray());
         for (var index = 0; index < nodes.Length; index++)
         {
             if (revision != _folderCheckRevision || _lifetime.IsCancellationRequested) return;
-            nodes[index].IsIncluded = included[index];
+            nodes[index].ApplyInclusion(included[index].Included, included[index].State);
             if (index % 64 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
         }
     }
@@ -400,6 +394,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         RebuildRows();
         RefreshChrome();
         SaveCatalogState();
+        StartMetadataIndexing(false);
+        if (_pendingFolderScans.Count > 0) _ = ScanCheckedFoldersAsync(_folderCheckRevision);
+    }
+
+    private async Task ScanCheckedFoldersAsync(int revision)
+    {
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return;
+        // Keep interrupted checkbox scans in the set until their complete revision finishes.
+        // A second check must not cancel and forget the first selected subtree.
+        var roots = _pendingFolderScans.ToArray();
+        await ScanRootsAsync(roots, changeView: false);
+        if (revision == _folderCheckRevision) _pendingFolderScans.ExceptWith(roots);
     }
 
     private void OnShowInfoChanged(object sender, RoutedEventArgs e)
@@ -603,7 +609,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             SetScanning(true);
             foreach (var root in roots) AddFolder(root);
             if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
-            await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token, _excludedFolders.ToArray());
+            await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token,
+                inclusion: _folderInclusion.Snapshot());
             await RefreshCatalogCountAsync(); SaveCatalogState(); StartMetadataIndexing(false);
         }
         catch (OperationCanceledException) { }
@@ -783,7 +790,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return node;
         }
 
-        node = new FolderNode(normalized) { IsIncluded = !_excludedFolders.Contains(normalized) && (parent?.IsIncluded ?? true) };
+        node = new FolderNode(normalized, parent);
+        node.ApplyInclusion(_folderInclusion);
         node.Children.Add(FolderNode.Placeholder());
         node.IsExpanded = _catalogState.ExpandedFolders.Contains(normalized, StringComparer.OrdinalIgnoreCase);
         _folderNodes.Add(normalized, node);
@@ -875,8 +883,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
 
 
-    private bool IsFolderIncluded(string folder) => !_excludedFolders.Any(excluded => IsUnderFolder(folder, excluded));
-
     private bool IsVisibleByType(PhotoItem item)
     {
         return ShowVideos || !item.IsVideo;
@@ -949,10 +955,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             await previous;
             var token = operation.Token; token.ThrowIfCancellationRequested();
             MetadataStatusText.Text = "Индексирую метаданные…";
+            var rules = _folderInclusion.Snapshot();
             await Task.Run(async () =>
             {
                 if (resetExisting) await _desktopCatalogStore.ResetMetadataIndexAsync(token);
-                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true, MetadataDueAtUtc = DateTime.UtcNow }, token))
+                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true, MetadataDueAtUtc = DateTime.UtcNow,
+                    ExcludedFolders = rules.ExcludedFolders, IncludedFolders = rules.IncludedFolders }, token))
                 {
                     var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
                         _ => ToSavedItem(item.Path), token);
@@ -1081,7 +1089,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             await previous;
             var token = operation.Token;
             var changed = new List<SavedMediaItem>(128);
-            await foreach (var old in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true }, token))
+            var rules = _folderInclusion.Snapshot();
+            await foreach (var old in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true,
+                ExcludedFolders = rules.ExcludedFolders, IncludedFolders = rules.IncludedFolders }, token))
             {
                 var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ => ToSavedItem(old.Path), token);
                 if (fresh is not null && (fresh.SizeBytes != old.SizeBytes || fresh.FileModifiedAt != old.FileModifiedAt || fresh.IsHiddenOrSystem != old.IsHiddenOrSystem)) changed.Add(fresh);
@@ -1120,7 +1130,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             IncludeSystemFolders = _includeSystemFolders, ShowVideos = ShowVideos,
             Folder = scope == DuplicateSearchScope.CurrentFolder ? _activeFolder : null,
-            ExcludedFolders = scope == DuplicateSearchScope.IncludedFolders ? _excludedFolders.ToArray() : Array.Empty<string>()
+            ExcludedFolders = scope == DuplicateSearchScope.IncludedFolders ? _folderInclusion.ExcludedFolders : Array.Empty<string>(),
+            IncludedFolders = scope == DuplicateSearchScope.IncludedFolders ? _folderInclusion.IncludedFolders : Array.Empty<string>()
         };
         // Recent is already bounded to the visible newest 500 files. Applying the size
         // predicate before that limit would pull older candidates into this scope.
@@ -1207,7 +1218,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (!_catalogLoaded) return null;
         var all = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders }, _lifetime.Token);
-        var included = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders, ExcludedFolders = _excludedFolders.ToArray() }, _lifetime.Token);
+        var included = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders,
+            ExcludedFolders = _folderInclusion.ExcludedFolders, IncludedFolders = _folderInclusion.IncludedFolders }, _lifetime.Token);
         var dialog = new DuplicateSearchDialog((int)Math.Min(int.MaxValue, (PhotoRows as VirtualPhotoRows)?.ItemCount ?? 0), (int)Math.Min(int.MaxValue, included), (int)Math.Min(int.MaxValue, all),
             _viewMode == LibraryViewMode.Folder ? _activeFolder : null) { Owner = this };
         if (dialog.ShowDialog() != true) return null;

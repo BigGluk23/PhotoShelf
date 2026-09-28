@@ -6,11 +6,18 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2"><PrivateAssets>all</PrivateAssets></PackageReference>
     <ProjectReference Include="../../src/PhotoShelf.Application/PhotoShelf.Application.csproj" />
     <ProjectReference Include="../PhotoShelf.CrashProbe/PhotoShelf.CrashProbe.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../PhotoShelf.HeifProbe/PhotoShelf.HeifProbe.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
   <Target Name="CopyCrashProbe" AfterTargets="Build">
     <ItemGroup>
       <CrashProbeFiles Include="$(MSBuildProjectDirectory)/../PhotoShelf.CrashProbe/bin/$(Configuration)/$(TargetFramework)/*" />
     </ItemGroup>
     <Copy SourceFiles="@(CrashProbeFiles)" DestinationFolder="$(TargetDir)CrashProbe" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyHeifProbe" AfterTargets="Build">
+    <ItemGroup>
+      <HeifProbeFiles Include="$(MSBuildProjectDirectory)/../PhotoShelf.HeifProbe/bin/$(Configuration)/$(TargetFramework)/*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(HeifProbeFiles)" DestinationFolder="$(TargetDir)HeifProbe" SkipUnchangedFiles="true" />
   </Target>
 </Project>

@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using SkiaSharp;
+using PhotoShelf.Application.Media;
 
 namespace PhotoShelf.Desktop;
 
@@ -15,6 +16,7 @@ public sealed record MediaDecodedFrame(BitmapSource Bitmap, int DelayMillisecond
 
 public static class MediaBitmapLoader
 {
+    private static readonly HeifDecoderClient HeifDecoder = new();
     public const long MaximumSourceFrameBytes = 128L * 1024 * 1024;
     private const long MaximumAnimatedFileBytes = 128L * 1024 * 1024;
 
@@ -126,6 +128,29 @@ public static class MediaBitmapLoader
         bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad;
         if (landscape) bitmap.DecodePixelWidth = maximumDimension; else bitmap.DecodePixelHeight = maximumDimension;
         bitmap.StreamSource = stream; bitmap.EndInit(); bitmap.Freeze();
+        return bitmap;
+    }
+
+    public static bool IsHeif(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return HeifDecoderClient.HasHeifSignature(stream) ||
+            Path.GetExtension(path).ToLowerInvariant() is ".heic" or ".heif" or ".hif";
+    }
+
+    /// <summary>Called only by background decoders. HEIC never depends on a Windows WIC extension.</summary>
+    public static BitmapSource LoadStillBounded(string path, int maximumDimension, CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!IsHeif(path)) return LoadWicBounded(path, maximumDimension);
+        var frame = HeifDecoder.DecodeAsync(path, maximumDimension, token).GetAwaiter().GetResult();
+        // WPF uses BGRA; swap in place so the conversion stays inside the reserved pixel budget.
+        for (var offset = 0; offset < frame.Pixels.Length; offset += 4)
+            (frame.Pixels[offset], frame.Pixels[offset + 2]) = (frame.Pixels[offset + 2], frame.Pixels[offset]);
+        token.ThrowIfCancellationRequested();
+        var bitmap = BitmapSource.Create(frame.Width, frame.Height, 96, 96, PixelFormats.Bgra32,
+            null, frame.Pixels, frame.Stride);
+        bitmap.Freeze();
         return bitmap;
     }
 }

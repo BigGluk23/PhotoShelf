@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Windows.Threading;
 using PhotoShelf.Application.Catalog;
 using PhotoShelf.Infrastructure.Sqlite;
@@ -16,6 +17,8 @@ internal sealed class UiSmokeSession
     public bool Ready { get; private set; }
     public bool PreviewRendered { get; private set; }
     public bool NativeDecoderVerified { get; private set; }
+    public bool HeifDecoderVerified { get; private set; }
+    private byte[]? _fixtureHash;
     public double ElapsedReadySeconds { get; private set; }
     public int DispatcherTicks { get; private set; }
     public double MaxDispatcherGapMs { get; private set; }
@@ -45,12 +48,21 @@ internal sealed class UiSmokeSession
                 throw new InvalidOperationException("Published native WebP decoder failed its synthetic fixture.");
             return true;
         });
-        _fixturePath = Path.Combine(media, "preview.png");
-        // An embedded application illustration is the only media fixture; never discover user files.
-        using (var embedded = AppResources.Open(AppResources.GiraffeUri))
+        _fixturePath = Path.Combine(media, "preview.heic");
+        // Generated coloured quadrants, never a user image. The packaged decoder must render them.
+        using (var embedded = typeof(UiSmokeSession).Assembly.GetManifestResourceStream("PhotoShelf.SyntheticHeif.heic")
+            ?? throw new InvalidOperationException("Missing synthetic HEIF resource."))
         await using (var output = new FileStream(_fixturePath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
             65536, FileOptions.Asynchronous))
             await embedded.CopyToAsync(output);
+        _fixtureHash = SHA256.HashData(await File.ReadAllBytesAsync(_fixturePath));
+        HeifDecoderVerified = await Task.Run(() =>
+        {
+            var decoded = MediaBitmapLoader.LoadStillBounded(_fixturePath, 2048);
+            if (decoded.PixelWidth != 320 || decoded.PixelHeight != 180 || !decoded.IsFrozen)
+                throw new InvalidOperationException("Published HEIF decoder failed its synthetic fixture.");
+            return true;
+        });
         var file = new FileInfo(_fixturePath);
         var store = new SqliteDesktopCatalogStore();
         await store.InitializeAsync();
@@ -98,6 +110,10 @@ internal sealed class UiSmokeSession
             DispatcherTicks++;
         }
         ElapsedReadySeconds = _readyTime.Elapsed.TotalSeconds;
+        var fixtureBytes = _fixturePath is null ? [] : await File.ReadAllBytesAsync(_fixturePath);
+        if (_fixturePath is null || _fixtureHash is null ||
+            !_fixtureHash.SequenceEqual(SHA256.HashData(fixtureBytes)))
+            throw new InvalidOperationException("The synthetic HEIF original changed during preview.");
         if (DispatcherTicks < 20 || MaxDispatcherGapMs > 2000)
             throw new InvalidOperationException("Dispatcher responsiveness check failed (fewer than 20 observations or a gap over 2 seconds).");
         _closeRequested = true;
@@ -107,7 +123,7 @@ internal sealed class UiSmokeSession
 
     public object CreateReport(int exitCode) => new
     {
-        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && GracefulExit && DispatcherTicks >= 20 &&
+        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && HeifDecoderVerified && GracefulExit && DispatcherTicks >= 20 &&
             MaxDispatcherGapMs <= 2000 && ErrorReporter.ErrorCount == 0 ? "passed" : "failed",
         check = "ui-smoke",
         version = ErrorReporter.Version,
@@ -116,6 +132,7 @@ internal sealed class UiSmokeSession
         ready = Ready,
         previewRendered = PreviewRendered,
         nativeDecoderVerified = NativeDecoderVerified,
+        heifDecoderVerified = HeifDecoderVerified,
         elapsedReadySeconds = ElapsedReadySeconds,
         dispatcherTicks = DispatcherTicks,
         maxDispatcherGapMs = MaxDispatcherGapMs,

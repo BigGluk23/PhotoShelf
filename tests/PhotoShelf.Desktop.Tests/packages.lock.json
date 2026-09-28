@@ -183,9 +183,9 @@
         "dependencies": {
           "MetadataExtractor": "[2.9.3, )",
           "Microsoft.Data.Sqlite": "[10.0.12, )",
-          "PhotoShelf.Application": "[0.10.3-ultra, )",
-          "PhotoShelf.Domain": "[0.10.3-ultra, )",
-          "PhotoShelf.Infrastructure.Sqlite": "[0.10.3-ultra, )",
+          "PhotoShelf.Application": "[0.10.4-ultra, )",
+          "PhotoShelf.Domain": "[0.10.4-ultra, )",
+          "PhotoShelf.Infrastructure.Sqlite": "[0.10.4-ultra, )",
           "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.5, )",
           "SkiaSharp": "[4.152.1, )"
         }
@@ -193,7 +193,7 @@
       "photoshelf.application": {
         "type": "Project",
         "dependencies": {
-          "PhotoShelf.Domain": "[0.10.3-ultra, )"
+          "PhotoShelf.Domain": "[0.10.4-ultra, )"
         }
       },
       "photoshelf.domain": {
@@ -203,8 +203,8 @@
         "type": "Project",
         "dependencies": {
           "Microsoft.Data.Sqlite": "[10.0.12, )",
-          "PhotoShelf.Application": "[0.10.3-ultra, )",
-          "PhotoShelf.Domain": "[0.10.3-ultra, )",
+          "PhotoShelf.Application": "[0.10.4-ultra, )",
+          "PhotoShelf.Domain": "[0.10.4-ultra, )",
           "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.5, )"
         }
       }

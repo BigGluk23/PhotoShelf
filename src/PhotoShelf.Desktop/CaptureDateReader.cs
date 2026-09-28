@@ -6,6 +6,7 @@ using MetadataExtractor;
 using MetadataExtractor.Formats.Exif;
 using MetadataExtractor.Formats.Xmp;
 using PhotoShelf.Application.Metadata;
+using PhotoShelf.Application.Media;
 
 namespace PhotoShelf.Desktop;
 
@@ -36,7 +37,13 @@ public static class CaptureDateReader
             }
             catch (ImageProcessingException) { malformed = true; }
             catch (NotSupportedException) { }
-            // Absence is decided only after WIC's DateTaken fallback has also had a chance.
+            // HEIF metadata is read by the bundled parser, independent of Windows extensions.
+            // Do not turn an absent EXIF date into a recurring WIC codec error on clean Windows.
+            stream.Position = 0;
+            if (HeifDecoderClient.HasHeifSignature(stream))
+                return malformed ? new(MetadataReadStatus.Corrupt, ErrorCode: "invalid-metadata") :
+                    metadataRead ? new(MetadataReadStatus.Absent) : new(MetadataReadStatus.Unsupported, ErrorCode: "unsupported-metadata");
+            // Legacy formats can also expose DateTaken through WIC.
             stream.Position = 0;
             try
             {

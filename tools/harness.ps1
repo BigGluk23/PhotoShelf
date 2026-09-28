@@ -36,6 +36,7 @@ try {
     $result.version = (& $Python tools/harness_checks.py version).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify application version.' }
     Invoke-Checked $DotNet @('--info')
+    & (Join-Path $repoRoot 'tools/build-heif-codec.ps1')
     # Lockfiles pin direct/transitive package hashes; NuGet audit is required and warnings fail restore.
     Invoke-Checked $DotNet @('restore', 'PhotoShelf.sln', '--locked-mode', '--force', '--disable-parallel')
     & $DotNet list PhotoShelf.sln package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'dependencies.json') -Encoding utf8
@@ -104,7 +105,7 @@ try {
         throw 'New error logs were written during the isolated UI smoke.'
     }
     if ($smokeProcess.ExitCode -ne 0 -or $smoke.status -ne 'passed' -or $smoke.check -ne 'ui-smoke' -or $smoke.ready -ne $true -or $smoke.previewRendered -ne $true -or
-        $smoke.nativeDecoderVerified -ne $true -or $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
+        $smoke.nativeDecoderVerified -ne $true -or $smoke.heifDecoderVerified -ne $true -or $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
         $smoke.dispatcherTicks -lt 20 -or $smoke.maxDispatcherGapMs -gt 2000 -or $smoke.exitCode -ne 0 -or
         -not ($smoke.version -eq $result.version -or $smoke.version.StartsWith($result.version + '+', [StringComparison]::Ordinal))) {
         throw 'UI smoke did not confirm the published version, ready window, at least 5 seconds of responsiveness, zero errors, and graceful exit.'

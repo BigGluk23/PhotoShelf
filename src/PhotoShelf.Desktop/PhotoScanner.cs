@@ -1,4 +1,5 @@
 using System.IO;
+using PhotoShelf.Application.Catalog;
 
 namespace PhotoShelf.Desktop;
 
@@ -91,25 +92,25 @@ public static class PhotoScanner
     }
 
     public static Task ScanAsync(IEnumerable<string> roots, Func<PhotoScanBatch, Task> apply,
-        bool includeSystemFolders, CancellationToken cancellationToken, string[]? excluded = null, bool recursive = true)
+        bool includeSystemFolders, CancellationToken cancellationToken, string[]? excluded = null, bool recursive = true,
+        FolderInclusionRules? inclusion = null)
     {
+        var rules = inclusion?.Snapshot() ?? new FolderInclusionRules(excluded ?? []);
         return Task.Run(async () =>
         {
             var pending = new Queue<string>(roots.Distinct(StringComparer.OrdinalIgnoreCase));
             var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var batch = new List<string>(64);
             var seen = 0;
-            bool Excluded(string path) => excluded?.Any(x => path.Equals(x, StringComparison.OrdinalIgnoreCase) ||
-                path.StartsWith(x.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) == true;
             var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false,
                 AttributesToSkip = FileAttributes.ReparsePoint | (includeSystemFolders ? 0 : FileAttributes.Hidden | FileAttributes.System | FileAttributes.Temporary) };
             while (pending.TryDequeue(out var folder))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!visited.Add(folder) || Excluded(folder) || IsIgnoredPath(folder, includeSystemFolders)) continue;
+                if (!visited.Add(folder) || !rules.MayContainIncluded(folder) || IsIgnoredPath(folder, includeSystemFolders)) continue;
                 try
                 {
-                    foreach (var path in Directory.EnumerateFiles(folder, "*", options))
+                    if (rules.IsIncluded(folder)) foreach (var path in Directory.EnumerateFiles(folder, "*", options))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         if (!PhotoItem.IsSupported(path) || IsIgnoredPath(path, includeSystemFolders)) continue;
@@ -118,7 +119,8 @@ public static class PhotoScanner
                         await apply(new PhotoScanBatch(folder, batch.ToArray(), seen)).ConfigureAwait(false);
                         batch.Clear();
                     }
-                    if (recursive) foreach (var child in Directory.EnumerateDirectories(folder, "*", options)) pending.Enqueue(child);
+                    if (recursive) foreach (var child in Directory.EnumerateDirectories(folder, "*", options))
+                        if (rules.MayContainIncluded(child)) pending.Enqueue(child);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 if (batch.Count > 0)

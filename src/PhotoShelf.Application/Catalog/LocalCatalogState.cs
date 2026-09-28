@@ -29,6 +29,9 @@ public sealed class LocalCatalogState
 
     public List<string> ExcludedFolders { get; set; } = new();
 
+    // Positive exceptions inside excluded ancestors; missing in older catalogs means no exceptions.
+    public List<string> IncludedFolders { get; set; } = new();
+
     public List<SavedDuplicateHash> DuplicateHashes { get; set; } = new();
 }
 

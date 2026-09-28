@@ -135,6 +135,7 @@ public sealed partial class SqliteDesktopCatalogStore
                     case "newest_first": if (bool.TryParse(value, out var newest)) state.SortNewestFirst = newest; break;
                     case "include_subfolders": if (bool.TryParse(value, out var subfolders)) state.IncludeSubfolders = subfolders; break;
                     case "expanded": state.ExpandedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
+                    case "included_folders": state.IncludedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
                     case "tile_width": if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var width)) state.TileWidth = width; break;
                     case "show_videos": if (bool.TryParse(value, out var videos)) state.ShowVideos = videos; break;
                     case "date_grouping_mode": state.DateGroupingMode = value; break;
@@ -166,7 +167,8 @@ public sealed partial class SqliteDesktopCatalogStore
                 ["tile_width"] = state.TileWidth.ToString(CultureInfo.InvariantCulture), ["show_videos"] = state.ShowVideos.ToString(),
                 ["date_grouping_mode"] = state.DateGroupingMode, ["include_system"] = state.IncludeSystemFolders.ToString(),
                 ["active_folder"] = state.ActiveFolder ?? "", ["view_mode"] = state.ViewMode, ["newest_first"] = state.SortNewestFirst.ToString(),
-                ["include_subfolders"] = state.IncludeSubfolders.ToString(), ["expanded"] = JsonSerializer.Serialize(state.ExpandedFolders)
+                ["include_subfolders"] = state.IncludeSubfolders.ToString(), ["expanded"] = JsonSerializer.Serialize(state.ExpandedFolders),
+                ["included_folders"] = JsonSerializer.Serialize(state.IncludedFolders)
             };
             foreach (var (key,value) in values)
             {
