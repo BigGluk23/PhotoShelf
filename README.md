@@ -1,4 +1,4 @@
-# PhotoShelf Ultra v0.10.4
+# PhotoShelf Ultra v0.10.5
 
 Локальный менеджер фото и видео для Windows x64, C# / .NET 10 / WPF.
 Реализованы этапы P0: быстрое измеримое ядро и безопасная организация файлов.
@@ -15,6 +15,7 @@
 Сравнение с v0.9.7: [docs/ultra-comparison.md](docs/ultra-comparison.md).
 История исправления запуска: [docs/v0.10.1-startup-fix.md](docs/v0.10.1-startup-fix.md).
 Исправления ревью v0.10.3: [docs/v0.10.3-review-fixes.md](docs/v0.10.3-review-fixes.md).
+Исправление пустой плашки просмотра v0.10.5: [docs/v0.10.5-viewer-status.md](docs/v0.10.5-viewer-status.md).
 Галки дерева и HEIC v0.10.4: [docs/v0.10.4-folders-heif.md](docs/v0.10.4-folders-heif.md).
 Изменения v0.10.2 и проверка стабильности сетки: [docs/v0.10.2-validation.md](docs/v0.10.2-validation.md).
 

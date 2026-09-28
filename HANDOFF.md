@@ -1,6 +1,6 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.4** (`0.10.4-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.5** (`0.10.5-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
 
 ## Задача и история
@@ -10,7 +10,7 @@
 Читайте:
 
 1. `README.md` — возможности и команды.
-2. `docs/v0.10.4-folders-heif.md` — текущие изменения; `docs/v0.10.3-review-fixes.md` — исправления F01–F07; `docs/v0.10.2-validation.md` — предыдущий выпуск.
+2. `docs/v0.10.5-viewer-status.md` — исправление пустого статуса; `docs/v0.10.4-folders-heif.md` — дерево и HEIC; `docs/v0.10.3-review-fixes.md` — исправления F01–F07; `docs/v0.10.2-validation.md` — предыдущий выпуск.
 3. `docs/github-integration.md` — объединение локальной версии и upstream.
 4. `src/PhotoShelf.Application/Files/SAFETY.md` — обязательный протокол переноса.
 5. `src/PhotoShelf.Infrastructure.Sqlite/CATALOG.md` — реальный каталог/запросы.

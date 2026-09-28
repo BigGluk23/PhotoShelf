@@ -49,7 +49,8 @@
                    Stretch="Uniform"
                    SnapsToDevicePixels="True" />
 
-            <TextBlock Text="{Binding ElementName=PhotoImage, Path=Status}" Foreground="White" Background="#BB202126" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="8" Padding="8" />
+            <TextBlock x:Name="PhotoStatusText" Style="{StaticResource MediaStatusText}"
+                       Text="{Binding ElementName=PhotoImage, Path=Status}" Foreground="White" Background="#BB202126" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="8" Padding="8" />
             <MediaElement x:Name="VideoPlayer"
                           LoadedBehavior="Manual"
                           UnloadedBehavior="Stop"

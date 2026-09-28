@@ -18,6 +18,7 @@ internal sealed class UiSmokeSession
     public bool PreviewRendered { get; private set; }
     public bool NativeDecoderVerified { get; private set; }
     public bool HeifDecoderVerified { get; private set; }
+    public bool ViewerStatusVerified { get; private set; }
     private byte[]? _fixtureHash;
     public double ElapsedReadySeconds { get; private set; }
     public int DispatcherTicks { get; private set; }
@@ -96,6 +97,7 @@ internal sealed class UiSmokeSession
             await Task.Delay(100);
         }
         PreviewRendered = true;
+        await VerifyViewerStatusAsync(window);
         Ready = true;
         _readyTime.Start();
         var previousTick = TimeSpan.Zero;
@@ -123,7 +125,7 @@ internal sealed class UiSmokeSession
 
     public object CreateReport(int exitCode) => new
     {
-        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && HeifDecoderVerified && GracefulExit && DispatcherTicks >= 20 &&
+        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && HeifDecoderVerified && ViewerStatusVerified && GracefulExit && DispatcherTicks >= 20 &&
             MaxDispatcherGapMs <= 2000 && ErrorReporter.ErrorCount == 0 ? "passed" : "failed",
         check = "ui-smoke",
         version = ErrorReporter.Version,
@@ -133,6 +135,7 @@ internal sealed class UiSmokeSession
         previewRendered = PreviewRendered,
         nativeDecoderVerified = NativeDecoderVerified,
         heifDecoderVerified = HeifDecoderVerified,
+        viewerStatusVerified = ViewerStatusVerified,
         elapsedReadySeconds = ElapsedReadySeconds,
         dispatcherTicks = DispatcherTicks,
         maxDispatcherGapMs = MaxDispatcherGapMs,
@@ -140,4 +143,37 @@ internal sealed class UiSmokeSession
         errorCount = ErrorReporter.ErrorCount,
         exitCode
     };
+
+    private async Task VerifyViewerStatusAsync(MainWindow owner)
+    {
+        var viewer = new PhotoViewerWindow(new SqliteDesktopCatalogStore(),
+            new CatalogViewQuery { IncludeSystemFolders = true }, 1, 0, _fixturePath)
+        { Owner = owner, ShowInTaskbar = false, IsEnabled = false };
+        try
+        {
+            viewer.Show();
+            var image = (PreviewImage)viewer.FindName("PhotoImage");
+            var status = (System.Windows.Controls.TextBlock)viewer.FindName("PhotoStatusText");
+            var wait = Stopwatch.StartNew();
+            while (image.Source is null)
+            {
+                if (wait.Elapsed > TimeSpan.FromSeconds(15) || ErrorReporter.ErrorCount != 0)
+                    throw new InvalidOperationException("The synthetic viewer photo did not render.");
+                await Task.Delay(50);
+            }
+            await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            if (!string.IsNullOrEmpty(status.Text) || status.Visibility != System.Windows.Visibility.Collapsed)
+                throw new InvalidOperationException("An empty status overlay obscures the viewer photo.");
+            AsyncMediaImage.SetStatus(image, "Synthetic decoder notice");
+            await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            if (status.Visibility != System.Windows.Visibility.Visible || status.Text != "Synthetic decoder notice")
+                throw new InvalidOperationException("The viewer hides a nonempty decoder notice.");
+            AsyncMediaImage.SetStatus(image, "");
+            await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            if (status.Visibility != System.Windows.Visibility.Collapsed)
+                throw new InvalidOperationException("The viewer retains the cleared decoder notice.");
+            ViewerStatusVerified = true;
+        }
+        finally { viewer.Close(); }
+    }
 }

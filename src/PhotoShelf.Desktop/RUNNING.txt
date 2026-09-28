@@ -1,4 +1,4 @@
-PhotoShelf Ultra v0.10.4 — Windows x64
+PhotoShelf Ultra v0.10.5 — Windows x64
 
 Распакуйте весь ZIP и запустите PhotoShelf.exe.
 .NET runtime, иконки и изображения интерфейса включены в EXE. Папка Assets для запуска не требуется.
