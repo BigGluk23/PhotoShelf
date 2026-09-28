@@ -99,24 +99,60 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 var recursionChanged = _configuration.IncludeSubdirectories != configuration.IncludeSubdirectories;
                 _configuration = configuration with { Roots = roots, IgnoredDirectories = ignored };
                 var requested = roots.Where(path => !IsIgnored(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var uncoveredReplacements = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var root in _roots.Values.ToArray())
                 {
                     if (!requested.Contains(root.Path))
                     {
                         if (root.Watcher is not null) retired.Add(root.Watcher);
+                        if (root.Watcher is not null || root.RevalidateWhenAvailable || root.RevalidateWhenWatched)
+                        {
+                            foreach (var replacement in requested.Where(path => Under(root.Path, path) || Under(path, root.Path)))
+                            {
+                                var overlap = Under(replacement, root.Path) ? replacement : root.Path;
+                                if (!requested.Any(cover => Under(overlap, cover) && _roots.TryGetValue(cover, out var live) && live.Watcher is not null))
+                                    uncoveredReplacements.Add(replacement);
+                            }
+                        }
+                        // A temporary browse watcher can overlap a retained library scope.
+                        // Transfer pending reconciliation intent before retiring its old owner.
+                        if (_dirty.Contains(root.Path) || _revalidateContent.Contains(root.Path))
+                            foreach (var replacement in requested.Where(path => Under(root.Path, path) || Under(path, root.Path)))
+                            {
+                                _dirty.Add(replacement);
+                                if (_revalidateContent.Contains(root.Path)) _revalidateContent.Add(replacement);
+                            }
                         _roots.Remove(root.Path); _dirty.Remove(root.Path); _revalidateContent.Remove(root.Path);
                     }
                     else if (recursionChanged && root.Watcher is not null)
-                    { retired.Add(root.Watcher); root.Watcher = null; root.NextProbe = default; }
+                    {
+                        retired.Add(root.Watcher); root.Watcher = null; root.NextProbe = default;
+                        // Replacing a subscription creates a real notification gap, unlike a quiet pause.
+                        root.RevalidateWhenAvailable = true;
+                        root.RevalidateWhenWatched = true;
+                    }
                 }
                 foreach (var path in requested)
                 {
                     if (!_roots.ContainsKey(path)) { _roots.Add(path, new Root(path)); _dirty.Add(path); }
+                    if (uncoveredReplacements.Contains(path))
+                    {
+                        // Retiring the only covering subscription creates a real notification gap.
+                        _roots[path].RevalidateWhenAvailable = true;
+                        _roots[path].RevalidateWhenWatched = true;
+                        _roots[path].NextProbe = default;
+                    }
                     if (filtersChanged) _dirty.Add(path);
                     _roots[path].PendingState = _roots[path].LastState;
                 }
                 foreach (var path in _paths.Keys.ToArray())
-                    if (!_roots.ContainsKey(_paths[path]) || !IsObserved(path, _paths[path])) _paths.Remove(path);
+                {
+                    string? owner = _paths[path];
+                    if (!_roots.ContainsKey(owner))
+                        owner = _roots.Keys.FirstOrDefault(root => IsObserved(path, root));
+                    if (owner is null || !IsObserved(path, owner)) _paths.Remove(path);
+                    else _paths[path] = owner;
+                }
                 _callbackRetryAt = default;
             }
             await Task.Run(() => { foreach (var watcher in retired) watcher.Dispose(); }).ConfigureAwait(false);
@@ -126,7 +162,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         finally { _control.Release(); }
     }
 
-    /// <summary>Returns only after callbacks and synchronous probes have really finished and watcher handles are closed.</summary>
+    /// <summary>Drains actual readers/callbacks; native directory watchers continue queuing bounded notifications.</summary>
     public async Task PauseAsync()
     {
         await _control.WaitAsync().ConfigureAwait(false);
@@ -134,7 +170,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         {
             ThrowIfDisposed();
             lock (_sync) _explicitlyPaused = true;
-            await PauseCoreAsync().ConfigureAwait(false);
+            // Windows FileSystemWatcher holds directory notification handles, not media readers.
+            // Keep them alive so a modal review does not create an unobserved content gap.
+            await PauseCoreAsync(closeWatchers: false).ConfigureAwait(false);
         }
         finally { _control.Release(); }
     }
@@ -150,7 +188,8 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 _explicitlyPaused = false;
                 if (!_paused) return;
                 _generation++;
-                _paths.Clear(); _callbackRetryAt = default;
+                // Notifications collected during the pause still require targeted content checks.
+                _callbackRetryAt = default;
                 foreach (var root in _roots.Values) { _dirty.Add(root.Path); root.NextProbe = default; root.NextWatchAttempt = default; }
                 StartGeneration();
             }
@@ -234,9 +273,10 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                         {
                             foreach (var path in batch.ReconcileRoots) _dirty.Add(path);
                             foreach (var path in batch.RevalidateContentRoots ?? []) _revalidateContent.Add(path);
+                            // Replaying an interrupted path check does not justify invalidating
+                            // every cached hash in its root. AddPath escalates only on real overflow.
                             foreach (var path in batch.ChangedPaths)
-                                foreach (var root in _roots.Keys.Where(root => Under(path, root)))
-                                { _dirty.Add(root); _revalidateContent.Add(root); }
+                                foreach (var root in _roots.Keys.Where(root => Under(path, root))) AddPath(path, root);
                         }
                     }
                     catch
@@ -414,6 +454,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 _options.RetryDelay.TotalMilliseconds * Math.Pow(2, root.Failures - 1)));
             _dirty.Add(root.Path); _revalidateContent.Add(root.Path);
             root.PendingState = new(root.Path, FileAvailability.NeedsVerification, false, "WatcherEventsLostReconciliationRequired");
+            // Record the observed error so an immediate successful restart publishes Available
+            // even if it matches the state from before this error (e.g. after a long pause).
+            root.LastState = root.PendingState;
         }
         Wake();
     }
@@ -454,6 +497,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         {
             if (_members.Remove(path, out var node)) _order.Remove(node);
         }
+        public bool Contains(string path) => _members.ContainsKey(path);
         public IEnumerable<string> Take(int count) => _order.Take(count);
     }
 

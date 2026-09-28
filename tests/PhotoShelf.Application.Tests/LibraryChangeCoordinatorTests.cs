@@ -84,13 +84,14 @@ public sealed class LibraryChangeCoordinatorTests
         finally { release.Set(); }
         await pause.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(1, completed);
-        Assert.True(factory.Latest(root).Disposed);
+        Assert.False(factory.Latest(root).Disposed);
         var pausedCount = count;
-        factory.Latest(root).Change(new(Path.Combine(root, "stale.jpg")));
+        factory.Latest(root).Change(new(Path.Combine(root, "queued-while-paused.jpg")));
         await Task.Delay(75);
         Assert.Equal(pausedCount, count);
         await monitor.ResumeAsync();
-        await Until(() => count > pausedCount && factory.Count == 2);
+        await Until(() => count > pausedCount);
+        Assert.Equal(1, factory.Count);
     }
 
     [Fact]
@@ -252,24 +253,28 @@ public sealed class LibraryChangeCoordinatorTests
     }
 
     [Fact]
-    public async Task CancelledPathBatchRetainsForcedContentVerificationOnResume()
+    public async Task CancelledPathBatchReplaysTargetedVerificationWithoutInvalidatingWholeRoot()
     {
         var root = RootPath(); var factory = new FakeFactory();
         var pathEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var pathCalls = 0;
+        var changed = Path.Combine(root, "edited-preserving-timestamp.jpg");
         await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
         {
-            if (batch.ChangedPaths.Count > 0)
+            if (batch.ChangedPaths.Count > 0 && Interlocked.Increment(ref pathCalls) == 1)
             { pathEntered.TrySetResult(); await Task.Delay(Timeout.Infinite, token); }
             batches.Enqueue(batch);
         }, FastOptions, factory, new FakeProbe());
         await monitor.ConfigureAsync(new([root]));
         await Until(() => factory.Count == 1);
-        factory.Latest(root).Change(new(Path.Combine(root, "edited-preserving-timestamp.jpg")));
+        factory.Latest(root).Change(new(changed));
         await pathEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await monitor.PauseAsync();
         await monitor.ResumeAsync();
-        await Until(() => batches.Any(batch => batch.RevalidateContentRoots?.Contains(root) == true));
+        await Until(() => batches.Any(batch => batch.ChangedPaths.Contains(changed)));
+        Assert.DoesNotContain(batches, batch => batch.RevalidateContentRoots?.Contains(root) == true);
+        Assert.Equal(1, factory.Count);
     }
 
     [Fact]
@@ -287,6 +292,234 @@ public sealed class LibraryChangeCoordinatorTests
         Assert.Equal(1, factory.Count);
         await monitor.ResumeAsync();
         await Until(() => calls > pausedCalls && factory.Count == 2);
+    }
+
+    [Fact]
+    public async Task QuietPauseResumeKeepsWatcherAndDoesNotInvalidateUnchangedContentCaches()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => batches.Any(batch => batch.ReconcileRoots.Contains(root)));
+        var watcher = factory.Latest(root);
+        await monitor.PauseAsync();
+        Assert.False(watcher.Disposed);
+        await monitor.ResumeAsync();
+        var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.ReconcileRoots.Contains(root)));
+        Assert.Equal(1, factory.Count);
+        Assert.All(batches, batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+        Assert.All(batches, batch => Assert.Empty(batch.ChangedPaths));
+    }
+
+    [Fact]
+    public async Task PausedEventsSurviveBrowseReconfigurationWithoutRunningProbesOrCallbacks()
+    {
+        var root = RootPath(); var browse = RootPath(); var factory = new FakeFactory(); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, probe);
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => factory.Count == 1);
+        await monitor.PauseAsync();
+        var callbackCount = batches.Count; var probeCount = probe.Calls;
+        var first = Path.Combine(root, "first.jpg"); var second = Path.Combine(root, "second.jpg");
+        factory.Latest(root).Change(new(first)); factory.Latest(root).Change(new(second));
+        await monitor.ConfigureAsync(new([root, browse]));
+        await Task.Delay(100);
+        Assert.Equal(2, monitor.PendingPathCount);
+        Assert.Equal(probeCount, probe.Calls); Assert.Equal(callbackCount, batches.Count);
+        await monitor.ResumeAsync();
+        var generation = monitor.Generation;
+        await Until(() => batches.Where(batch => batch.Generation == generation).SelectMany(batch => batch.ChangedPaths).Count() == 2);
+        Assert.Equal(new[] { first, second }, batches.Where(batch => batch.Generation == generation)
+            .SelectMany(batch => batch.ChangedPaths).Order().ToArray());
+        Assert.All(batches, batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+        Assert.Equal(2, factory.Count); // one retained library watcher plus the newly browsed folder
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task RetiringOverlappingWatcherTransfersPendingPathAndOverflowIntent(bool overflow, bool retireParent)
+    {
+        var library = RootPath(); var browse = Path.Combine(library, "browse");
+        var retiring = retireParent ? library : browse;
+        var retained = retireParent ? browse : library;
+        var factory = new FakeFactory(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions with { MaximumPendingPaths = 2 }, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([library, browse]));
+        await Until(() => factory.Count == 2);
+        await monitor.PauseAsync();
+        var changed = Path.Combine(browse, "same-size-edit.jpg");
+        factory.Latest(retiring).Change(new(changed)); // this subscription wins deduplication
+        factory.Latest(retained).Change(new(changed));
+        if (overflow)
+            for (var index = 0; index < 10; index++) factory.Latest(retiring).Change(new(Path.Combine(browse, $"burst-{index}.jpg")));
+        await monitor.ConfigureAsync(new([retained]));
+        Assert.True(monitor.PendingPathCount > 0);
+        Assert.True(factory.Latest(retiring).Disposed);
+        Assert.False(factory.Latest(retained).Disposed);
+        await monitor.ResumeAsync();
+        var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.ChangedPaths.Contains(changed)));
+        if (overflow)
+            await Until(() => batches.Any(batch => batch.Generation == generation && batch.RevalidateContentRoots?.Contains(retained) == true));
+        else Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
+        Assert.DoesNotContain(batches.Where(batch => batch.Generation == generation).SelectMany(batch => batch.ReconcileRoots), path => path == retiring);
+        Assert.Equal(2, factory.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RetiringOverlappingWatcherRetainsInterruptedDirectoryDiscovery(bool retireParent)
+    {
+        var parent = RootPath(); var child = Path.Combine(parent, "child");
+        var retiring = retireParent ? parent : child; var retained = retireParent ? child : parent;
+        var factory = new FakeFactory(); var probe = new FakeProbe(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var intercept = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.ReconcileRoots.Contains(retiring) && Interlocked.CompareExchange(ref intercept, 2, 1) == 1)
+            { interrupted.TrySetResult(); await Task.Delay(Timeout.Infinite, token); }
+            batches.Enqueue(batch);
+        }, FastOptions, factory, probe);
+        await monitor.ConfigureAsync(new([parent, child]));
+        await Until(() => probe.Calls >= 4 && batches.SelectMany(batch => batch.ReconcileRoots).Distinct().Count() == 2);
+        Interlocked.Exchange(ref intercept, 1);
+        factory.Latest(retiring).Change(new(Path.Combine(child, "new-directory"), RequiresReconciliation: true));
+        await interrupted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.ConfigureAsync(new([retained])); // cancellation must transfer the unprocessed directory scope
+        var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.ReconcileRoots.Contains(retained)));
+        Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
+        Assert.DoesNotContain(batches.Where(batch => batch.Generation == generation).SelectMany(batch => batch.ReconcileRoots), path => path == retiring);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReplacingParentSubscriptionWithNewChildDuringPauseRetainsRealNotificationGap(bool initiallyFailed)
+    {
+        var parent = RootPath(); var child = Path.Combine(parent, "child"); var unrelated = RootPath();
+        var factory = new FakeFactory { FailAttempts = initiallyFailed ? int.MaxValue : 0 }; var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([parent])); await Until(() => batches.SelectMany(batch => batch.RootStates).Any());
+        await monitor.PauseAsync();
+        factory.FailAttempts = 0;
+        await monitor.ConfigureAsync(new([child, unrelated]));
+        if (!initiallyFailed) Assert.True(factory.Latest(parent).Disposed);
+        // No watcher covers child now; its next available snapshot must not assume unchanged
+        // content merely because size/mtime still match. A completely unrelated new scope
+        // has no inherited overflow/gap evidence and must remain a normal reconciliation.
+        await monitor.ResumeAsync();
+        var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.RevalidateContentRoots?.Contains(child) == true));
+        Assert.DoesNotContain(batches, batch => batch.RevalidateContentRoots?.Contains(unrelated) == true);
+    }
+
+    [Fact]
+    public async Task ChangingRecursionDuringPauseRetainsActualSubscriptionGap()
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root], IncludeSubdirectories: false));
+        await Until(() => batches.SelectMany(batch => batch.RootStates).Any(state => state.IsWatching));
+        await monitor.PauseAsync();
+        var previousWatcher = factory.Latest(root);
+        await monitor.ConfigureAsync(new([root], IncludeSubdirectories: true));
+        Assert.True(previousWatcher.Disposed);
+        Assert.Equal(1, factory.Count);
+        await monitor.ResumeAsync();
+        var generation = monitor.Generation;
+        await Until(() => batches.Any(batch => batch.Generation == generation && batch.RevalidateContentRoots?.Contains(root) == true));
+        Assert.Equal(2, factory.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OverflowOrWatcherErrorDuringPauseForcesOnlyAffectedRootAfterResume(bool nativeWatcherError)
+    {
+        var root = RootPath(); var other = RootPath(); var factory = new FakeFactory(); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions with { MaximumPendingPaths = 8 }, factory, probe);
+        await monitor.ConfigureAsync(new([root, other]));
+        await Until(() => factory.Count == 2);
+        await monitor.PauseAsync();
+        var callbackCount = batches.Count; var probeCount = probe.Calls;
+        if (nativeWatcherError) factory.Latest(root).Error(new InternalBufferOverflowException());
+        else for (var index = 0; index < 1000; index++) factory.Latest(root).Change(new(Path.Combine(root, $"image-{index}.jpg")));
+        await Task.Delay(100);
+        Assert.True(monitor.PendingPathCount <= 8);
+        Assert.Equal(probeCount, probe.Calls); Assert.Equal(callbackCount, batches.Count);
+        await monitor.ResumeAsync();
+        await Until(() => batches.Any(batch => batch.RevalidateContentRoots?.Contains(root) == true));
+        Assert.DoesNotContain(batches, batch => batch.RevalidateContentRoots?.Contains(other) == true);
+    }
+
+    [Fact]
+    public async Task WatcherErrorDuringLongPausePublishesHealthyStateAfterSuccessfulRestart()
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) => { batches.Enqueue(batch); return Task.CompletedTask; },
+            FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => batches.SelectMany(batch => batch.RootStates).Any(state => state.IsWatching));
+        await monitor.PauseAsync();
+        factory.Latest(root).Error(new IOException("Synthetic native watcher failure"));
+        await Task.Delay(150); // The restart backoff expires while no probes/callbacks can run.
+        await monitor.ResumeAsync(); var generation = monitor.Generation;
+        await Until(() => batches.Where(batch => batch.Generation == generation).SelectMany(batch => batch.RootStates)
+            .Any(state => state.IsWatching && state.Availability == FileAvailability.Available && state.ErrorCode is null));
+        Assert.Equal(2, factory.Count);
+        Assert.Contains(batches, batch => batch.Generation == generation && batch.RevalidateContentRoots?.Contains(root) == true);
+    }
+
+    [WindowsFact]
+    public async Task RetainedWindowsDirectoryWatchersDoNotLockSyntheticMediaDuringPause()
+    {
+        var root = RootPath(); Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "synthetic.jpg");
+        var renamed = Path.Combine(root, "renamed.jpg");
+        var bytes = new byte[] { 4, 8, 15, 16, 23, 42 };
+        await File.WriteAllBytesAsync(path, bytes);
+        try
+        {
+            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var changes = new ConcurrentQueue<string>();
+            await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+            {
+                if (batch.RootStates.Any(state => state.IsWatching)) ready.TrySetResult();
+                foreach (var changed in batch.ChangedPaths) changes.Enqueue(changed);
+                return Task.CompletedTask;
+            }, FastOptions);
+            await monitor.ConfigureAsync(new([root])); await ready.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await monitor.PauseAsync();
+            // A media-reader handle would prevent this exclusive open. Directory notification
+            // handles permit it, and also permit a no-overwrite rename of the owned fixture.
+            using (var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Assert.Equal(bytes.Length, exclusive.Length);
+            }
+            File.Move(path, renamed);
+            await Until(() => monitor.PendingPathCount >= 2);
+            Assert.Empty(changes);
+            await monitor.ResumeAsync();
+            await Until(() => changes.Contains(path) && changes.Contains(renamed));
+            Assert.Equal(bytes, await File.ReadAllBytesAsync(renamed));
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 
     [Fact]
