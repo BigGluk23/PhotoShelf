@@ -41,13 +41,26 @@ public sealed class PhotoItem : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public string Path { get; }
+    public string Path { get; private set; }
+    public string AssetId { get; private set; } = "";
+    public long ObservationVersion { get; private set; }
+    public FileAvailability Availability { get; private set; } = FileAvailability.NeedsVerification;
+    public string? AvailabilityErrorCode { get; private set; }
+    public string? PreviewPath => Availability == FileAvailability.Available || Availability == FileAvailability.NeedsVerification && AvailabilityErrorCode is null ? Path : null;
+    public string AvailabilityText => Availability switch
+    {
+        FileAvailability.Missing => "Файл отсутствует",
+        FileAvailability.RootOffline => "Диск отключён",
+        FileAvailability.AccessDenied => "Нет доступа",
+        FileAvailability.NeedsVerification when AvailabilityErrorCode is not null => "Нужна повторная проверка",
+        _ => ""
+    };
 
     public long ViewIndex { get; set; } = -1;
 
-    public string FileName { get; }
+    public string FileName { get; private set; }
 
-    public bool IsVideo { get; }
+    public bool IsVideo { get; private set; }
 
     public bool IsPhoto => !IsVideo;
 
@@ -111,6 +124,25 @@ public sealed class PhotoItem : INotifyPropertyChanged
     }
 
     public string MetadataText => _metadataText ??= BuildMetadataText();
+
+    public void ApplyCatalogObservation(SavedMediaItem saved)
+    {
+        if (AssetId.Length > 0 && saved.AssetId == AssetId && saved.ObservationVersion < ObservationVersion) return;
+        var pathChanged = !string.Equals(Path, saved.Path, StringComparison.Ordinal);
+        var observationChanged = ObservationVersion != saved.ObservationVersion || Availability != saved.Availability ||
+            AvailabilityErrorCode != saved.AvailabilityErrorCode || pathChanged;
+        Path = saved.Path; FileName = System.IO.Path.GetFileName(Path); IsVideo = saved.IsVideo;
+        AssetId = saved.AssetId; ObservationVersion = saved.ObservationVersion;
+        Availability = saved.Availability; AvailabilityErrorCode = saved.AvailabilityErrorCode;
+        ApplyFileInformation(saved.SizeBytes, saved.FileModifiedAt);
+        ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
+        IsFavorite = saved.IsFavorite;
+        if (!observationChanged) return;
+        _metadataText = null;
+        foreach (var name in new[] { nameof(Path), nameof(PreviewPath), nameof(FileName), nameof(Folder), nameof(IsVideo),
+            nameof(IsPhoto), nameof(KindLabel), nameof(MediaTypeLabel), nameof(ObservationVersion), nameof(AvailabilityText), nameof(MetadataText) })
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
 
     public bool TryLoadCaptureDate()
     {
@@ -189,6 +221,12 @@ public sealed class PhotoItem : INotifyPropertyChanged
             });
         text.AppendLine($"Папка: {Folder}");
         text.AppendLine($"Путь: {Path}");
+
+        if (AvailabilityText.Length > 0)
+        {
+            text.AppendLine($"Доступность: {AvailabilityText}");
+            if (Availability is not FileAvailability.NeedsVerification) return text.ToString();
+        }
 
         if (IsVideo)
         {

@@ -113,6 +113,7 @@ public partial class MainWindow
             {
                 mediaPause?.Dispose();
                 _fileOperationActive = false; _fileOperationCancellation = null; progressWindow.Finish();
+                QueueLibraryMonitoring();
             }
         }
     }

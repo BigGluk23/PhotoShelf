@@ -15,11 +15,14 @@ public sealed partial class SqliteDesktopCatalogStore
             await CatalogDatabaseAccess.WriteAsync(_directory, async () =>
             {
                 await using var connection=await OpenAsync(token);await using var transaction=connection.BeginTransaction();
+                var caches = new List<string>();
+                foreach (var table in new[] { "desktop_metadata_cache", "duplicate_hash_cache" })
+                    if (await TableExistsAsync(connection, transaction, table, token)) caches.Add(table);
                 await using var command=connection.CreateCommand();command.Transaction=transaction;
                 command.CommandText="""
                     INSERT INTO desktop_media_items(asset_id,path,path_key,folder_key,search_key,is_favorite,size_bytes,
-                        file_modified_utc_ticks,file_local_ticks,file_month,is_video,capture_date_ticks,capture_month,metadata_indexed,metadata_status,metadata_attempted_ticks,metadata_retry_ticks,metadata_error_code,is_hidden_or_system,last_seen_utc)
-                    VALUES($id,$path,$pathKey,$folder,$pathKey,$favorite,$size,$modified,$local,$fileMonth,$video,$capture,$captureMonth,$indexed,$status,$attempted,$retry,$error,$system,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                        file_modified_utc_ticks,file_local_ticks,file_month,is_video,capture_date_ticks,capture_month,metadata_indexed,metadata_status,metadata_attempted_ticks,metadata_retry_ticks,metadata_error_code,is_hidden_or_system,last_seen_utc,availability,availability_checked_ticks,availability_error_code,file_identity)
+                    VALUES($id,$path,$pathKey,$folder,$pathKey,$favorite,$size,$modified,$local,$fileMonth,$video,$capture,$captureMonth,$indexed,$status,$attempted,$retry,$error,$system,strftime('%Y-%m-%dT%H:%M:%fZ','now'),$availability,$checked,$availabilityError,$identity)
                     ON CONFLICT(path_key) DO UPDATE SET
                         path=excluded.path,folder_key=excluded.folder_key,search_key=excluded.search_key,
                         is_favorite=CASE WHEN $preserveFavorite=1 THEN desktop_media_items.is_favorite ELSE excluded.is_favorite END,
@@ -37,6 +40,14 @@ public sealed partial class SqliteDesktopCatalogStore
                             WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_retry_ticks ELSE NULL END,
                         metadata_error_code=CASE WHEN excluded.metadata_indexed=1 THEN excluded.metadata_error_code
                             WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.metadata_error_code ELSE NULL END,
+                        observation_version=desktop_media_items.observation_version+CASE WHEN
+                            desktop_media_items.size_bytes<>excluded.size_bytes OR desktop_media_items.file_modified_utc_ticks<>excluded.file_modified_utc_ticks
+                            OR excluded.availability_checked_ticks IS NOT NULL THEN 1 ELSE 0 END,
+                        availability=CASE WHEN excluded.availability_checked_ticks IS NOT NULL THEN excluded.availability ELSE desktop_media_items.availability END,
+                        availability_checked_ticks=COALESCE(excluded.availability_checked_ticks,desktop_media_items.availability_checked_ticks),
+                        availability_error_code=CASE WHEN excluded.availability_checked_ticks IS NOT NULL THEN excluded.availability_error_code ELSE desktop_media_items.availability_error_code END,
+                        file_identity=CASE WHEN excluded.file_identity IS NOT NULL THEN excluded.file_identity
+                            WHEN desktop_media_items.size_bytes=excluded.size_bytes AND desktop_media_items.file_modified_utc_ticks=excluded.file_modified_utc_ticks THEN desktop_media_items.file_identity ELSE NULL END,
                         size_bytes=excluded.size_bytes,file_modified_utc_ticks=excluded.file_modified_utc_ticks,
                         file_local_ticks=excluded.file_local_ticks,file_month=excluded.file_month,
                         is_video=excluded.is_video,is_hidden_or_system=excluded.is_hidden_or_system,last_seen_utc=excluded.last_seen_utc;
@@ -61,6 +72,19 @@ public sealed partial class SqliteDesktopCatalogStore
                     command.Parameters.AddWithValue("$retry", (object?)item.MetadataRetryAtUtc?.Ticks ?? DBNull.Value);
                     command.Parameters.AddWithValue("$error", (object?)item.MetadataErrorCode ?? DBNull.Value);
                     command.Parameters.AddWithValue("$preserveFavorite",preserveFavorites ? 1 : 0);
+                    command.Parameters.AddWithValue("$availability", (int)item.Availability);
+                    command.Parameters.AddWithValue("$checked", (object?)item.AvailabilityCheckedAtUtc?.ToUniversalTime().Ticks ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$availabilityError", (object?)item.AvailabilityErrorCode ?? DBNull.Value);
+                    command.Parameters.AddWithValue("$identity", (object?)item.FileIdentity ?? DBNull.Value);
+                    foreach (var table in caches)
+                    {
+                        await using var invalidate = connection.CreateCommand(); invalidate.Transaction = transaction;
+                        invalidate.CommandText = $"DELETE FROM {table} WHERE path IN (SELECT path FROM desktop_media_items WHERE path_key=$key AND (size_bytes<>$size OR file_modified_utc_ticks<>$modified));";
+                        invalidate.Parameters.AddWithValue("$key", NormalizePathKey(item.Path));
+                        invalidate.Parameters.AddWithValue("$size", item.SizeBytes);
+                        invalidate.Parameters.AddWithValue("$modified", item.FileModifiedAt?.ToUniversalTime().Ticks ?? 0);
+                        await invalidate.ExecuteNonQueryAsync(token);
+                    }
                     await command.ExecuteNonQueryAsync(token);
                 }
                 await transaction.CommitAsync(token);
@@ -79,7 +103,7 @@ public sealed partial class SqliteDesktopCatalogStore
     public Task UpdateCaptureDateAsync(string path,long size,DateTime? modified,DateTime? captureDate,CancellationToken token=default) =>
         UpdateMetadataResultAsync(path,size,modified,new(captureDate is null ? MetadataReadStatus.Absent : MetadataReadStatus.Found,captureDate),DateTime.UtcNow,token);
 
-    public Task<bool> UpdateMetadataResultAsync(string path,long size,DateTime? modified,CaptureDateReadResult result,DateTime attemptedUtc,CancellationToken token=default) => Task.Run(async () =>
+    public Task<bool> UpdateMetadataResultAsync(string path,long size,DateTime? modified,CaptureDateReadResult result,DateTime attemptedUtc,CancellationToken token=default, long? expectedObservationVersion=null) => Task.Run(async () =>
     {
         var updated = false;
         await CatalogDatabaseAccess.WriteAsync(_directory,async () =>
@@ -91,8 +115,10 @@ public sealed partial class SqliteDesktopCatalogStore
                     capture_month=CASE WHEN $authoritative=1 THEN $month ELSE capture_month END,
                     metadata_indexed=$terminal,metadata_status=$status,metadata_attempted_ticks=$attempted,
                     metadata_retry_ticks=$retry,metadata_error_code=$error
-                WHERE path_key=$path AND size_bytes=$size AND file_modified_utc_ticks=$modified AND is_quarantined=0;
+                WHERE path_key=$path AND size_bytes=$size AND file_modified_utc_ticks=$modified AND is_quarantined=0
+                    AND ($version IS NULL OR observation_version=$version) AND (availability=0 OR (availability=4 AND availability_error_code IS NULL));
                 """;
+            command.Parameters.AddWithValue("$version", (object?)expectedObservationVersion ?? DBNull.Value);
             command.Parameters.AddWithValue("$authoritative",result.IsAuthoritative?1:0);
             command.Parameters.AddWithValue("$capture",(object?)result.CaptureDate?.Ticks??DBNull.Value);
             command.Parameters.AddWithValue("$month",(object?)Month(result.CaptureDate)??DBNull.Value);
@@ -159,7 +185,7 @@ public sealed partial class SqliteDesktopCatalogStore
         if(from.Id is not null)
         {
             await using var command=connection.CreateCommand();command.Transaction=transaction;
-            command.CommandText="UPDATE desktop_media_items SET path=$destination,path_key=$key,folder_key=$folder,search_key=$key,is_quarantined=$quarantine WHERE asset_id=$id;";
+            command.CommandText="UPDATE desktop_media_items SET path=$destination,path_key=$key,folder_key=$folder,search_key=$key,is_quarantined=$quarantine,file_identity=NULL,availability=4,availability_checked_ticks=NULL,availability_error_code=NULL,observation_version=observation_version+1 WHERE asset_id=$id;";
             command.Parameters.AddWithValue("$destination",destination);command.Parameters.AddWithValue("$key",destinationKey);
             command.Parameters.AddWithValue("$folder",FolderKey(destination));command.Parameters.AddWithValue("$quarantine",removeFromLibrary?1:0);command.Parameters.AddWithValue("$id",from.Id);
             await command.ExecuteNonQueryAsync();

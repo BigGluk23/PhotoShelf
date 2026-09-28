@@ -1,0 +1,315 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Threading;
+using Microsoft.Data.Sqlite;
+using PhotoShelf.Application.Catalog;
+using PhotoShelf.Desktop;
+using PhotoShelf.Infrastructure.Sqlite;
+
+namespace PhotoShelf.PerformanceRunner;
+
+/// <summary>One identical host runs against either source revision. It never selects an existing catalog.</summary>
+internal static class Program
+{
+    private const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
+    private static readonly List<Sample> Samples = [];
+    private static readonly List<MemorySample> Memory = [];
+    private static readonly List<object> Supersessions = [];
+    private static string _mediaRoot = "";
+    private static int _count;
+    private static int _repetitions;
+    private static string _reportPath = "";
+    private static string _revision = "";
+    private static string _label = "";
+    private static int _cancellations;
+
+    [STAThread]
+    public static int Main(string[] args)
+    {
+        // Parse/reserve output before initializing any application/catalog/cache.
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Actual WPF timings require Windows.");
+        if (args.Length != 5 || !int.TryParse(args[0], out _count) || _count is not (100_000 or 1_000_000) ||
+            !int.TryParse(args[1], out _repetitions) || _repetitions is < 5 or > 50)
+            throw new ArgumentException("Usage: count(100000|1000000) repetitions(5..50) report.json revision label");
+        _reportPath = Path.GetFullPath(args[2]); _revision = args[3]; _label = args[4];
+        using var report = new FileStream(_reportPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        var catalog = LocalCatalogStore.CreateIsolatedSmokeCatalog();
+        _mediaRoot = Path.Combine(catalog, "synthetic-catalog-only");
+        typeof(ErrorReporter).GetProperty("AutomatedCheck", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, true);
+        string? failure = null;
+        var exitCode = 1;
+        try
+        {
+            var store = new SqliteDesktopCatalogStore();
+            SeedAsync(store).GetAwaiter().GetResult();
+            MeasureSqlAsync(store).GetAwaiter().GetResult();
+            var app = new App(verificationOnly: true) { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            app.InitializeComponent();
+            app.Dispatcher.BeginInvoke(new Action(async () =>
+            {
+                MainWindow? window = null;
+                try
+                {
+                    var state = await MainWindow.LoadInitialCatalogStateAsync();
+                    window = new MainWindow(state) { Width = 1280, Height = 800, WindowState = WindowState.Normal };
+                    app.MainWindow = window;
+                    window.Show();
+                    var ready = (Task<Exception?>)typeof(MainWindow).GetProperty("InitialCatalogReady", PrivateInstance)!.GetValue(window)!;
+                    if (await ready.WaitAsync(TimeSpan.FromSeconds(120)) is { } error) throw new InvalidOperationException("Startup failed.", error);
+                    // Identical controlled profile: wait for real readers to stop, not just request cancellation.
+                    await QuiesceAsync(window);
+                    await WaitForIdleAsync(window);
+                    await MeasureUiAsync(window);
+                    if ((int)typeof(ErrorReporter).GetProperty("ErrorCount", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)! != 0)
+                        throw new InvalidOperationException("Application wrote an error report during the benchmark.");
+                    var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    window.Closed += (_, _) => closed.TrySetResult();
+                    window.Close();
+                    await closed.Task.WaitAsync(TimeSpan.FromSeconds(60));
+                    exitCode = 0;
+                }
+                catch (Exception ex) { failure = ex.ToString(); }
+                finally { app.Shutdown(exitCode); }
+            }));
+            app.Run();
+        }
+        catch (Exception ex) { failure = ex.ToString(); }
+        var fixtureRetained = true;
+        string? cleanupError = null;
+        if (exitCode == 0)
+        {
+            try
+            {
+                // Only this atomically-created fixture is eligible. Failed runs remain available for diagnosis.
+                var expectedParent = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+                if (!LocalCatalogStore.IsIsolatedSmokeCatalog || LocalCatalogStore.CatalogDirectory != catalog ||
+                    !string.Equals(Path.GetDirectoryName(catalog), expectedParent, StringComparison.OrdinalIgnoreCase) ||
+                    !Path.GetFileName(catalog).StartsWith("PhotoShelf-ui-smoke-", StringComparison.Ordinal) ||
+                    (File.GetAttributes(catalog) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException("Fixture cleanup ownership check failed; retained.");
+                SqliteConnection.ClearAllPools();
+                Directory.Delete(catalog, recursive: true);
+                fixtureRetained = false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+            { cleanupError = ex.Message; }
+        }
+        var result = new
+        {
+            schema = 1, status = exitCode == 0 ? "passed" : "failed", error = failure,
+            revision = _revision, label = _label, applicationVersion = ErrorReporter.Version,
+            count = _count, repetitions = _repetitions, warmups = 2, catalogRoot = catalog, fixtureRetained, cleanupError,
+            fixture = "deterministic-v1-catalog-only", syntheticFileBytes = 0,
+            scope = "SQLite queries and actual WPF event-to-bound-data-page/layout; absent synthetic media, decoding/indexing and physical input excluded; background writers quiesced",
+            clock = "Stopwatch", clockFrequency = Stopwatch.Frequency, timestampUtc = DateTime.UtcNow,
+            machine = new { name = Environment.MachineName, os = RuntimeInformation.OSDescription,
+                architecture = RuntimeInformation.ProcessArchitecture.ToString(), framework = RuntimeInformation.FrameworkDescription,
+                logicalProcessors = Environment.ProcessorCount, totalAvailableMemoryBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
+                runnerImage = Environment.GetEnvironmentVariable("ImageVersion"), runnerOs = Environment.GetEnvironmentVariable("RUNNER_OS"),
+                dpi = "WPF default", viewport = "1280x800 device independent pixels" },
+            confirmedSupersessions = _cancellations, supersessions = Supersessions, samples = Samples, memory = Memory
+        };
+        JsonSerializer.Serialize(report, result, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        report.Flush(true);
+        Console.WriteLine($"{result.status}: {_reportPath}");
+        return exitCode;
+    }
+
+    private static async Task SeedAsync(SqliteDesktopCatalogStore store)
+    {
+        await store.InitializeAsync();
+        await store.SaveAsync(new LocalCatalogState { IncludeSystemFolders = true, DateGroupingMode = "FileDate" }, saveItems: false);
+        await using var db = new SqliteConnection(new SqliteConnectionStringBuilder
+        { DataSource = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite"), Pooling = false }.ToString());
+        await db.OpenAsync();
+        await using var command = db.CreateCommand();
+        // Bulk setup is deliberately outside measurements and does not benchmark production ingestion.
+        // Populate only common columns: each revision retains its real schema, defaults, triggers and indexes.
+        command.CommandText = """
+            PRAGMA synchronous=FULL;
+            WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)), numbers(i) AS (
+              SELECT a.n+10*b.n+100*c.n+1000*d.n+10000*e.n+100000*f.n
+              FROM digits a,digits b,digits c,digits d,digits e,digits f
+            ), fixture AS (
+              SELECT i, $root || '\bucket' || printf('%02d',i%100) || '\' ||
+                CASE WHEN i%97=0 THEN 'needle_' ELSE 'synthetic_' END || printf('%08d',i) || '.jpg' AS path,
+                $ticks + (i%3650)*864000000000 AS date FROM numbers WHERE i<$count
+            )
+            INSERT INTO desktop_media_items(asset_id,path,path_key,folder_key,search_key,is_favorite,size_bytes,
+                file_modified_utc_ticks,file_local_ticks,file_month,is_video,capture_date_ticks,capture_month,
+                metadata_indexed,metadata_status,is_hidden_or_system,last_seen_utc)
+            SELECT printf('%032x',i+1),path,upper(replace(path,'\','/')),
+                upper(replace($root || '\bucket' || printf('%02d',i%100),'\','/')),upper(replace(path,'\','/')),
+                i%13=0,1024+i%31,date,date,strftime('%Y-%m','2015-01-01',printf('+%d days',i%3650)),0,
+                CASE WHEN i%7=0 THEN NULL ELSE date-864000000000 END,
+                CASE WHEN i%7=0 THEN NULL ELSE strftime('%Y-%m','2015-01-01',printf('%+d days',i%3650-1)) END,
+                1,CASE WHEN i%7=0 THEN 2 ELSE 1 END,0,'2026-09-28T00:00:00Z' FROM fixture;
+            PRAGMA wal_checkpoint(TRUNCATE);
+            """;
+        command.Parameters.AddWithValue("$root", _mediaRoot);
+        command.Parameters.AddWithValue("$ticks", new DateTime(2015, 1, 1).Ticks);
+        command.Parameters.AddWithValue("$count", _count);
+        command.CommandTimeout = 600;
+        await command.ExecuteNonQueryAsync();
+        if (await store.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }) != _count)
+            throw new InvalidDataException("Fixture count mismatch.");
+    }
+
+    private static async Task MeasureSqlAsync(SqliteDesktopCatalogStore store)
+    {
+        var query = new CatalogViewQuery { PageSize = 128, IncludeSystemFolders = true };
+        var queries = new (string Name, CatalogViewQuery Query)[]
+        {
+            ("sql.page.first", query), ("sql.page.deep", query with { Offset = _count - 128 }),
+            ("sql.page.capture", query with { UseCaptureDate = true }),
+            ("sql.page.folder", query with { Folder = Path.Combine(_mediaRoot, "bucket00"), ViewMode = "Folder" }),
+            ("sql.page.search", query with { SearchText = "needle_" })
+        };
+        foreach (var (name, current) in queries)
+            await RepeatAsync(name, async () =>
+            {
+                var page = await store.QueryPageAsync(current);
+                if (page.Items.Count != 128) throw new InvalidDataException($"{name}: incomplete data page.");
+                return Fingerprint(page.Items.Select(x => x.Path));
+            });
+        foreach (var capture in new[] { false, true })
+            await RepeatAsync(capture ? "sql.groups.capture" : "sql.groups.file", async () =>
+            {
+                var groups = await store.QueryGroupsAsync(query with { UseCaptureDate = capture });
+                if (groups.Sum(x => x.Count) != _count) throw new InvalidDataException("Group count mismatch.");
+                return string.Join(";", groups.Select(x => $"{x.Key}:{x.Count}"));
+            });
+    }
+
+    private static async Task RepeatAsync(string name, Func<Task<string>> operation)
+    {
+        for (var i = -2; i < _repetitions; i++)
+        {
+            var watch = Stopwatch.StartNew(); var fingerprint = await operation();
+            if (i >= 0) Samples.Add(new(name, i, watch.Elapsed.TotalMilliseconds, fingerprint));
+        }
+    }
+
+    private static async Task MeasureUiAsync(MainWindow window)
+    {
+        var date = (ComboBox)window.FindName("DateModeBox");
+        var search = (TextBox)window.FindName("SearchBox");
+        var sort = (Button)window.FindName("DateSortButton");
+        await MeasureActionAsync(window, "ui.date", () => date.SelectedIndex = date.SelectedIndex == 0 ? 1 : 0,
+            q => q.UseCaptureDate == (date.SelectedIndex == 0));
+        await MeasureActionAsync(window, "ui.sort", () => sort.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)),
+            _ => true);
+        await MeasureActionAsync(window, "ui.search", () => search.Text = search.Text == "needle_" ? "synthetic_" : "needle_",
+            q => q.SearchText == search.Text);
+        search.Text = ""; await WaitForIdleAsync(window);
+        var bucket = 0;
+        await MeasureActionAsync(window, "ui.folder", () =>
+        {
+            bucket = 1 - bucket;
+            var node = new FolderNode(Path.Combine(_mediaRoot, $"bucket{bucket:00}")) { ChildrenLoaded = true };
+            Invoke(window, "OnFolderTreeSelectedItemChanged", window.FindName("FolderTree"), new RoutedPropertyChangedEventArgs<object>(null!, node));
+        }, q => q.Folder == Path.Combine(_mediaRoot, $"bucket{bucket:00}"));
+        Invoke(window, "OnAllPhotosClicked", window, new RoutedEventArgs());
+        await WaitForIdleAsync(window);
+        for (var repeat = 0; repeat < 5; repeat++)
+        {
+            // Force an old pending projection, capture its token before it can be disposed, then supersede it.
+            search.Text = "superseded_" + repeat;
+            var oldToken = Get<CancellationTokenSource?>(window, "_projectionCancellation")?.Token
+                ?? throw new InvalidOperationException("Projection did not expose an active cancellation token.");
+            var cancellationWatch = Stopwatch.StartNew();
+            search.Text = "needle_";
+            if (!oldToken.IsCancellationRequested) throw new InvalidOperationException("Superseded request was not canceled.");
+            var signalMs = cancellationWatch.Elapsed.TotalMilliseconds;
+            _cancellations++;
+            await WaitForIdleAsync(window);
+            if (Get<CatalogViewQuery>(window, "_currentQuery").SearchText != "needle_" ||
+                window.PhotoRows is not VirtualPhotoRows rows || rows.ItemCount != (_count + 96) / 97 ||
+                rows.LoadedItems.Any(x => !Path.GetFileName(x.Path).StartsWith("needle_", StringComparison.Ordinal)))
+                throw new InvalidOperationException("Stale request replaced the latest search.");
+            Supersessions.Add(new { iteration = repeat, cancellationSignalMs = signalMs,
+                finalSettledPageMs = cancellationWatch.Elapsed.TotalMilliseconds,
+                scope = "pending projection superseded before debounce; not a native SQL interruption benchmark" });
+            await Task.Delay(100); await WaitForIdleAsync(window);
+            if (Get<CatalogViewQuery>(window, "_currentQuery").SearchText != "needle_")
+                throw new InvalidOperationException("Stale results appeared after final publication.");
+        }
+        SnapshotMemory(window, "end");
+    }
+
+    private static async Task MeasureActionAsync(MainWindow window, string name, Action action, Func<CatalogViewQuery, bool> expected)
+    {
+        for (var i = -2; i < _repetitions; i++)
+        {
+            await QuiesceAsync(window); await WaitForIdleAsync(window);
+            var oldRows = window.PhotoRows;
+            var published = new TaskCompletionSource<double>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var watch = Stopwatch.StartNew();
+            void Observe(object? sender, PropertyChangedEventArgs args)
+            {
+                if (args.PropertyName == nameof(MainWindow.PhotoRows) && !ReferenceEquals(oldRows, window.PhotoRows) &&
+                    window.PhotoRows is VirtualPhotoRows rows && rows.ItemCount > 0 && rows.LoadedItems.Any() &&
+                    expected(Get<CatalogViewQuery>(window, "_currentQuery"))) published.TrySetResult(watch.Elapsed.TotalMilliseconds);
+            }
+            window.PropertyChanged += Observe;
+            try
+            {
+                action();
+                // An actual dispatcher input-priority turn after the control handler, not timer tick spacing.
+                await window.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Input);
+                var ack = watch.Elapsed.TotalMilliseconds;
+                var data = await published.Task.WaitAsync(TimeSpan.FromSeconds(60));
+                await window.Dispatcher.InvokeAsync(window.UpdateLayout, DispatcherPriority.Render);
+                var layout = watch.Elapsed.TotalMilliseconds;
+                if (i >= 0)
+                {
+                    var fingerprint = Fingerprint(((VirtualPhotoRows)window.PhotoRows).LoadedItems.Select(x => x.Path));
+                    Samples.Add(new(name + ".ack", i, ack, ""));
+                    Samples.Add(new(name + ".first_data_page", i, data, ""));
+                    Samples.Add(new(name + ".layout", i, layout, fingerprint));
+                    SnapshotMemory(window, name);
+                }
+            }
+            finally { window.PropertyChanged -= Observe; }
+        }
+    }
+
+    private static async Task QuiesceAsync(MainWindow window) =>
+        await ((Task)Invoke(window, "StopCatalogWritersAsync", true)!).WaitAsync(TimeSpan.FromSeconds(120));
+
+    private static async Task WaitForIdleAsync(MainWindow window)
+    {
+        var watch = Stopwatch.StartNew();
+        while (Get<bool>(window, "_isProjecting") || Get<bool>(window, "_projectionQueued"))
+        {
+            if (watch.Elapsed > TimeSpan.FromSeconds(120)) throw new TimeoutException("Projection did not settle.");
+            await Task.Delay(10);
+        }
+        await window.Dispatcher.InvokeAsync(window.UpdateLayout, DispatcherPriority.ApplicationIdle);
+    }
+
+    private static void SnapshotMemory(MainWindow window, string phase)
+    {
+        using var process = Process.GetCurrentProcess(); process.Refresh();
+        var rows = window.PhotoRows as VirtualPhotoRows;
+        Memory.Add(new(phase, process.WorkingSet64, process.PrivateMemorySize64, GC.GetTotalMemory(false),
+            rows?.CachedPageCount ?? 0, rows?.CachedRowCount ?? 0, rows?.PendingPageCount ?? 0));
+    }
+
+    private static string Fingerprint(IEnumerable<string> paths) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+        string.Join("\n", paths.Select(x => Path.GetRelativePath(_mediaRoot, x))))));
+    private static T Get<T>(object target, string name) => (T)(typeof(MainWindow).GetField(name, PrivateInstance)
+        ?? throw new MissingFieldException(typeof(MainWindow).FullName, name)).GetValue(target)!;
+    private static object? Invoke(object target, string name, params object?[] args) =>
+        (typeof(MainWindow).GetMethod(name, PrivateInstance) ?? throw new MissingMethodException(typeof(MainWindow).FullName, name)).Invoke(target, args);
+    private sealed record Sample(string Name, int Iteration, double Milliseconds, string Fingerprint);
+    private sealed record MemorySample(string Phase, long WorkingSetBytes, long PrivateBytes, long ManagedBytes, int CachedPages, int CachedRows, int PendingPages);
+}

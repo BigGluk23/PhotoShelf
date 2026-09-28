@@ -1,0 +1,172 @@
+using System.IO;
+using System.Windows;
+using System.Windows.Threading;
+using PhotoShelf.Application.Catalog;
+
+namespace PhotoShelf.Desktop;
+
+public partial class MainWindow
+{
+    private readonly HashSet<string> _watchedFolders = new(StringComparer.OrdinalIgnoreCase);
+    private LibraryChangeCoordinator? _libraryMonitor;
+    private LibraryCatalogSynchronizer? _librarySynchronizer;
+    private Task _monitorConfigurationTask = Task.CompletedTask;
+    private string _monitorConfigurationKey = "";
+    private string _monitorRulesKey = "";
+    private Func<string, bool>? _monitorPathFilter;
+    private bool _monitorPaused;
+    private bool _metadataRefreshPending;
+    private bool _monitorRootsRestored;
+    private long _monitorConfigurationRevision;
+    private MonitorScope? _monitorScope;
+    private readonly Dictionary<string, LibraryRootState> _libraryRootStates = new(StringComparer.OrdinalIgnoreCase);
+    private sealed record MonitorScope(FolderInclusionRules Rules, string? BrowseFolder, bool Recursive, bool IncludeSystem, IReadOnlyList<string> LibraryRoots);
+
+    private void QueueLibraryMonitoring()
+    {
+        if (LocalCatalogStore.IsIsolatedSmokeCatalog || !_catalogLoaded || _fileOperationActive || _hasPendingRecovery || _closing) return;
+        var revision = ++_monitorConfigurationRevision;
+        _monitorConfigurationTask = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision);
+    }
+
+    private async Task ConfigureLibraryMonitoringAsync(Task previous, long revision)
+    {
+        try
+        {
+            await previous;
+            if (_closing || _fileOperationActive || _hasPendingRecovery || revision != _monitorConfigurationRevision) return;
+            if (!_monitorRootsRestored)
+            {
+                foreach (var root in _catalogState.WatchedFolders) RegisterWatchedFolder(root);
+                if (_watchedFolders.Count == 0)
+                {
+                    // Older releases did not persist scan roots. Adopt actual catalog folders,
+                    // never every drive displayed in the Explorer-like tree.
+                    string? after = null;
+                    while (true)
+                    {
+                        var page = await _desktopCatalogStore.QueryKnownFoldersPageAsync(after, token: _lifetime.Token);
+                        if (page.Count == 0) break;
+                        foreach (var root in page) RegisterWatchedFolder(root);
+                        after = page[^1];
+                        if (_watchedFolders.Count > 4096)
+                            throw new InvalidOperationException("Для автообновления нужно не более 4096 корневых папок. Выберите общую папку библиотеки и пересканируйте её.");
+                    }
+                }
+                _monitorRootsRestored = true;
+                await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
+            }
+            if (_closing || _fileOperationActive || revision != _monitorConfigurationRevision) return;
+            var rules = _folderInclusion.Snapshot();
+            var browse = _viewMode == LibraryViewMode.Folder ? _activeFolder : null;
+            var libraryRoots = _watchedFolders.Concat(rules.IncludedFolders).Where(rules.MayContainIncluded).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var roots = libraryRoots.ToList();
+            if (browse is not null) roots.Add(browse);
+            roots = roots.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToList();
+            var rulesKey = _includeSystemFolders + "|" + string.Join('\n', rules.IncludedFolders) + "|" + string.Join('\n', rules.ExcludedFolders);
+            var key = string.Join('\n', roots) + "|library:" + string.Join('\n', libraryRoots) + "|" + browse + "|" + _includeSubfolders + "|" + rulesKey;
+            if (_libraryMonitor is null)
+            {
+                _librarySynchronizer = new(_desktopCatalogStore, PublishLibraryUpdateAsync);
+                _libraryMonitor = new LibraryChangeCoordinator(async (batch, token) =>
+                {
+                    var scope = _monitorScope;
+                    if (scope is not null) await _librarySynchronizer.ProcessAsync(batch, scope.Rules,
+                        scope.BrowseFolder, scope.Recursive, scope.IncludeSystem, token, scope.LibraryRoots);
+                });
+            }
+            if (_monitorConfigurationKey != key)
+            {
+                _monitorScope = new(rules, browse, _includeSubfolders, _includeSystemFolders, libraryRoots);
+                _monitorPathFilter ??= path => _monitorScope is { } scope && !PhotoScanner.IsIgnoredPath(path, scope.IncludeSystem) &&
+                    (scope.LibraryRoots.Any(root => LibraryCatalogSynchronizer.IsUnder(path, root)) && scope.Rules.MayContainIncluded(path) || scope.BrowseFolder is not null && LibraryCatalogSynchronizer.IsUnder(path, scope.BrowseFolder));
+                foreach (var removed in _libraryRootStates.Keys.Except(roots, StringComparer.OrdinalIgnoreCase).ToArray()) _libraryRootStates.Remove(removed);
+                await _libraryMonitor.ConfigureAsync(new(roots,
+                    [LocalCatalogStore.CatalogDirectory, LocalCatalogStore.DerivedDataDirectory],
+                    ShouldObservePath: _monitorPathFilter));
+                if (_monitorRulesKey.Length > 0 && _monitorRulesKey != rulesKey) _libraryMonitor.RequestReconciliation();
+                _monitorRulesKey = rulesKey;
+                _monitorConfigurationKey = key;
+            }
+            if (_monitorPaused)
+            {
+                await _libraryMonitor.ResumeAsync();
+                _monitorPaused = false;
+            }
+            LibraryStatusText.Text = roots.Count == 0 ? "Автообновление: добавьте папку" : "Автообновление включено";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception) { LibraryStatusText.Text = $"Автообновление: {exception.Message}"; }
+    }
+
+    private void RegisterWatchedFolder(string path)
+    {
+        var root = Path.GetFullPath(path);
+        if (_watchedFolders.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))) return;
+        _watchedFolders.RemoveWhere(child => LibraryCatalogSynchronizer.IsUnder(child, root));
+        _watchedFolders.Add(root);
+    }
+
+    private async Task PublishLibraryUpdateAsync(LibraryCatalogUpdate update)
+    {
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (_closing || _lifetime.IsCancellationRequested) return;
+            foreach (var state in update.Roots)
+            {
+                if (_monitorScope is { } scope && !scope.LibraryRoots.Contains(state.Path, StringComparer.OrdinalIgnoreCase) &&
+                    !string.Equals(scope.BrowseFolder, state.Path, StringComparison.OrdinalIgnoreCase)) continue;
+                _libraryRootStates[state.Path] = state;
+                if (_folderNodes.TryGetValue(NormalizePath(state.Path), out var node)) node.AvailabilityText = RootAvailabilityText(state);
+            }
+            var unavailable = _libraryRootStates.Values.Where(state => state.Availability != FileAvailability.Available).ToArray();
+            LibraryStatusText.Text = unavailable.Length == 0 ? "Автообновление включено" :
+                $"Автообновление: {unavailable.Length} папок требуют внимания";
+            LibraryStatusText.ToolTip = string.Join("\n", unavailable.Select(state => $"{state.Path}: {RootAvailabilityText(state)}"));
+            var retained = (PhotoRows as VirtualPhotoRows)?.LoadedItems.ToArray() ?? [];
+            foreach (var rename in update.Renames)
+            {
+                var selected = _selection.Find(rename.Source);
+                if (selected is not null) { _selection.Remove(selected); selected.ApplyCatalogObservation(rename.Destination); _selection.Add(selected); }
+                foreach (var item in retained.Where(item => item.Path.Equals(rename.Source, StringComparison.OrdinalIgnoreCase)))
+                    item.ApplyCatalogObservation(rename.Destination);
+                if (_selectedPhoto?.Path.Equals(rename.Source, StringComparison.OrdinalIgnoreCase) == true)
+                    _selectedPhoto.ApplyCatalogObservation(rename.Destination);
+            }
+            foreach (var saved in update.Items)
+            {
+                _selection.Find(saved.Path)?.ApplyCatalogObservation(saved);
+                foreach (var item in retained.Where(item => item.Path.Equals(saved.Path, StringComparison.OrdinalIgnoreCase))) item.ApplyCatalogObservation(saved);
+            }
+            if (update.Items.Count > 0)
+            {
+                foreach (var viewer in OwnedWindows.OfType<PhotoViewerWindow>()) viewer.CatalogItemsChanged(update.Items, update.Renames);
+                NoteCatalogChanged();
+                if (_selectedPhoto is { } selected && update.Items.Any(item => item.Path.Equals(selected.Path, StringComparison.OrdinalIgnoreCase))) UpdateInfoPanel();
+            }
+            if (update.Completed)
+            {
+                CompleteCatalogStage();
+                if (!_fileOperationActive && !_hasPendingRecovery)
+                {
+                    if (_metadataTask.IsCompleted) { _metadataRefreshPending = false; StartMetadataIndexing(false); }
+                    else _metadataRefreshPending = true;
+                }
+            }
+        }, DispatcherPriority.Background);
+        if (update.Completed && !_closing)
+        {
+            var count = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }, _lifetime.Token);
+            await Dispatcher.InvokeAsync(() => _catalogCount = count, DispatcherPriority.Background);
+        }
+    }
+
+    private static string RootAvailabilityText(LibraryRootState state) => state.Availability switch
+    {
+        FileAvailability.RootOffline => "Диск отключён",
+        FileAvailability.Missing => "Папка отсутствует",
+        FileAvailability.AccessDenied => "Нет доступа",
+        FileAvailability.NeedsVerification => state.ErrorCode is "WatcherLimitPeriodicFallback" or "WatcherFailedPeriodicFallback" ? "Периодическая сверка" : "Нужна повторная проверка",
+        _ => ""
+    };
+}

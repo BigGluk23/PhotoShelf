@@ -214,14 +214,14 @@ public sealed partial class SqliteDesktopCatalogStore
         var where=new List<string>{"is_quarantined=0"};
         if(query.MetadataDueAtUtc is { } due)
         {
-            where.Add("metadata_indexed=0 AND is_video=0 AND (metadata_retry_ticks IS NULL OR metadata_retry_ticks<=$metadataDue)");
+            where.Add("metadata_indexed=0 AND is_video=0 AND (availability=0 OR (availability=4 AND availability_error_code IS NULL)) AND (metadata_retry_ticks IS NULL OR metadata_retry_ticks<=$metadataDue)");
             command.Parameters.AddWithValue("$metadataDue", due.ToUniversalTime().Ticks);
         }
         if(!query.ShowVideos)where.Add("is_video=0");
         if(!query.IncludeSystemFolders)where.Add("is_hidden_or_system=0");
         if(query.ViewMode=="Favorites")where.Add("is_favorite=1");
         if(query.MissingCaptureDateOnly)where.Add("capture_date_ticks IS NULL AND is_video=0");
-        if(query.DuplicateCandidatesOnly)where.Add("size_bytes IN (SELECT size_bytes FROM desktop_size_counts WHERE item_count>1)");
+        if(query.DuplicateCandidatesOnly)where.Add("(availability=0 OR (availability=4 AND availability_error_code IS NULL)) AND size_bytes IN (SELECT size_bytes FROM desktop_size_counts WHERE item_count>1)");
         if(!string.IsNullOrWhiteSpace(query.SearchText))
         {
             where.Add("instr(search_key,$text)>0");command.Parameters.AddWithValue("$text",query.SearchText.Replace('\\','/').ToUpperInvariant());
@@ -293,7 +293,7 @@ public sealed partial class SqliteDesktopCatalogStore
     private static string SortExpression(CatalogViewQuery query)=>query.UseCaptureDate ? "COALESCE(capture_date_ticks,0)" : "file_local_ticks";
     private static string Fingerprint(CatalogViewQuery query)=>Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(query with {Cursor=null,Offset=0,PageSize=0})))[..24];
     private sealed record PageCursor(long Ticks,string PathKey,string View);
-    private const string ItemColumns="asset_id,path,is_favorite,size_bytes,file_modified_utc_ticks,is_video,capture_date_ticks,metadata_indexed,is_hidden_or_system,file_local_ticks,metadata_status,metadata_attempted_ticks,metadata_retry_ticks,metadata_error_code";
+    private const string ItemColumns="asset_id,path,is_favorite,size_bytes,file_modified_utc_ticks,is_video,capture_date_ticks,metadata_indexed,is_hidden_or_system,file_local_ticks,metadata_status,metadata_attempted_ticks,metadata_retry_ticks,metadata_error_code,availability,availability_checked_ticks,availability_error_code,file_identity,observation_version";
     private static SavedMediaItem ReadItem(SqliteDataReader r)=>new()
     {
         AssetId=r.GetString(0),Path=r.GetString(1),IsFavorite=r.GetInt64(2)==1,SizeBytes=r.GetInt64(3),
@@ -303,6 +303,10 @@ public sealed partial class SqliteDesktopCatalogStore
         MetadataStatus=(PhotoShelf.Application.Metadata.MetadataReadStatus)r.GetInt32(10),
         MetadataAttemptedAtUtc=r.IsDBNull(11)?null:new DateTime(r.GetInt64(11),DateTimeKind.Utc),
         MetadataRetryAtUtc=r.IsDBNull(12)?null:new DateTime(r.GetInt64(12),DateTimeKind.Utc),
-        MetadataErrorCode=r.IsDBNull(13)?null:r.GetString(13)
+        MetadataErrorCode=r.IsDBNull(13)?null:r.GetString(13),
+        Availability=(FileAvailability)r.GetInt32(14),
+        AvailabilityCheckedAtUtc=r.IsDBNull(15)?null:new DateTime(r.GetInt64(15),DateTimeKind.Utc),
+        AvailabilityErrorCode=r.IsDBNull(16)?null:r.GetString(16),
+        FileIdentity=r.IsDBNull(17)?null:r.GetString(17), ObservationVersion=r.GetInt64(18)
     };
 }

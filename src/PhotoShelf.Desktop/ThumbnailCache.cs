@@ -24,7 +24,7 @@ public static class ThumbnailCache
     }, token);
 
     // All callers run in background workers. This cache exclusively owns generated ps-thumb-v2-* entries.
-    public static ImageSource? LoadOrCreate(string path, int decodeWidth, Func<string, int, ImageSource?> factory)
+    public static ImageSource? LoadOrCreate(string path, int decodeWidth, Func<string, int, ImageSource?> factory, long observationVersion = 0)
     {
         var generation = Store.Generation;
         ScheduleTrim();
@@ -33,7 +33,9 @@ public static class ThumbnailCache
         {
             var source = new FileInfo(path);
             if (!source.Exists) return null;
-            key = Store.GetKey(source.FullName, source.Length, source.LastWriteTimeUtc.Ticks, decodeWidth);
+            // Watcher invalidation must also defeat editors which preserve size and mtime.
+            var identity = observationVersion == 0 ? source.FullName : $"{source.FullName}|observation:{observationVersion}";
+            key = Store.GetKey(identity, source.Length, source.LastWriteTimeUtc.Ticks, decodeWidth);
             if (Store.TryGetPath(key) is { } cachedPath && LoadBitmap(cachedPath, decodeWidth) is { } cached)
             {
                 ScheduleTrim();

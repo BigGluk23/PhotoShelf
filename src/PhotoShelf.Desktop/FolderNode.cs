@@ -13,6 +13,12 @@ public sealed class FolderNode : INotifyPropertyChanged
     public bool IsVisible { get => _isVisible; set { _isVisible = value; OnPropertyChanged(nameof(IsVisible)); } }
     private bool _isExpanded;
     private int _directItemCount;
+    private string _availabilityText = "";
+    public string AvailabilityText
+    {
+        get => _availabilityText;
+        set { if (_availabilityText == value) return; _availabilityText = value; OnPropertyChanged(nameof(AvailabilityText)); OnPropertyChanged(nameof(DisplayText)); }
+    }
 
     public FolderNode(string fullPath, FolderNode? parent = null)
     {
@@ -97,7 +103,8 @@ public sealed class FolderNode : INotifyPropertyChanged
         }
     }
 
-    public string DisplayText => DirectItemCount > 0 ? $"{Name}  ({DirectItemCount})" : Name;
+    public string DisplayText => (DirectItemCount > 0 ? $"{Name}  ({DirectItemCount})" : Name) +
+        (AvailabilityText.Length == 0 ? "" : $" — {AvailabilityText}");
 
     private static string GetDisplayName(string fullPath)
     {

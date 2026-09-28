@@ -11,6 +11,10 @@ on:
         description: Include synthetic 10k/100k/1M catalog tests
         type: boolean
         default: false
+      performance_million:
+        description: Also compare baseline/current WPF and SQL with 1M synthetic catalog records
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -59,3 +63,36 @@ jobs:
             artifacts/windows-*/*.sha256
           if-no-files-found: error
           retention-days: 14
+
+  performance:
+    name: Same-host baseline/current performance
+    needs: windows
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out current source and pinned baseline history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up pinned .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Set up comparison reporter
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Compare four fresh processes on this same host
+        shell: pwsh
+        env:
+          PHOTOSHELF_PERFORMANCE_MILLION: ${{ inputs.performance_million == true }}
+        run: ./scripts/compare-windows-performance.ps1 -Million:($env:PHOTOSHELF_PERFORMANCE_MILLION -eq 'true')
+      - name: Preserve raw measurements, machine metadata and comparison
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-performance-${{ github.sha }}
+          path: TestResults/performance-*/
+          if-no-files-found: error
+          retention-days: 30

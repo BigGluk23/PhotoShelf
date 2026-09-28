@@ -31,6 +31,7 @@ public sealed class LocalCatalogState
 
     // Positive exceptions inside excluded ancestors; missing in older catalogs means no exceptions.
     public List<string> IncludedFolders { get; set; } = new();
+    public List<string> WatchedFolders { get; set; } = new();
 
     public List<SavedDuplicateHash> DuplicateHashes { get; set; } = new();
 }
@@ -38,6 +39,11 @@ public sealed class LocalCatalogState
 public sealed class SavedMediaItem
 {
     public string AssetId { get; set; } = string.Empty;
+    public FileAvailability Availability { get; set; } = FileAvailability.NeedsVerification;
+    public DateTime? AvailabilityCheckedAtUtc { get; set; }
+    public string? AvailabilityErrorCode { get; set; }
+    public string? FileIdentity { get; set; }
+    public long ObservationVersion { get; set; }
     public DateTime? CaptureDate { get; set; }
     public bool MetadataIndexed { get; set; }
     public PhotoShelf.Application.Metadata.MetadataReadStatus MetadataStatus { get; set; }

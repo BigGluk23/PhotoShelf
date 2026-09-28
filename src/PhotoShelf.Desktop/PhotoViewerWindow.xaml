@@ -147,7 +147,7 @@
                     <DataTemplate>
                         <Border x:Name="ThumbCard" Width="{Binding Width}" Height="{Binding Height}" Background="#FF2D3036" CornerRadius="10" ClipToBounds="True">
                             <Grid>
-                                <Image local:AsyncMediaImage.Path="{Binding Item.Path}" Stretch="UniformToFill" />
+                                <Image local:AsyncMediaImage.Path="{Binding Item.PreviewPath}" local:AsyncMediaImage.Revision="{Binding Item.ObservationVersion}" Stretch="UniformToFill" />
                                 <TextBlock Text="{Binding Item.KindLabel}"
                                            Foreground="#FFEFEFEF"
                                            FontWeight="SemiBold"

@@ -73,6 +73,7 @@ public static class AsyncMediaImage
     }
     public static readonly DependencyProperty PathProperty = DependencyProperty.RegisterAttached("Path", typeof(string), typeof(AsyncMediaImage), new PropertyMetadata(null, Changed));
     public static readonly DependencyProperty DecodeWidthProperty = DependencyProperty.RegisterAttached("DecodeWidth", typeof(int), typeof(AsyncMediaImage), new PropertyMetadata(256, Changed));
+    public static readonly DependencyProperty RevisionProperty = DependencyProperty.RegisterAttached("Revision", typeof(long), typeof(AsyncMediaImage), new PropertyMetadata(0L, Changed));
     public static readonly DependencyProperty StatusProperty = DependencyProperty.RegisterAttached("Status", typeof(string), typeof(AsyncMediaImage), new PropertyMetadata(""));
     private static readonly DependencyProperty StateProperty = DependencyProperty.RegisterAttached("State", typeof(State), typeof(AsyncMediaImage));
     public static string GetStatus(DependencyObject obj) => (string)obj.GetValue(StatusProperty);
@@ -81,6 +82,8 @@ public static class AsyncMediaImage
     public static void SetPath(DependencyObject obj, string? value) => obj.SetValue(PathProperty, value);
     public static int GetDecodeWidth(DependencyObject obj) => (int)obj.GetValue(DecodeWidthProperty);
     public static void SetDecodeWidth(DependencyObject obj, int value) => obj.SetValue(DecodeWidthProperty, value);
+    public static long GetRevision(DependencyObject obj) => (long)obj.GetValue(RevisionProperty);
+    public static void SetRevision(DependencyObject obj, long value) => obj.SetValue(RevisionProperty, value);
 
     private sealed class State(string path)
     {
@@ -142,10 +145,11 @@ public static class AsyncMediaImage
         image.SetValue(StateProperty, state);
         var token = state.Cancellation.Token;
         var width = Math.Clamp(GetDecodeWidth(image), 32, 4096);
+        var revision = GetRevision(image);
         DecodedFrames? result = null;
         try
         {
-            result = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.VisiblePreview, ct => Decode(path, width, ct), token);
+            result = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.VisiblePreview, ct => Decode(path, width, revision, ct), token);
             if (token.IsCancellationRequested || !image.IsLoaded || !ReferenceEquals(image.GetValue(StateProperty), state)) return;
             state.Frames = result;
             result = null; // Ownership transfers only after checking the realized element's identity.
@@ -191,7 +195,7 @@ public static class AsyncMediaImage
     }
     private sealed class MediaBudgetException : Exception { }
 
-    private static DecodedFrames Decode(string path, int width, CancellationToken token)
+    private static DecodedFrames Decode(string path, int width, long revision, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         var video = PhotoItem.IsVideoPath(path);
@@ -228,7 +232,7 @@ public static class AsyncMediaImage
             var frames = new List<Frame>();
             if (video)
             {
-                var bitmap = ThumbnailCache.LoadOrCreate(path, width, static (p, w) => VideoThumbnailProvider.TryLoad(p, w)) as BitmapSource;
+                var bitmap = ThumbnailCache.LoadOrCreate(path, width, static (p, w) => VideoThumbnailProvider.TryLoad(p, w), revision) as BitmapSource;
                 if (bitmap is not null) frames.Add(new(bitmap, 100));
             }
             else if (animatedFormat)
@@ -241,7 +245,7 @@ public static class AsyncMediaImage
             }
             else
             {
-                var bitmap = width <= 512 ? ThumbnailCache.LoadOrCreate(path, width, (p, w) => MediaBitmapLoader.LoadStillBounded(p, w, token)) as BitmapSource : MediaBitmapLoader.LoadStillBounded(path, width, token);
+                var bitmap = width <= 512 ? ThumbnailCache.LoadOrCreate(path, width, (p, w) => MediaBitmapLoader.LoadStillBounded(p, w, token), revision) as BitmapSource : MediaBitmapLoader.LoadStillBounded(path, width, token);
                 if (bitmap is not null) frames.Add(new(bitmap, 100));
             }
             token.ThrowIfCancellationRequested();

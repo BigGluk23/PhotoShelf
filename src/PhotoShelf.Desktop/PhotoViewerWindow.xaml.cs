@@ -20,6 +20,7 @@ public partial class PhotoViewerWindow : Window
     private readonly DispatcherTimer _videoTimer;
     private long _index;
     private string? _anchorPath;
+    private string? _displayedPath;
     private bool _updatingFilmstrip;
     private bool _isSeeking;
     private bool _isVideoPlaying;
@@ -104,6 +105,12 @@ public partial class PhotoViewerWindow : Window
         {
             var anchor = _anchorPath; _anchorPath = null;
             var center = _index;
+            if (anchor is not null)
+            {
+                var movedIndex = await _store.IndexOfAsync(_query, anchor, request.Token);
+                request.Token.ThrowIfCancellationRequested();
+                if (movedIndex is not null) _index = center = movedIndex.Value;
+            }
             var start = Math.Max(0, center - 5);
             var page = await _store.QueryPageAsync(_query, checked((int)start), 11, token: request.Token);
             request.Token.ThrowIfCancellationRequested();
@@ -112,7 +119,7 @@ public partial class PhotoViewerWindow : Window
             {
                 var saved = page.Items[i];
                 var photo = new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt) { IsFavorite = saved.IsFavorite };
-                if (saved.MetadataIndexed) photo.ApplyIndexedCaptureDate(saved.CaptureDate);
+                photo.ApplyCatalogObservation(saved);
                 _nearby[start + i] = photo;
             }
             if (!_nearby.TryGetValue(center, out item!)) { TitleText.Text = "Файл больше не входит в этот вид"; return; }
@@ -122,7 +129,8 @@ public partial class PhotoViewerWindow : Window
                 request.Token.ThrowIfCancellationRequested();
                 if (saved is null) { TitleText.Text = "Выбранный файл больше не в каталоге"; return; }
                 item = new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
-                if (saved.MetadataIndexed) item.ApplyIndexedCaptureDate(saved.CaptureDate);
+                item.ApplyCatalogObservation(saved);
+                _nearby[center] = item;
             }
             RebuildFilmstrip();
         }
@@ -131,10 +139,20 @@ public partial class PhotoViewerWindow : Window
         finally { if (ReferenceEquals(_request, request)) _request = null; }
 
         Title = item.FileName;
+        _displayedPath = item.Path;
         TitleText.Text = item.FileName;
         DetailText.Text = $"{_index + 1} из {_count}   {item.DetailLine}   {item.Folder}";
         StopVideo();
         AsyncMediaImage.SetPath(PhotoImage, null);
+
+        if (item.PreviewPath is null)
+        {
+            VideoControlsPanel.Visibility = Visibility.Collapsed;
+            VideoPlayer.Visibility = Visibility.Collapsed;
+            PhotoImage.Visibility = Visibility.Visible;
+            AsyncMediaImage.SetStatus(PhotoImage, item.AvailabilityText);
+            return;
+        }
 
         if (item.IsVideo)
         {
@@ -158,6 +176,7 @@ public partial class PhotoViewerWindow : Window
         PhotoImage.Source = null;
 
         AsyncMediaImage.SetDecodeWidth(PhotoImage, 2200);
+        AsyncMediaImage.SetRevision(PhotoImage, item.ObservationVersion);
         AsyncMediaImage.SetPath(PhotoImage, item.Path);
     }
 
@@ -167,6 +186,17 @@ public partial class PhotoViewerWindow : Window
         StopVideo();
         AsyncMediaImage.SetPath(PhotoImage, null);
         base.OnClosed(e);
+    }
+
+    public void CatalogItemsChanged(IReadOnlyList<SavedMediaItem> items, IReadOnlyList<CatalogExternalRename> renames)
+    {
+        if (_lifetime.IsCancellationRequested) return;
+        var path = _displayedPath;
+        if (path is null) return;
+        var rename = renames.FirstOrDefault(change => change.Source.Equals(path, StringComparison.OrdinalIgnoreCase));
+        if (rename is null && !items.Any(item => item.Path.Equals(path, StringComparison.OrdinalIgnoreCase))) return;
+        _anchorPath = rename?.Destination.Path ?? path;
+        ShowCurrentPhoto();
     }
 
     private void StopVideo()

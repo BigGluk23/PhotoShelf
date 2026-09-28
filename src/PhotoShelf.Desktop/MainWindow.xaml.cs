@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.5";
+    private const string VersionLabel = "Ultra v0.10.6";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -356,7 +356,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (_fileOperationActive || _closing) { node.ApplyInclusion(_folderInclusion); return; }
         _scanCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel();
-        _maintenanceCancellation?.Cancel();
         var included = node.ToggleInclusion(_folderInclusion);
         _pendingFolderScans.RemoveWhere(path => !_folderInclusion.MayContainIncluded(path));
         if (included) _pendingFolderScans.Add(node.FullPath);
@@ -395,6 +394,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         RefreshChrome();
         SaveCatalogState();
         StartMetadataIndexing(false);
+        QueueLibraryMonitoring();
         if (_pendingFolderScans.Count > 0) _ = ScanCheckedFoldersAsync(_folderCheckRevision);
     }
 
@@ -607,7 +607,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             await previous;
             var token = operation.Token; token.ThrowIfCancellationRequested();
             SetScanning(true);
-            foreach (var root in roots) AddFolder(root);
+            foreach (var root in roots) { AddFolder(root); RegisterWatchedFolder(root); }
+            QueueLibraryMonitoring();
             if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
             await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token,
                 inclusion: _folderInclusion.Snapshot());
@@ -892,6 +893,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_isInitializing || _lifetime.IsCancellationRequested) return;
         _ = RebuildRowsAsync();
+        QueueLibraryMonitoring();
     }
 
     private void RefreshDateSortButton()
@@ -944,7 +946,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 if (_lifetime.IsCancellationRequested || _closing) return;
                 (PhotoRows as VirtualPhotoRows)?.ApplyMetadata(batch);
                 foreach (var saved in batch)
-                    if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt)
+                    if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt && selected.ObservationVersion == saved.ObservationVersion)
                         selected.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
                 MetadataStatusText.Text = $"Метаданные: {count:N0}";
                 if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate)) NoteCatalogChanged();
@@ -973,13 +975,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     var previousDate = item.CaptureDate;
                     if (fresh is not null && (fresh.SizeBytes != item.SizeBytes || fresh.FileModifiedAt != item.FileModifiedAt))
                     {
-                        await _desktopCatalogStore.UpsertItemsAsync(new[] { fresh }, preserveFavorites: true, token);
+                        // The scan/monitor owns file-state updates. A changed input cannot publish
+                        // metadata read against an older catalog observation.
+                        var probe = new FileSystemObservationProbe().ProbeFile(item.Path);
+                        if (probe.Availability == FileAvailability.Available)
+                            await _desktopCatalogStore.ApplyObservationAsync(new(LibraryCatalogSynchronizer.Available(probe)), item, token);
                         await Dispatcher.InvokeAsync(NoteCatalogChanged, DispatcherPriority.Background);
-                        item.CaptureDate = null;
+                        continue;
                     }
                     fresh ??= item;
+                    fresh.ObservationVersion = item.ObservationVersion;
+                    fresh.Availability = item.Availability;
+                    fresh.AvailabilityCheckedAtUtc = item.AvailabilityCheckedAtUtc;
+                    fresh.AvailabilityErrorCode = item.AvailabilityErrorCode;
+                    fresh.AssetId = item.AssetId;
                     var attempted = DateTime.UtcNow;
-                    if (!await _desktopCatalogStore.UpdateMetadataResultAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, result, attempted, token)) continue;
+                    if (!await _desktopCatalogStore.UpdateMetadataResultAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, result, attempted, token, expectedObservationVersion: item.ObservationVersion)) continue;
                     var date = result.ApplyTo(item.CaptureDate);
                     groupingChanged |= previousDate != date;
                     fresh.CaptureDate = date; fresh.MetadataIndexed = result.IsTerminal; fresh.MetadataStatus = result.Status;
@@ -1001,6 +1012,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 _metadataIndexCancellation = null;
                 CompleteCatalogStage();
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_metadataRefreshPending && !_closing && !_fileOperationActive && !_hasPendingRecovery)
+                    { _metadataRefreshPending = false; StartMetadataIndexing(false); }
+                }), DispatcherPriority.Background);
             }
             operation.Dispose();
         }
@@ -1059,7 +1075,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadSavedCatalogAsync();
             MarkInitialCatalogReady();
-            StartBackgroundCatalogMaintenance();
+            QueueLibraryMonitoring();
             if (!_hasPendingRecovery) StartMetadataIndexing(resetExisting: false);
         }
         catch (OperationCanceledException) { MarkInitialCatalogFailed(new OperationCanceledException()); }
@@ -1072,39 +1088,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             RefreshChrome();
         }
     }
-
-    private void StartBackgroundCatalogMaintenance()
-    {
-        if (_fileOperationActive || _hasPendingRecovery || _closing) return;
-        _maintenanceCancellation?.Cancel();
-        var previous = _maintenanceTask;
-        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _maintenanceCancellation = operation;
-        _maintenanceTask = MaintainCatalogAsync(operation, previous);
-    }
-    private async Task MaintainCatalogAsync(CancellationTokenSource operation, Task previous)
-    {
-        try
-        {
-            await previous;
-            var token = operation.Token;
-            var changed = new List<SavedMediaItem>(128);
-            var rules = _folderInclusion.Snapshot();
-            await foreach (var old in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true,
-                ExcludedFolders = rules.ExcludedFolders, IncludedFolders = rules.IncludedFolders }, token))
-            {
-                var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ => ToSavedItem(old.Path), token);
-                if (fresh is not null && (fresh.SizeBytes != old.SizeBytes || fresh.FileModifiedAt != old.FileModifiedAt || fresh.IsHiddenOrSystem != old.IsHiddenOrSystem)) changed.Add(fresh);
-                if (changed.Count < 128) continue;
-                await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); changed.Clear(); NoteCatalogChanged();
-            }
-            if (changed.Count > 0) { await _desktopCatalogStore.UpsertItemsAsync(changed, preserveFavorites: true, token); NoteCatalogChanged(); }
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusText.Text = $"Проверка каталога: {ex.Message}"; }
-        finally { if (ReferenceEquals(_maintenanceCancellation, operation)) { _maintenanceCancellation = null; CompleteCatalogStage(); } operation.Dispose(); }
-    }
-
 
     private void SaveCatalogState()
     {
@@ -1144,7 +1127,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var searchTask = Task.Run(async () =>
             {
                 var matches = new List<DuplicateSearchMatch>(128);
-                var pending = new List<SavedDuplicateHash>(); var count = 0;
+                var count = 0;
                 await foreach (var saved in _desktopCatalogStore.EnumerateAsync(query, token))
                 {
                     if (scope == DuplicateSearchScope.CompareTwoFolders &&
@@ -1166,23 +1149,25 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                                 return after.Length == fresh.SizeBytes && after.LastWriteTime == fresh.FileModifiedAt ? value : null;
                             }, token);
                             if (hash is null) continue;
-                            pending.Add(new SavedDuplicateHash { Path = fresh.Path, SizeBytes = fresh.SizeBytes, FileModifiedAt = fresh.FileModifiedAt, Hash = hash });
+                            if (!await _duplicateHashStore.SaveObservedAsync(new SavedDuplicateHash
+                                { Path = fresh.Path, SizeBytes = fresh.SizeBytes, FileModifiedAt = fresh.FileModifiedAt, Hash = hash }, saved, token)) continue;
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
                     }
+                    var observed = await _desktopCatalogStore.GetItemAsync(saved.Path, token);
+                    if (observed is null || observed.ObservationVersion != saved.ObservationVersion || observed.AssetId != saved.AssetId ||
+                        observed.SizeBytes != fresh.SizeBytes || observed.FileModifiedAt != fresh.FileModifiedAt) continue;
                     fresh.CaptureDate = saved.CaptureDate;
                     var mask = (compareA is not null && IsUnderFolder(fresh.Path, compareA) ? 1 : 0) |
                         (compareB is not null && IsUnderFolder(fresh.Path, compareB) ? 2 : 0);
                     matches.Add(new DuplicateSearchMatch(fresh, hash, mask));
                     if (++count % 128 == 0)
                     {
-                        await _duplicateHashStore.SaveAsync(pending.ToArray(), token); pending.Clear();
                         await session.AddAsync(matches, token); matches.Clear();
                         var progress = count;
                         await Dispatcher.InvokeAsync(() => { if (!token.IsCancellationRequested) StatusText.Text = $"Проверено кандидатов: {progress:N0}"; }, DispatcherPriority.Background, token);
                     }
                 }
-                await _duplicateHashStore.SaveAsync(pending, token);
                 if (matches.Count > 0) await session.AddAsync(matches, token);
                 await session.CompleteAsync(scope == DuplicateSearchScope.CompareTwoFolders, token);
             }, token);
@@ -1206,7 +1191,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 {
                     ApplyMovedPaths(); _activeDuplicateReview = null;
                     try { await RefreshCatalogCountAsync(); await CheckPendingOperationsAsync(); RebuildRows(); }
-                    finally { _fileOperationActive = false; }
+                    finally { _fileOperationActive = false; QueueLibraryMonitoring(); }
                 }
             }
         }
@@ -1282,13 +1267,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _infoCancellation = operation;
         Task? pendingRead = null;
+        var observedVersion = item.ObservationVersion;
+        var observedPath = item.Path;
+        // Read an immutable snapshot so a concurrent external rename cannot poison its metadata cache.
+        var snapshot = new PhotoItem(item.Path, item.FileSizeBytes, item.FileModifiedAt);
+        snapshot.ApplyCatalogObservation(new SavedMediaItem { Path = item.Path, AssetId = item.AssetId, IsVideo = item.IsVideo,
+            SizeBytes = item.FileSizeBytes, FileModifiedAt = item.FileModifiedAt, CaptureDate = item.CaptureDate,
+            MetadataStatus = item.MetadataStatus, Availability = item.Availability, AvailabilityErrorCode = item.AvailabilityErrorCode,
+            ObservationVersion = item.ObservationVersion, IsFavorite = item.IsFavorite });
         try
         {
-            var work = BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Interactive, _ => item.MetadataText, operation.Token);
+            var work = BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Interactive, _ => snapshot.MetadataText, operation.Token);
             pendingRead = work;
             _infoWorkTasks.Add(work);
             var text = await work;
-            if (!operation.IsCancellationRequested && revision == _infoRevision && ReferenceEquals(item, _selectedPhoto)) InfoText.Text = text;
+            if (!operation.IsCancellationRequested && revision == _infoRevision && ReferenceEquals(item, _selectedPhoto) && item.ObservationVersion == observedVersion && item.Path == observedPath) InfoText.Text = text;
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (revision == _infoRevision) InfoText.Text = $"Сведения недоступны: {ex.Message}"; }

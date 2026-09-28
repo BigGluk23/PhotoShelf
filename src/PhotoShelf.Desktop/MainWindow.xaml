@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.5" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.6" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -240,7 +240,8 @@
                                                     <StackPanel>
                                                         <Border Height="{Binding DataContext.TileImageHeight, RelativeSource={RelativeSource AncestorType=Window}}" Background="#FFE5E2DC" ClipToBounds="True">
                                                             <Grid>
-                                                                <media:PreviewImage x:Name="TileImage" media:AsyncMediaImage.Path="{Binding Path}" Stretch="UniformToFill" />
+                                                                <media:PreviewImage x:Name="TileImage" media:AsyncMediaImage.Path="{Binding PreviewPath}" media:AsyncMediaImage.Revision="{Binding ObservationVersion}" Stretch="UniformToFill" />
+                                                                <TextBlock Text="{Binding AvailabilityText}" Style="{StaticResource MediaStatusText}" Background="#E6FFF0CE" Foreground="#FF644200" TextWrapping="Wrap" FontSize="10" VerticalAlignment="Top" />
                                                                 <TextBlock Style="{StaticResource MediaStatusText}" Text="{Binding ElementName=TileImage, Path=Status}" TextWrapping="Wrap" FontSize="10" Background="#DDE5E2DC" VerticalAlignment="Bottom" />
                                                                 <TextBlock Text="{Binding KindLabel}"
                                                                            Foreground="{StaticResource MutedTextBrush}"
@@ -314,7 +315,10 @@
                     <ColumnDefinition Width="560" />
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock x:Name="StatusText" Text="0 фотографий" Width="210" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <StackPanel Width="210" VerticalAlignment="Center">
+                        <TextBlock x:Name="StatusText" Text="0 фотографий" Foreground="#FFDEDEDE" TextTrimming="CharacterEllipsis" />
+                        <TextBlock x:Name="LibraryStatusText" Text="Автообновление: подготовка" FontSize="10" Foreground="#FFBFC5CC" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
                     <TextBlock x:Name="MetadataStatusText" Text="Метаданные: ждут" Width="130" Foreground="#FFDEDEDE" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <ProgressBar x:Name="CatalogProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />
                     <ProgressBar x:Name="DuplicateProgressBar" Width="110" Height="8" Margin="8,0,0,0" Minimum="0" Maximum="100" Visibility="Collapsed" />

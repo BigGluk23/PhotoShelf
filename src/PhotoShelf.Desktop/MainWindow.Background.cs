@@ -17,14 +17,13 @@ public partial class MainWindow
     private CancellationTokenSource? _rangeSelectionCancellation;
     private CancellationTokenSource? _browseCancellation;
     private CancellationTokenSource? _saveCancellation;
-    private CancellationTokenSource? _maintenanceCancellation;
     private Task _pendingSave = Task.CompletedTask;
     private Task _metadataTask = Task.CompletedTask;
-    private Task _maintenanceTask = Task.CompletedTask;
     private Task _scanTask = Task.CompletedTask;
     private Task _browseTask = Task.CompletedTask;
     private bool _isProjecting;
     private bool _projectionQueued;
+    private bool _projectionDeferredForScroll;
     private readonly CatalogRefreshBuffer _backgroundRefresh = new();
     private bool _includeSubfolders = true;
     private bool _closeReady;
@@ -90,7 +89,11 @@ public partial class MainWindow
                 await Task.Delay(250, _lifetime.Token);
                 while (_isProjecting) await Task.Delay(100, _lifetime.Token);
                 if (_closing || _fileOperationActive || !_backgroundRefresh.ShouldPublish((PhotoRows as VirtualPhotoRows)?.ItemCount > 0)) break;
-                if (!await RebuildRowsAsync(background: true)) break;
+                if (!await RebuildRowsAsync(background: true))
+                {
+                    if (!_projectionDeferredForScroll) break;
+                    await Task.Delay(500, _lifetime.Token);
+                }
             }
             while (_backgroundRefresh.ShouldPublish((PhotoRows as VirtualPhotoRows)?.ItemCount > 0));
         }
@@ -104,9 +107,8 @@ public partial class MainWindow
     {
         var item = _selection.Find(saved.Path) ?? retained?.GetValueOrDefault(saved.Path)
             ?? new PhotoItem(saved.Path, saved.SizeBytes, saved.FileModifiedAt);
-        item.ApplyFileInformation(saved.SizeBytes, saved.FileModifiedAt);
-        item.IsFavorite = saved.IsFavorite; if (index >= 0) item.ViewIndex = index;
-        item.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
+        item.ApplyCatalogObservation(saved);
+        if (index >= 0) item.ViewIndex = index;
         return item;
     }
 
@@ -130,6 +132,7 @@ public partial class MainWindow
             .ToDictionary(item => item.Path, StringComparer.OrdinalIgnoreCase) : null;
         VirtualPhotoRows? pending = null;
         _isProjecting = true;
+        _projectionDeferredForScroll = false;
         UpdatePendingRefresh();
         if (!preserve)
         {
@@ -154,7 +157,7 @@ public partial class MainWindow
             token.ThrowIfCancellationRequested();
             // Do not undo a scroll made while the background query was preparing.
             // The explicit update button remains available for this pending revision.
-            if (background && preserve && GetGridAnchor() != anchor) return false;
+            if (background && preserve && GetGridAnchor() != anchor) { _projectionDeferredForScroll = true; return false; }
             old?.Dispose(); PhotoRows = rows; pending = null; _currentQuery = query; _viewIdentity = identity;
             OnPropertyChanged(nameof(PhotoRows));
             if (preserve && anchorIndex > 0 && rows.Count > 0)
@@ -213,6 +216,7 @@ public partial class MainWindow
     private Task BrowseFolderAsync(string folder)
     {
         if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return Task.CompletedTask;
+        QueueLibraryMonitoring();
         _browseCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         var previous = _browseTask;
@@ -236,10 +240,8 @@ public partial class MainWindow
 
     private async Task IndexScanBatchAsync(PhotoScanBatch batch, CancellationToken token)
     {
-        var items = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Scan, _ =>
-            batch.Paths.Select(ToSavedItem).Where(x => x is not null).Cast<SavedMediaItem>().ToArray(), token);
-        token.ThrowIfCancellationRequested();
-        await _desktopCatalogStore.UpsertItemsAsync(items, preserveFavorites: true, token);
+        var synchronizer = new LibraryCatalogSynchronizer(_desktopCatalogStore, PublishLibraryUpdateAsync);
+        await synchronizer.ObservePathsAsync(batch.Paths, forceContent: false, token);
         await Dispatcher.InvokeAsync(() =>
         {
             if (_lifetime.IsCancellationRequested || _closing) return;
@@ -305,7 +307,8 @@ public partial class MainWindow
         SortNewestFirst = _sortNewestFirst, IncludeSubfolders = _includeSubfolders,
         ExpandedFolders = _folderNodes.Values.Where(x => x.IsExpanded).Select(x => x.FullPath).ToList(),
         ExcludedFolders = _folderInclusion.ExcludedFolders.ToList(),
-        IncludedFolders = _folderInclusion.IncludedFolders.ToList()
+        IncludedFolders = _folderInclusion.IncludedFolders.ToList(),
+        WatchedFolders = (_monitorRootsRestored ? _watchedFolders : _catalogState.WatchedFolders.Concat(_watchedFolders)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
     };
     private async Task SaveAfterDelayAsync(CancellationToken token)
     {
@@ -321,8 +324,10 @@ public partial class MainWindow
     }
     private async Task StopCatalogWritersAsync(bool stopDuplicates = true)
     {
+        await _monitorConfigurationTask;
+        if (_libraryMonitor is not null) { await _libraryMonitor.PauseAsync(); _monitorPaused = true; }
         _scanCancellation?.Cancel(); _browseCancellation?.Cancel();
-        _metadataIndexCancellation?.Cancel(); _maintenanceCancellation?.Cancel();
+        _metadataIndexCancellation?.Cancel();
         _saveCancellation?.Cancel(); _infoCancellation?.Cancel(); _rangeSelectionCancellation?.Cancel();
         if (stopDuplicates)
         {
@@ -330,7 +335,7 @@ public partial class MainWindow
             try { await _duplicateWorkTask; } catch (OperationCanceledException) { }
         }
         try { await Task.WhenAll(_infoWorkTasks.ToArray()); } catch (Exception) { /* All readers have finished, including canceled or failed reads. */ }
-        await Task.WhenAll(_scanTask, _browseTask, _metadataTask, _maintenanceTask, _pendingSave);
+        await Task.WhenAll(_scanTask, _browseTask, _metadataTask, _pendingSave);
     }
     protected override async void OnClosing(CancelEventArgs e)
     {
@@ -348,6 +353,7 @@ public partial class MainWindow
             if (_activeDuplicateReview is { } review) { review.StopOperation(); await review.PendingOperation; }
             await _fileOperationTask;
             if (_catalogLoaded) await PersistStateAsync(CaptureState(), CancellationToken.None, 0);
+            if (_libraryMonitor is not null) await _libraryMonitor.DisposeAsync();
             _closeReady = true; Close();
         }
         catch (Exception ex)

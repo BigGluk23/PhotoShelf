@@ -185,6 +185,22 @@ public sealed class VirtualPhotoRowsTests
     });
 
     [Fact]
+    public Task LateMetadataWithSameFingerprintCannotOverwriteNewObservation() => OnStaAsync(async () =>
+    {
+        using var fixture = await Fixture.CreateAsync();
+        using var rows = fixture.Rows(Item);
+        await rows.PrimeAsync();
+        var item = ((PhotoRow)rows[1]!).Items[0];
+        item.ApplyCatalogObservation(new SavedMediaItem { Path = item.Path, SizeBytes = item.FileSizeBytes,
+            FileModifiedAt = item.FileModifiedAt, ObservationVersion = 2, Availability = FileAvailability.Available });
+        rows.ApplyMetadata([new SavedMediaItem { Path = item.Path, SizeBytes = item.FileSizeBytes,
+            FileModifiedAt = item.FileModifiedAt, ObservationVersion = 1,
+            CaptureDate = new DateTime(2020, 1, 1), MetadataIndexed = true }]);
+        Assert.False(item.IsCaptureDateLoaded);
+        Assert.Null(item.CaptureDate);
+    });
+
+    [Fact]
     public Task DeepAnchorIsLoadedBeforePublicationWithoutLoadingFirstPage() => OnStaAsync(async () =>
     {
         using var fixture = await Fixture.CreateAsync();

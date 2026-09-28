@@ -192,7 +192,7 @@ public sealed class VirtualPhotoRows : IList, IDisposable
         var byPath = new Dictionary<string, SavedMediaItem>(StringComparer.OrdinalIgnoreCase);
         foreach (var update in updates) byPath[update.Path] = update;
         foreach (var item in LoadedItems)
-            if (byPath.TryGetValue(item.Path, out var saved) && item.FileSizeBytes == saved.SizeBytes && item.FileModifiedAt == saved.FileModifiedAt)
+            if (byPath.TryGetValue(item.Path, out var saved) && item.FileSizeBytes == saved.SizeBytes && item.FileModifiedAt == saved.FileModifiedAt && item.ObservationVersion == saved.ObservationVersion)
                 item.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
     }
     public long ItemIndexForRow(int rowIndex)

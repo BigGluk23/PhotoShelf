@@ -65,6 +65,46 @@ public sealed class AsyncMediaImageTests
     });
 
     [Fact]
+    public Task NewObservationReloadsSamePathEvenWhenSizeAndTimestampAreUnchanged() => OnStaAsync(async () =>
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "photoshelf-wpf-image-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "changed.bmp");
+        // Uncompressed BMP makes the equal-size rewrite deterministic.
+        void WriteBitmap(byte blue, byte red)
+        {
+            var pixels = new byte[32 * 32 * 4];
+            for (var i = 0; i < pixels.Length; i += 4) { pixels[i] = blue; pixels[i + 2] = red; pixels[i + 3] = 255; }
+            var encoder = new BmpBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(BitmapSource.Create(32, 32, 96, 96, PixelFormats.Bgra32, null, pixels, 128)));
+            using var stream = File.Create(path); encoder.Save(stream);
+        }
+        WriteBitmap(0, 255);
+        var timestamp = File.GetLastWriteTimeUtc(path); var size = new FileInfo(path).Length;
+        var image = new Image(); AsyncMediaImage.SetDecodeWidth(image, 600);
+        var window = new Window { Content = image, Width = 100, Height = 100, ShowInTaskbar = false };
+        try
+        {
+            window.Show(); AsyncMediaImage.SetRevision(image, 1); AsyncMediaImage.SetPath(image, path);
+            await WaitUntilAsync(() => image.Source is BitmapSource);
+            var old = image.Source;
+            WriteBitmap(255, 0); File.SetLastWriteTimeUtc(path, timestamp);
+            Assert.Equal(size, new FileInfo(path).Length);
+            AsyncMediaImage.SetRevision(image, 2);
+            await WaitUntilAsync(() => image.Source is BitmapSource && !ReferenceEquals(image.Source, old));
+            var bitmap = new FormatConvertedBitmap((BitmapSource)image.Source, PixelFormats.Bgra32, null, 0);
+            var pixels = new byte[bitmap.PixelWidth * bitmap.PixelHeight * 4];
+            bitmap.CopyPixels(pixels, bitmap.PixelWidth * 4, 0);
+            Assert.Equal(255, pixels[0]); Assert.Equal(0, pixels[2]);
+        }
+        finally
+        {
+            window.Close(); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            Directory.Delete(directory, true);
+        }
+    });
+
+    [Fact]
     public Task HidingImageStopsDecodeAndReleasesItsPixels() => OnStaAsync(async () =>
     {
         var directory = Path.Combine(Path.GetTempPath(), "photoshelf-wpf-image-test-" + Guid.NewGuid().ToString("N"));
