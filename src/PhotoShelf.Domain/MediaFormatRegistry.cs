@@ -14,6 +14,9 @@ public static class MediaFormatRegistry
     public static bool IsRaw(string path) => Raw.Contains(Path.GetExtension(path));
     public static bool IsPhoto(string path) => IsRaw(path) || Images.Contains(Path.GetExtension(path));
     public static bool IsVideo(string path) => Videos.Contains(Path.GetExtension(path));
+    // TypeScript source/declaration files share these suffixes with MPEG transport streams.
+    // Keep extension checks free of I/O; admission probes belong to background workers.
+    public static bool HasAmbiguousVideoExtension(string path) => Path.GetExtension(path).ToLowerInvariant() is ".ts" or ".mts";
     public static bool IsSidecar(string path) => Path.GetExtension(path).Equals(".xmp", StringComparison.OrdinalIgnoreCase)
         || Path.GetExtension(path).Equals(".aae", StringComparison.OrdinalIgnoreCase);
 }

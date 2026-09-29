@@ -23,7 +23,8 @@ public sealed class OperationsWindow : Window
     private readonly Button _export = new() { Content = "Сохранить журнал для разбора", Margin = new Thickness(6), Padding = new Thickness(8) };
     private bool _busy;
     private int _revision;
-    public OperationsWindow(string directory, Func<MoveOperationHistory, bool, Task> execute, Func<Task<string>> backup)
+    public OperationsWindow(string directory, Func<MoveOperationHistory, bool, Task> execute, Func<Task<string>> backup,
+        Func<BackgroundActivitySnapshot>? background = null, Func<Task>? toggleBackground = null)
     {
         _directory = directory; _execute = execute;
         Title = "Операции и восстановление"; Width = 1100; Height = 720; WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -33,7 +34,36 @@ public sealed class OperationsWindow : Window
         grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _status.Text = "Выберите операцию. Внизу показаны исходные и целевые пути. При откате направление меняется. Совпадения и изменённые файлы не перезаписываются.";
-        grid.Children.Add(_status);
+        var header = new StackPanel(); grid.Children.Add(header);
+        if (background is not null && toggleBackground is not null)
+        {
+            var title = new TextBlock { FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8, 4, 8, 4) };
+            var details = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8, 4, 8, 4) };
+            var toggle = new Button { Margin = new Thickness(8), Padding = new Thickness(8), HorizontalAlignment = System.Windows.HorizontalAlignment.Left };
+            header.Children.Add(title);
+            header.Children.Add(new ScrollViewer { Content = details, MaxHeight = 175, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
+            header.Children.Add(toggle);
+            void RefreshBackground()
+            {
+                var state = background(); title.Text = state.Summary; details.Text = state.Details;
+                toggle.Content = state.Paused ? "Продолжить фоновую обработку" : "Пауза индексирования и автообновления";
+                toggle.IsEnabled = !_busy && state.CanToggle;
+            }
+            toggle.Click += async (_, _) =>
+            {
+                if (_busy) return;
+                _busy = true; SetButtons(); toggle.IsEnabled = false;
+                try { await toggleBackground(); }
+                catch (Exception ex) { _status.Text = $"Не удалось изменить режим: {ex.Message}"; }
+                finally { _busy = false; SetButtons(); RefreshBackground(); }
+            };
+            var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+            timer.Tick += (_, _) => RefreshBackground();
+            Loaded += (_, _) => { RefreshBackground(); timer.Start(); };
+            Closed += (_, _) => timer.Stop();
+        }
+        header.Children.Add(new TextBlock { Text = "История переносов и восстановления", FontWeight = FontWeights.SemiBold, Margin = new Thickness(8) });
+        header.Children.Add(_status);
         Grid.SetRow(_history, 1); grid.Children.Add(_history);
         Grid.SetRow(_files, 2); grid.Children.Add(_files);
         AddColumn(_history, "Начало (UTC)", nameof(MoveOperationHistory.StartedUtc), 160);

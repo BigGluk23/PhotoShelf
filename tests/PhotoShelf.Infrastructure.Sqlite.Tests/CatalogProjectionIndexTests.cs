@@ -9,6 +9,7 @@ public sealed class CatalogProjectionIndexTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "photoshelf-projection-index-" + Guid.NewGuid().ToString("N"));
     private const string FileIndex = "ix_desktop_file_group_asc";
     private const string CaptureIndex = "ix_desktop_capture_group_asc";
+    private const string MetadataQueueIndex = "ix_desktop_metadata_queue";
 
     [Fact]
     public async Task AdditiveIndexUpgradePreservesEveryTableAndExistingQuerySemantics()
@@ -22,6 +23,7 @@ public sealed class CatalogProjectionIndexTests : IDisposable
         var schema = await SchemaWithoutIndexesAsync();
         Assert.DoesNotContain(FileIndex, oldIndexes.Keys);
         Assert.DoesNotContain(CaptureIndex, oldIndexes.Keys);
+        Assert.DoesNotContain(MetadataQueueIndex, oldIndexes.Keys);
 
         await store.InitializeAsync();
         await store.InitializeAsync(); // Reopening an upgraded catalog must be idempotent.
@@ -29,7 +31,9 @@ public sealed class CatalogProjectionIndexTests : IDisposable
         Assert.Equal(contents, await AllTableContentsAsync());
         Assert.Equal(schema, await SchemaWithoutIndexesAsync());
         var indexes = await IndexDefinitionsAsync();
-        Assert.Equal(oldIndexes.Count + 2, indexes.Count);
+        Assert.Equal(oldIndexes.Count + 3, indexes.Count);
+        Assert.Equal(new[] { CaptureIndex, FileIndex, MetadataQueueIndex }.Order(StringComparer.Ordinal),
+            indexes.Keys.Except(oldIndexes.Keys).Order(StringComparer.Ordinal));
         foreach (var index in oldIndexes) Assert.Equal(index.Value, indexes[index.Key]);
         for (var i = 0; i < queries.Length; i++)
             Assert.Equal(before[i], await ViewSnapshotAsync(store, queries[i]));
@@ -110,6 +114,7 @@ public sealed class CatalogProjectionIndexTests : IDisposable
         Assert.Equal(retryContents, await AllTableContentsAsync());
         Assert.Contains(FileIndex, (await IndexDefinitionsAsync()).Keys);
         Assert.Contains(CaptureIndex, (await IndexDefinitionsAsync()).Keys);
+        Assert.Contains(MetadataQueueIndex, (await IndexDefinitionsAsync()).Keys);
         Assert.Equal("keep me", await ScalarAsync("SELECT sentinel FROM owned_index_creation_blocker;"));
         Assert.Equal("ok", await ScalarAsync("PRAGMA integrity_check;"));
     }

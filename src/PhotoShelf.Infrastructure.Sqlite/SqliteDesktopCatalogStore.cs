@@ -110,6 +110,7 @@ public sealed partial class SqliteDesktopCatalogStore
                 CREATE INDEX IF NOT EXISTS ix_desktop_file_group_asc ON desktop_media_items(is_quarantined,file_month,file_local_ticks ASC,path_key,is_hidden_or_system,is_video,is_favorite,search_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_capture_group_asc ON desktop_media_items(is_quarantined,capture_month,COALESCE(capture_date_ticks,0) ASC,path_key,is_hidden_or_system,is_video,is_favorite,search_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_metadata_due ON desktop_media_items(metadata_indexed,is_quarantined,is_video,metadata_retry_ticks);
+                CREATE INDEX IF NOT EXISTS ix_desktop_metadata_queue ON desktop_media_items(path_key,metadata_retry_ticks,availability,availability_error_code) WHERE metadata_indexed=0 AND is_quarantined=0 AND is_video=0;
                 CREATE INDEX IF NOT EXISTS ix_desktop_size ON desktop_media_items(size_bytes,is_quarantined);
                 CREATE INDEX IF NOT EXISTS ix_desktop_favorites ON desktop_media_items(is_favorite,file_local_ticks DESC,path_key);
                 CREATE INDEX IF NOT EXISTS ix_desktop_file_identity ON desktop_media_items(file_identity) WHERE file_identity IS NOT NULL;
@@ -149,6 +150,7 @@ public sealed partial class SqliteDesktopCatalogStore
                     case "view_mode": state.ViewMode = value; break;
                     case "newest_first": if (bool.TryParse(value, out var newest)) state.SortNewestFirst = newest; break;
                     case "include_subfolders": if (bool.TryParse(value, out var subfolders)) state.IncludeSubfolders = subfolders; break;
+                    case "background_processing_paused": if (bool.TryParse(value, out var paused)) state.BackgroundProcessingPaused = paused; break;
                     case "expanded": state.ExpandedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
                     case "watched_folders": state.WatchedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
                     case "included_folders": state.IncludedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
@@ -184,6 +186,7 @@ public sealed partial class SqliteDesktopCatalogStore
                 ["date_grouping_mode"] = state.DateGroupingMode, ["include_system"] = state.IncludeSystemFolders.ToString(),
                 ["active_folder"] = state.ActiveFolder ?? "", ["view_mode"] = state.ViewMode, ["newest_first"] = state.SortNewestFirst.ToString(),
                 ["include_subfolders"] = state.IncludeSubfolders.ToString(), ["expanded"] = JsonSerializer.Serialize(state.ExpandedFolders),
+                ["background_processing_paused"] = state.BackgroundProcessingPaused.ToString(),
                 ["included_folders"] = JsonSerializer.Serialize(state.IncludedFolders),
                 ["watched_folders"] = JsonSerializer.Serialize(state.WatchedFolders)
             };

@@ -1,7 +1,15 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.9** (`0.10.9-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.10** (`0.10.10-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Фоновые задачи v0.10.10
+
+Периодический дедлайн сверки отсчитывается после успешного callback. DirectoryName notifications идут через bounded owner/subtree очередь; overflow и потеря наблюдения сохраняют отдельный recovery intent. `LibraryMonitorActivity` — только snapshot для UI.
+
+`MetadataQueue.cs` использует partial pending-index и path keyset; UI query ordering не меняется. Результаты фиксируются пакетами с CAS по asset ID, fingerprint, observation version и предыдущему времени попытки. Commit короткий и не отменяется на середине; после него worker обязан опубликовать только accepted mask. `MainWindow.Metadata.cs` не отменяет активный проход на каждом завершении сканирования.
+
+`BackgroundProcessingPaused` хранится в settings; guard включается до отмены и ожидания настоящих читателей. «Операции» показывают фон отдельно от истории переносов. `CaptureDateReader` имеет кооперативный stream budget, но не hard timeout зависшего нативного кода. Admission неоднозначных `.ts`/`.mts` выполняется только для новых строк, чтением не более 8 KiB; существующие строки сохраняются. См. [контракт и проверки](docs/v0.10.10-background-work.md).
 
 ## Поиск и сортировка v0.10.9
 

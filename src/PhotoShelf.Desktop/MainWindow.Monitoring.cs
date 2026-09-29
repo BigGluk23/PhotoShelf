@@ -27,7 +27,7 @@ public partial class MainWindow
 
     private void QueueLibraryMonitoring()
     {
-        if (LocalCatalogStore.IsIsolatedSmokeCatalog && !AllowIsolatedLibraryMonitoring || !_catalogLoaded || _fileOperationActive || _hasPendingRecovery || _closing) return;
+        if (LocalCatalogStore.IsIsolatedSmokeCatalog && !AllowIsolatedLibraryMonitoring || !_catalogLoaded || _fileOperationActive || _hasPendingRecovery || _closing || _backgroundProcessingPaused) return;
         var revision = ++_monitorConfigurationRevision;
         _monitorConfigurationTask = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision);
     }
@@ -37,7 +37,7 @@ public partial class MainWindow
         try
         {
             await previous;
-            if (_closing || _fileOperationActive || _hasPendingRecovery || revision != _monitorConfigurationRevision) return;
+            if (_closing || _fileOperationActive || _hasPendingRecovery || _backgroundProcessingPaused || revision != _monitorConfigurationRevision) return;
             if (!_monitorRootsRestored)
             {
                 foreach (var root in _catalogState.WatchedFolders) RegisterWatchedFolder(root);
@@ -59,7 +59,7 @@ public partial class MainWindow
                 _monitorRootsRestored = true;
                 await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
             }
-            if (_closing || _fileOperationActive || revision != _monitorConfigurationRevision) return;
+            if (_closing || _fileOperationActive || _backgroundProcessingPaused || revision != _monitorConfigurationRevision) return;
             var rules = _folderInclusion.Snapshot();
             var browse = _viewMode == LibraryViewMode.Folder ? _activeFolder : null;
             var libraryRoots = LibraryFolderScope.IncludedRoots(_watchedFolders, rules);
@@ -99,12 +99,12 @@ public partial class MainWindow
                 _monitorRulesKey = rulesKey;
                 _monitorConfigurationKey = key;
             }
-            if (_monitorPaused)
+            if (_monitorPaused && !_backgroundProcessingPaused)
             {
                 await _libraryMonitor.ResumeAsync();
                 _monitorPaused = false;
             }
-            LibraryStatusText.Text = roots.Count == 0 ? "Автообновление: добавьте папку" : "Автообновление включено";
+            LibraryStatusText.Text = _backgroundProcessingPaused ? "Автообновление: пауза" : roots.Count == 0 ? "Автообновление: добавьте папку" : "Автообновление включено";
         }
         catch (OperationCanceledException) { }
         catch (Exception exception) { LibraryStatusText.Text = $"Автообновление: {exception.Message}"; }

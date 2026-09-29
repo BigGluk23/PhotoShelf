@@ -6,9 +6,17 @@ public sealed record LibraryMonitorConfiguration(IReadOnlyList<string> Roots,
     IReadOnlyList<string>? NonRecursiveRoots = null);
 
 public sealed record LibraryRootState(string Path, FileAvailability Availability, bool IsWatching, string? ErrorCode = null);
+public sealed record LibraryDirectoryChange(string OwnerRoot, string Path);
 public sealed record LibraryMonitorBatch(long Generation, IReadOnlyList<string> ChangedPaths,
     IReadOnlyList<string> ReconcileRoots, IReadOnlyList<LibraryRootState> RootStates,
-    IReadOnlyList<string>? RevalidateContentRoots = null);
+    IReadOnlyList<string>? RevalidateContentRoots = null,
+    IReadOnlyList<LibraryDirectoryChange>? DirectoryChanges = null);
+
+public sealed record LibraryMonitorActivity(long Generation, bool IsPaused, bool IsDisposed, bool IsProcessing,
+    IReadOnlyList<string> ActiveReconciliationRoots, int ActiveChangedPathCount,
+    int PendingPathCount, int PendingReconciliationRootCount, long CompletedReconciliationCount,
+    DateTime? LastReconciliationCompletedAtUtc, int ActiveDirectoryCount, int PendingDirectoryCount,
+    long CompletedDirectoryReconciliationCount);
 
 public sealed record LibraryMonitorOptions
 {
@@ -16,6 +24,8 @@ public sealed record LibraryMonitorOptions
     public int MaximumWatchers { get; init; } = 32;
     public int MaximumPendingPaths { get; init; } = 1024;
     public int MaximumPathsPerBatch { get; init; } = 256;
+    public int MaximumPendingDirectories { get; init; } = 1024;
+    public int MaximumDirectoriesPerBatch { get; init; } = 32;
     public int MaximumReconcileRootsPerBatch { get; init; } = 1;
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(200);
     public TimeSpan Debounce { get; init; } = TimeSpan.FromMilliseconds(250);
@@ -44,7 +54,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     private readonly LibraryMonitorOptions _options;
     private readonly ILibraryWatcherFactory _factory;
     private readonly IFileSystemObservationProbe _probe;
+    private readonly TimeProvider _clock;
     private readonly Dictionary<string, string> _paths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _directories = new(StringComparer.OrdinalIgnoreCase);
     private readonly DirtyRootQueue _dirty = new();
     private readonly HashSet<string> _revalidateContent = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Root> _roots = new(StringComparer.OrdinalIgnoreCase);
@@ -55,26 +67,47 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     private DateTime _firstChange;
     private DateTime _callbackRetryAt;
     private bool _paused = true, _explicitlyPaused, _disposed;
+    private LibraryMonitorBatch? _activeBatch;
+    private long _completedReconciliations;
+    private long _completedDirectoryReconciliations;
+    private DateTime? _lastReconciliationCompletedAtUtc;
 
     public LibraryChangeCoordinator(Func<LibraryMonitorBatch, CancellationToken, Task> callback,
         LibraryMonitorOptions? options = null, ILibraryWatcherFactory? watcherFactory = null,
-        IFileSystemObservationProbe? probe = null)
+        IFileSystemObservationProbe? probe = null, TimeProvider? clock = null)
     {
         _callback = callback ?? throw new ArgumentNullException(nameof(callback));
         _options = options ?? new();
         if (_options.MaximumRoots < 1 || _options.MaximumWatchers < 0 || _options.MaximumPendingPaths < 1
-            || _options.MaximumPathsPerBatch < 1 || _options.MaximumReconcileRootsPerBatch < 1
+            || _options.MaximumPathsPerBatch < 1 || _options.MaximumPendingDirectories < 1
+            || _options.MaximumDirectoriesPerBatch < 1 || _options.MaximumReconcileRootsPerBatch < 1
             || _options.PollInterval <= TimeSpan.Zero || _options.Debounce < TimeSpan.Zero
             || _options.RootProbeInterval <= TimeSpan.Zero || _options.ReconciliationInterval <= TimeSpan.Zero
             || _options.RetryDelay <= TimeSpan.Zero || _options.MaximumRetryDelay < _options.RetryDelay)
             throw new ArgumentOutOfRangeException(nameof(options));
         _factory = watcherFactory ?? new FileSystemLibraryWatcherFactory();
         _probe = probe ?? new FileSystemObservationProbe();
+        _clock = clock ?? TimeProvider.System;
         _worker = Task.Run(RunAsync);
     }
 
     public long Generation { get { lock (_sync) return _generation; } }
     public int PendingPathCount { get { lock (_sync) return _paths.Count; } }
+    public LibraryMonitorActivity Activity
+    {
+        get
+        {
+            lock (_sync)
+                return new(_generation, _paused, _disposed, _activeBatch is not null,
+                    Array.AsReadOnly(_activeBatch is null ? [] : _activeBatch.ReconcileRoots
+                        .Concat((_activeBatch.DirectoryChanges ?? []).Select(change => change.Path)).ToArray()),
+                    _activeBatch?.ChangedPaths.Count ?? 0, _paths.Count, _dirty.Count,
+                    _completedReconciliations, _lastReconciliationCompletedAtUtc,
+                    _activeBatch?.DirectoryChanges?.Count ?? 0, _directories.Count, _completedDirectoryReconciliations);
+        }
+    }
+
+    private DateTime UtcNow => _clock.GetUtcNow().UtcDateTime;
 
     public async Task ConfigureAsync(LibraryMonitorConfiguration configuration)
     {
@@ -165,6 +198,14 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                         owner = _roots.Keys.FirstOrDefault(root => IsObservedFile(path, root));
                     if (owner is null || !IsObservedFile(path, owner)) _paths.Remove(path);
                     else _paths[path] = owner;
+                }
+                foreach (var path in _directories.Keys.ToArray())
+                {
+                    string? owner = _directories[path];
+                    if (!_roots.ContainsKey(owner) || !IsObserved(path, owner))
+                        owner = _roots.Keys.FirstOrDefault(root => IsObserved(path, root));
+                    if (owner is null) _directories.Remove(path);
+                    else _directories[path] = owner;
                 }
                 _callbackRetryAt = default;
             }
@@ -272,13 +313,28 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                     token.ThrowIfCancellationRequested();
                     var batch = TakeBatch(generation);
                     if (batch is null) continue;
+                    lock (_sync) _activeBatch = batch;
                     try
                     {
                         await _callback(batch, token).ConfigureAwait(false);
                         token.ThrowIfCancellationRequested();
                         lock (_sync)
+                        {
+                            var completedAt = UtcNow;
+                            foreach (var path in batch.ReconcileRoots)
+                            {
+                                if (!_roots.TryGetValue(path, out var reconciled)) continue;
+                                // A long scan must be followed by a quiet interval, not another
+                                // immediately overdue periodic scan. Real events arriving during
+                                // this callback remain in _dirty and are not acknowledged here.
+                                reconciled.NextReconciliation = completedAt + _options.ReconciliationInterval;
+                                _completedReconciliations++;
+                                _lastReconciliationCompletedAtUtc = completedAt;
+                            }
+                            _completedDirectoryReconciliations += batch.DirectoryChanges?.Count ?? 0;
                             foreach (var state in batch.RootStates.Where(state => state.ErrorCode == "ConsumerFailedRetryScheduled"))
                                 if (_roots.TryGetValue(state.Path, out var root)) root.PendingState = root.LastState;
+                        }
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested)
                     {
@@ -290,6 +346,8 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                             // every cached hash in its root. AddPath escalates only on real overflow.
                             foreach (var path in batch.ChangedPaths)
                                 foreach (var root in _roots.Keys.Where(root => Under(path, root))) AddPath(path, root);
+                            foreach (var change in batch.DirectoryChanges ?? [])
+                                if (_roots.ContainsKey(change.OwnerRoot)) AddDirectory(change.Path, change.OwnerRoot);
                         }
                     }
                     catch
@@ -298,6 +356,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                         lock (_sync)
                         {
                             var affected = batch.ReconcileRoots.Concat(batch.RootStates.Select(state => state.Path))
+                                .Concat((batch.DirectoryChanges ?? []).Select(change => change.OwnerRoot))
                                 .Concat(_roots.Keys.Where(root => batch.ChangedPaths.Any(path => Under(path, root))))
                                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
                             foreach (var path in affected)
@@ -308,9 +367,10 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                                 var root = _roots[path];
                                 root.PendingState = new(path, FileAvailability.NeedsVerification, root.Watcher is not null, "ConsumerFailedRetryScheduled");
                             }
-                            _callbackRetryAt = DateTime.UtcNow + _options.MaximumRetryDelay;
+                            _callbackRetryAt = UtcNow + _options.MaximumRetryDelay;
                         }
                     }
+                    finally { lock (_sync) _activeBatch = null; }
                 }
                 catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested) { }
                 finally { _work.Release(); }
@@ -324,7 +384,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         foreach (var root in _roots.Values)
         {
             token.ThrowIfCancellationRequested();
-            var now = DateTime.UtcNow;
+            var now = UtcNow;
             bool restart;
             lock (_sync) { restart = root.RestartRequested; root.RestartRequested = false; }
             if (restart) { root.RevalidateWhenWatched = true; root.Watcher?.Dispose(); root.Watcher = null; root.NextProbe = default; }
@@ -397,18 +457,25 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     {
         lock (_sync)
         {
-            if (_paused || _generation != generation || DateTime.UtcNow < _callbackRetryAt) return null;
+            if (_paused || _generation != generation || UtcNow < _callbackRetryAt) return null;
             var states = _roots.Values.Where(root => root.PendingState is not null).Select(root => root.PendingState!).ToArray();
             foreach (var root in _roots.Values) root.PendingState = null;
             var reconcile = _dirty.Take(_options.MaximumReconcileRootsPerBatch).ToArray();
             foreach (var path in reconcile) _dirty.Remove(path);
+            // The future full pass covers directory events already queued for that owner.
+            // Events arriving after this point enqueue fresh intent, including during the pass.
+            foreach (var path in _directories.Where(pair => reconcile.Contains(pair.Value, StringComparer.OrdinalIgnoreCase)).Select(pair => pair.Key).ToArray())
+                _directories.Remove(path);
+            var directories = _directories.Take(_options.MaximumDirectoriesPerBatch)
+                .Select(pair => new LibraryDirectoryChange(pair.Value, pair.Key)).ToArray();
+            foreach (var change in directories) _directories.Remove(change.Path);
             var revalidate = reconcile.Where(path => _revalidateContent.Remove(path)).ToArray();
             // A bounded first-event debounce cannot be postponed forever by a continuous copy.
-            var paths = DateTime.UtcNow - _firstChange >= _options.Debounce
+            var paths = UtcNow - _firstChange >= _options.Debounce
                 ? _paths.Keys.Take(_options.MaximumPathsPerBatch).ToArray() : [];
             foreach (var path in paths) _paths.Remove(path);
-            if (states.Length + reconcile.Length + paths.Length == 0) return null;
-            return new(generation, paths, reconcile, states, revalidate);
+            if (states.Length + reconcile.Length + paths.Length + directories.Length == 0) return null;
+            return new(generation, paths, reconcile, states, revalidate, directories);
         }
     }
 
@@ -421,8 +488,8 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             if (_disposed || !_roots.TryGetValue(root, out var current) || !ReferenceEquals(current, watchedRoot)) return;
             if (change.RequiresReconciliation)
             {
-                if (IsObserved(change.Path, root) || change.OldPath is not null && IsObserved(change.OldPath, root))
-                { _dirty.Add(root); queued = true; }
+                queued = AddDirectory(change.Path, root);
+                if (change.OldPath is not null) queued |= AddDirectory(change.OldPath, root);
             }
             else
             {
@@ -444,8 +511,34 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             // Recover every overflowed root, rather than silently dropping a path notification.
             _dirty.Add(root); _revalidateContent.Add(root); return true;
         }
-        if (_paths.Count == 0) _firstChange = DateTime.UtcNow;
+        if (_paths.Count == 0) _firstChange = UtcNow;
         _paths.Add(path, root);
+        return true;
+    }
+
+    private bool AddDirectory(string path, string root)
+    {
+        try { path = Normalize(path); }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        { _dirty.Add(root); return true; }
+        if (!IsObserved(path, root)) return false;
+        if (_dirty.Contains(root)) return false; // A not-yet-started full pass already covers it.
+        if (path.Equals(root, StringComparison.OrdinalIgnoreCase)) { _dirty.Add(root); return true; }
+        // Directory notifications identify a changed subtree, not a content change to every
+        // photo on the drive. Keep old and new rename paths, including nonexistent old paths.
+        if (_directories.Any(pair => pair.Value.Equals(root, StringComparison.OrdinalIgnoreCase) && Under(path, pair.Key))) return false;
+        foreach (var child in _directories.Where(pair => pair.Value.Equals(root, StringComparison.OrdinalIgnoreCase) && Under(pair.Key, path)).Select(pair => pair.Key).ToArray())
+            _directories.Remove(child);
+        if (_directories.Count >= _options.MaximumPendingDirectories)
+        {
+            // Overflow must retain discovery intent, but directory names alone do not prove
+            // changed media bytes and must not invalidate the entire root's cached metadata.
+            _dirty.Add(root);
+            foreach (var child in _directories.Where(pair => pair.Value.Equals(root, StringComparison.OrdinalIgnoreCase)).Select(pair => pair.Key).ToArray())
+                _directories.Remove(child);
+            return true;
+        }
+        _directories[path] = root;
         return true;
     }
 
@@ -481,7 +574,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             root.RestartRequested = true;
             root.RevalidateWhenWatched = true;
             root.Failures = Math.Min(root.Failures + 1, 16);
-            root.NextWatchAttempt = DateTime.UtcNow + TimeSpan.FromMilliseconds(Math.Min(_options.MaximumRetryDelay.TotalMilliseconds,
+            root.NextWatchAttempt = UtcNow + TimeSpan.FromMilliseconds(Math.Min(_options.MaximumRetryDelay.TotalMilliseconds,
                 _options.RetryDelay.TotalMilliseconds * Math.Pow(2, root.Failures - 1)));
             _dirty.Add(root.Path); _revalidateContent.Add(root.Path);
             root.PendingState = new(root.Path, FileAvailability.NeedsVerification, false, "WatcherEventsLostReconciliationRequired");
@@ -522,6 +615,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     {
         private readonly LinkedList<string> _order = new();
         private readonly Dictionary<string, LinkedListNode<string>> _members = new(StringComparer.OrdinalIgnoreCase);
+        public int Count => _members.Count;
         public void Add(string path)
         {
             if (!_members.ContainsKey(path)) _members.Add(path, _order.AddLast(path));

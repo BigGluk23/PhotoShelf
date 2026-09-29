@@ -253,7 +253,7 @@ public partial class MainWindow
 
     private Task BrowseFolderAsync(string folder)
     {
-        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return Task.CompletedTask;
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return Task.CompletedTask;
         QueueLibraryMonitoring();
         _browseCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -344,6 +344,7 @@ public partial class MainWindow
         TileWidth = TileWidth, ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders,
         DateGroupingMode = _dateGroupingMode.ToString(), ActiveFolder = _activeFolder, ViewMode = _viewMode.ToString(),
         SortNewestFirst = _sortNewestFirst, IncludeSubfolders = _includeSubfolders,
+        BackgroundProcessingPaused = _backgroundProcessingPaused,
         ExpandedFolders = _folderNodes.Values.Where(x => x.IsExpanded).Select(x => x.FullPath).ToList(),
         ExcludedFolders = _folderInclusion.ExcludedFolders.ToList(),
         IncludedFolders = _folderInclusion.IncludedFolders.ToList(),

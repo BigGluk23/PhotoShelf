@@ -287,6 +287,7 @@ public sealed class FileObservationTests : IDisposable
             connection.Open(); using var command = connection.CreateCommand();
             command.CommandText = """
                 DROP INDEX ix_desktop_file_identity;
+                DROP INDEX ix_desktop_metadata_queue;
                 ALTER TABLE desktop_media_items DROP COLUMN availability;
                 ALTER TABLE desktop_media_items DROP COLUMN availability_checked_ticks;
                 ALTER TABLE desktop_media_items DROP COLUMN availability_error_code;

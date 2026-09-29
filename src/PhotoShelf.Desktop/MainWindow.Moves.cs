@@ -136,7 +136,7 @@ public partial class MainWindow
             await RunFileOperationAsync((progress, token) => undo
                 ? service.UndoAsync(history.JournalPath, undoJournal, CommitFileMoveAsync, progress, token)
                 : service.RecoverAsync(history.JournalPath, CommitFileMoveAsync, progress, token), paths);
-        }, () => _desktopCatalogStore.CreateBackupAsync(_lifetime.Token)) { Owner = this };
+        }, () => _desktopCatalogStore.CreateBackupAsync(_lifetime.Token), GetBackgroundActivity, ToggleBackgroundProcessingAsync) { Owner = this };
         window.ShowDialog();
     }
 }

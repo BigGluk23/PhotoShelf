@@ -34,6 +34,7 @@ internal sealed class UiBrowseSmokeSession
     private string? _expectedPublicationSearch;
     private int _wrongSearchPublications, _searchSortAnchorChecks, _searchSortSelectionChecks, _searchSortHashesChecked;
     private bool _searchSortVerified, _searchSortHashesVerified, _searchSortRapidVerified, _searchSortDecoderVerified;
+    private bool _backgroundPauseVerified, _backgroundPausePersisted, _backgroundResumeVerified, _backgroundIdleVerified;
 
     public async Task SeedCatalogAsync()
     {
@@ -171,6 +172,7 @@ internal sealed class UiBrowseSmokeSession
         await VerifyNoiseStabilityAsync(window, "direct-photo", _pictures, 1);
 
         await VerifySearchSortAsync(window);
+        await VerifyBackgroundPauseAsync(window);
 
         _phase = "original-byte-verification";
         await Task.Run(() =>
@@ -187,6 +189,38 @@ internal sealed class UiBrowseSmokeSession
         _phase = "production-shutdown";
         _closeRequested = true;
         window.Close();
+    }
+
+    private async Task VerifyBackgroundPauseAsync(MainWindow window)
+    {
+        _phase = "background-pause";
+        var store = new SqliteDesktopCatalogStore();
+        await UntilAsync(() => Task.FromResult(!window.BrowseSmokeBusy), "Background workers did not finish their initial queue.");
+        Require(window.GetBackgroundActivity().Details.Contains("Метаданные") && window.GetBackgroundActivity().CanToggle,
+            "Operations background activity is unavailable with an empty move history.");
+        await window.ToggleBackgroundProcessingAsync();
+        Require(window.GetBackgroundActivity().Paused && window.GetBackgroundActivity().CanToggle && !window.BrowseSmokeMonitoringEnabled,
+            "Background pause returned before the monitor drained.");
+        _backgroundPausePersisted = (await store.LoadAsync(includeItems: false)).BackgroundProcessingPaused;
+        Require(_backgroundPausePersisted, "Background pause was not persisted in the isolated catalog.");
+        var witness = Path.Combine(_proof, "created-while-paused.png");
+        await Task.Run(() => WritePng(witness));
+        var modified = File.GetLastWriteTimeUtc(witness);
+        _originalHashes[witness] = SHA256.HashData(await File.ReadAllBytesAsync(witness));
+        await Task.Delay(750);
+        Require(await store.GetItemAsync(witness) is null, "A paused watcher still indexed a new original.");
+        _backgroundPauseVerified = true;
+        _phase = "background-resume";
+        await window.ToggleBackgroundProcessingAsync();
+        await UntilAsync(async () => await store.GetItemAsync(witness) is { MetadataIndexed: true } && !window.BrowseSmokeBusy,
+            "Resume did not discover the queued PNG and finish its metadata.", 15);
+        Require(!(await store.LoadAsync(includeItems: false)).BackgroundProcessingPaused && window.BrowseSmokeMonitoringEnabled,
+            "Resume did not restore background processing and its persisted setting.");
+        _backgroundResumeVerified = true;
+        await Task.Delay(1000);
+        Require(!window.BrowseSmokeBusy && File.GetLastWriteTimeUtc(witness) == modified,
+            "Background work restarted without events or changed the original modification time.");
+        _backgroundIdleVerified = true;
     }
 
     private async Task VerifySearchSortAsync(MainWindow window)
@@ -393,6 +427,8 @@ internal sealed class UiBrowseSmokeSession
         recursiveCountVerified = _recursiveVerified, checkboxVerified = _checkboxVerified, rapidSelectionVerified = _rapidVerified,
         wrongFolderPublications = _wrongFolderPublications, rowPublications = _rowPublications, emptyTransitions = _emptyTransitions,
         stability = _stability, originalHashesVerified = _hashesVerified, originalsChecked = _originalHashes.Count,
+        background = new { pauseVerified = _backgroundPauseVerified, pausePersisted = _backgroundPausePersisted,
+            resumeVerified = _backgroundResumeVerified, idleVerified = _backgroundIdleVerified },
         searchSort = new { passed = _searchSortVerified, fixtureCount = _searchSortFixtures.Count, hashesChecked = _searchSortHashesChecked,
             originalHashesVerified = _searchSortHashesVerified, modificationTimesVerified = _searchSortHashesVerified,
             selectionChecks = _searchSortSelectionChecks, anchorChecks = _searchSortAnchorChecks,

@@ -19,6 +19,7 @@ public sealed class LocalCatalogState
     public string ViewMode { get; set; } = "All";
     public bool SortNewestFirst { get; set; } = true;
     public bool IncludeSubfolders { get; set; } = true;
+    public bool BackgroundProcessingPaused { get; set; }
     public List<string> ExpandedFolders { get; set; } = new();
     public string? QuarantineDirectory { get; set; }
     public List<string> QuarantineBatchDirectories { get; set; } = new();

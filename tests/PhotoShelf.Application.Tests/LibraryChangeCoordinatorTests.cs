@@ -14,6 +14,243 @@ public sealed class LibraryChangeCoordinatorTests
     };
 
     [Fact]
+    public async Task LongReconciliationWaitsAFullPeriodicIntervalAfterSuccessfulCompletion()
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var clock = new ManualClock();
+        var interval = TimeSpan.FromMinutes(30);
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                entered.TrySetResult();
+                await release.Task.WaitAsync(token);
+            }
+        }, FastOptions with { ReconciliationInterval = interval, Debounce = TimeSpan.Zero }, factory, new FakeProbe(), clock);
+        await monitor.ConfigureAsync(new([root]));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            var active = monitor.Activity;
+            Assert.True(active.IsProcessing);
+            Assert.Equal([root], active.ActiveReconciliationRoots);
+            Assert.Equal(0, active.CompletedReconciliationCount);
+            clock.Advance(interval + TimeSpan.FromMinutes(5));
+        }
+        finally { release.TrySetResult(); }
+
+        await Until(() => monitor.Activity.CompletedReconciliationCount >= 1 && !monitor.Activity.IsProcessing);
+        var completedAt = clock.GetUtcNow().UtcDateTime;
+        Assert.Equal(completedAt, monitor.Activity.LastReconciliationCompletedAtUtc);
+        // A real path callback is a worker-turn barrier. With the old start-based deadline,
+        // the already overdue root would be reconciled again before/with this notification.
+        clock.Advance(TimeSpan.FromSeconds(1));
+        var sentinel = Path.Combine(root, "sentinel.jpg");
+        factory.Latest(root).Change(new(sentinel));
+        await Until(() => batches.Any(batch => batch.ChangedPaths.Contains(sentinel)));
+        Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.DoesNotContain(batches, batch => batch.ChangedPaths.Contains(sentinel) && batch.ReconcileRoots.Count > 0);
+
+        clock.Advance(interval - TimeSpan.FromSeconds(1));
+        await Until(() => monitor.Activity.CompletedReconciliationCount >= 2);
+        Assert.Equal(2, batches.SelectMany(batch => batch.ReconcileRoots).Count());
+        await monitor.PauseAsync();
+        var paused = monitor.Activity;
+        Assert.True(paused.IsPaused); Assert.False(paused.IsProcessing);
+        await monitor.DisposeAsync();
+        Assert.True(monitor.Activity.IsDisposed);
+        Assert.True(monitor.Activity.IsPaused);
+        Assert.Empty(monitor.Activity.ActiveReconciliationRoots);
+        Assert.False(paused.IsDisposed); // Previously returned snapshots do not mutate.
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletingLongReconciliationPreservesDirectoryEventsAndWatcherErrors(bool watcherError)
+    {
+        var root = RootPath(); var factory = new FakeFactory(); var clock = new ManualClock();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                entered.TrySetResult();
+                await release.Task.WaitAsync(token);
+            }
+        }, FastOptions with { ReconciliationInterval = TimeSpan.FromMinutes(30) }, factory, new FakeProbe(), clock);
+        await monitor.ConfigureAsync(new([root]));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            clock.Advance(TimeSpan.FromMinutes(35));
+            var watcher = factory.Latest(root);
+            if (watcherError) watcher.Error(new InternalBufferOverflowException());
+            else watcher.Change(new(Path.Combine(root, "new-folder"), RequiresReconciliation: true));
+            Assert.Equal(watcherError ? 1 : 0, monitor.Activity.PendingReconciliationRootCount);
+            Assert.Equal(watcherError ? 0 : 1, monitor.Activity.PendingDirectoryCount);
+            Assert.Equal([root], monitor.Activity.ActiveReconciliationRoots);
+        }
+        finally { release.TrySetResult(); }
+        await Until(() => watcherError ? monitor.Activity.CompletedReconciliationCount >= 2 :
+            monitor.Activity.CompletedDirectoryReconciliationCount >= 1);
+        var replay = batches.Skip(1).First(batch => watcherError ? batch.ReconcileRoots.Contains(root) :
+            batch.DirectoryChanges?.Any(change => change.Path == Path.Combine(root, "new-folder")) == true);
+        Assert.Equal(watcherError, replay.RevalidateContentRoots?.Contains(root) == true);
+        if (!watcherError) Assert.Empty(replay.ReconcileRoots);
+    }
+
+    [Fact]
+    public async Task ContinuousDirectoryEventsStayTargetedWithoutRescanningTheOwnerRoot()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root], ShouldObserveFilePath: IsSyntheticMedia));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 1);
+        var watcher = factory.Latest(root);
+        for (var index = 0; index < 40; index++)
+        {
+            var directory = Path.Combine(root, "application-data", "noise-" + index);
+            watcher.Change(new(directory, RequiresReconciliation: true));
+            watcher.Change(new(Path.Combine(directory, "ignored.log")));
+            await Until(() => batches.SelectMany(batch => batch.DirectoryChanges ?? []).Any(change => change.Path == directory));
+        }
+        Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.Equal(40, batches.SelectMany(batch => batch.DirectoryChanges ?? []).Count());
+        Assert.All(batches.SelectMany(batch => batch.DirectoryChanges ?? []), change => Assert.Equal(root, change.OwnerRoot));
+        Assert.All(batches, batch => { Assert.Empty(batch.ChangedPaths); Assert.Empty(batch.RevalidateContentRoots ?? []); });
+    }
+
+    [Fact]
+    public async Task DirectoryRenameRetainsBothSubtreesAndCoalescesQueuedDescendants()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.ChangedPaths.Count > 0) { entered.TrySetResult(); await release.Task.WaitAsync(token); }
+        }, FastOptions with { Debounce = TimeSpan.Zero }, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 1);
+        var watcher = factory.Latest(root);
+        watcher.Change(new(Path.Combine(root, "barrier.jpg")));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var oldDirectory = Path.Combine(root, "before"); var newDirectory = Path.Combine(root, "after");
+        try
+        {
+            watcher.Change(new(Path.Combine(newDirectory, "nested"), RequiresReconciliation: true));
+            watcher.Change(new(newDirectory, oldDirectory, RequiresReconciliation: true));
+            watcher.Change(new(Path.Combine(newDirectory, "nested", "deeper"), RequiresReconciliation: true));
+            Assert.Equal(2, monitor.Activity.PendingDirectoryCount);
+            Assert.Equal(0, monitor.Activity.PendingReconciliationRootCount);
+        }
+        finally { release.TrySetResult(); }
+        await Until(() => monitor.Activity.CompletedDirectoryReconciliationCount == 2);
+        Assert.Equal(new[] { oldDirectory, newDirectory }.Order(), batches.SelectMany(batch => batch.DirectoryChanges ?? []).Select(change => change.Path).Order());
+        Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+    }
+
+    [Fact]
+    public async Task DirectoryQueueOverflowFallsBackOnlyForItsOwnerWithoutInvalidatingAllContent()
+    {
+        var first = RootPath(); var second = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.ChangedPaths.Count > 0) { entered.TrySetResult(); await release.Task.WaitAsync(token); }
+        }, FastOptions with { Debounce = TimeSpan.Zero, MaximumPendingDirectories = 4, MaximumDirectoriesPerBatch = 2 }, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([first, second]));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 2);
+        var baseline = batches.Count;
+        factory.Latest(first).Change(new(Path.Combine(first, "barrier.jpg")));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondDirectory = Path.Combine(second, "keep-this-target");
+        try
+        {
+            factory.Latest(second).Change(new(secondDirectory, RequiresReconciliation: true));
+            for (var index = 0; index < 2000; index++)
+                factory.Latest(first).Change(new(Path.Combine(first, "directory-" + index), RequiresReconciliation: true));
+            Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+            Assert.Equal(1, monitor.Activity.PendingDirectoryCount);
+        }
+        finally { release.TrySetResult(); }
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 3 && monitor.Activity.CompletedDirectoryReconciliationCount == 1);
+        Assert.Equal([first], batches.Skip(baseline).SelectMany(batch => batch.ReconcileRoots));
+        Assert.Equal([secondDirectory], batches.Skip(baseline).SelectMany(batch => batch.DirectoryChanges ?? []).Select(change => change.Path));
+        Assert.All(batches.Skip(baseline), batch => { Assert.Empty(batch.RevalidateContentRoots ?? []); Assert.True((batch.DirectoryChanges?.Count ?? 0) <= 2); });
+    }
+
+    [Fact]
+    public async Task FailedDirectoryConsumerRetriesThroughItsOwnerWithoutDroppingTheSubtree()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        {
+            batches.Enqueue(batch);
+            if ((batch.DirectoryChanges?.Count ?? 0) > 0) { failed.TrySetResult(); throw new IOException("Synthetic directory consumer failure"); }
+            return Task.CompletedTask;
+        }, FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 1);
+        factory.Latest(root).Change(new(Path.Combine(root, "new-directory"), RequiresReconciliation: true));
+        await failed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 2);
+        Assert.Contains(batches.Skip(1), batch => batch.ReconcileRoots.Contains(root));
+        Assert.All(batches, batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+        Assert.Equal(0, monitor.Activity.CompletedDirectoryReconciliationCount);
+    }
+
+    [Fact]
+    public async Task PauseDrainsDirectoryCallbackAndReconfigurationRetainsItsDiscoveryIntent()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var intercept = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if ((batch.DirectoryChanges?.Count ?? 0) > 0 && Interlocked.Exchange(ref intercept, 1) == 0)
+            { entered.TrySetResult(); await Task.Delay(Timeout.Infinite, token); }
+            batches.Enqueue(batch);
+        }, FastOptions, factory, new FakeProbe());
+        await monitor.ConfigureAsync(new([root]));
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 1);
+        factory.Latest(root).Change(new(Path.Combine(root, "interrupted-directory"), RequiresReconciliation: true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        Assert.True(monitor.Activity.IsPaused); Assert.False(monitor.Activity.IsProcessing);
+        Assert.Equal(1, monitor.Activity.PendingDirectoryCount);
+        await monitor.ConfigureAsync(new([root]));
+        Assert.True(monitor.Activity.IsPaused); Assert.Equal(1, monitor.Activity.PendingDirectoryCount);
+        factory.Latest(root).Change(new(Path.Combine(root, "created-while-paused"), RequiresReconciliation: true));
+        Assert.Equal(2, monitor.Activity.PendingDirectoryCount);
+        Assert.Single(batches); // No callbacks can run until explicit resume.
+        await monitor.ResumeAsync();
+        await Until(() => monitor.Activity.CompletedReconciliationCount == 2);
+        Assert.Equal(0, monitor.Activity.PendingDirectoryCount);
+        Assert.Equal([root], batches.Last().ReconcileRoots); // Resume's full owner pass covers both targets.
+        Assert.All(batches, batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+    }
+
+    [Fact]
     public async Task BurstIsDeduplicatedAndQueueOverflowRequiresReconciliation()
     {
         var root = RootPath(); var factory = new FakeFactory(); var batches = new ConcurrentQueue<LibraryMonitorBatch>();
@@ -86,7 +323,8 @@ public sealed class LibraryChangeCoordinatorTests
         Assert.All(batches.Skip(baseline), batch => Assert.Empty(batch.ReconcileRoots));
         Assert.Equal([direct], batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths));
         var immediate = Path.Combine(root, "new-child"); watcher.Change(new(immediate, RequiresReconciliation: true));
-        await Until(() => batches.Skip(baseline).Any(batch => batch.ReconcileRoots.Contains(root)));
+        await Until(() => batches.Skip(baseline).Any(batch => batch.DirectoryChanges?.Any(change => change.OwnerRoot == root && change.Path == immediate) == true));
+        Assert.All(batches.Skip(baseline), batch => Assert.Empty(batch.ReconcileRoots));
         Assert.DoesNotContain(batches.SelectMany(batch => batch.ChangedPaths), path => path == immediate);
         Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
     }
@@ -110,7 +348,7 @@ public sealed class LibraryChangeCoordinatorTests
         factory.Latest(library).Change(new(Path.Combine(library, "child"), RequiresReconciliation: true));
         factory.Latest(browse).Change(new(direct));
         await Until(() => batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths).Distinct().Count() == 2 &&
-            batches.Skip(baseline).Any(batch => batch.ReconcileRoots.Contains(library)));
+            batches.Skip(baseline).Any(batch => batch.DirectoryChanges?.Any(change => change.OwnerRoot == library && change.Path == Path.GetDirectoryName(nested)) == true));
         Assert.Equal(new[] { direct, nested }.Order(), batches.Skip(baseline).SelectMany(batch => batch.ChangedPaths).Order());
         Assert.DoesNotContain(batches.Skip(baseline).SelectMany(batch => batch.ReconcileRoots), root => root == browse);
     }
@@ -488,7 +726,7 @@ public sealed class LibraryChangeCoordinatorTests
         var intercept = 0;
         await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
         {
-            if (batch.ReconcileRoots.Contains(retiring) && Interlocked.CompareExchange(ref intercept, 2, 1) == 1)
+            if (batch.DirectoryChanges?.Any(change => change.OwnerRoot == retiring) == true && Interlocked.CompareExchange(ref intercept, 2, 1) == 1)
             { interrupted.TrySetResult(); await Task.Delay(Timeout.Infinite, token); }
             batches.Enqueue(batch);
         }, FastOptions, factory, probe);
@@ -499,7 +737,8 @@ public sealed class LibraryChangeCoordinatorTests
         await interrupted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await monitor.ConfigureAsync(new([retained])); // cancellation must transfer the unprocessed directory scope
         var generation = monitor.Generation;
-        await Until(() => batches.Any(batch => batch.Generation == generation && batch.ReconcileRoots.Contains(retained)));
+        await Until(() => batches.Any(batch => batch.Generation == generation &&
+            batch.DirectoryChanges?.Any(change => change.OwnerRoot == retained && change.Path == Path.Combine(child, "new-directory")) == true));
         Assert.DoesNotContain(batches, batch => (batch.RevalidateContentRoots?.Count ?? 0) > 0);
         Assert.DoesNotContain(batches.Where(batch => batch.Generation == generation).SelectMany(batch => batch.ReconcileRoots), path => path == retiring);
     }
@@ -672,6 +911,13 @@ public sealed class LibraryChangeCoordinatorTests
         public int Calls;
         public FileSystemProbeResult ProbeFile(string path) => new(path, Availability, DateTime.UtcNow);
         public FileSystemProbeResult ProbeRoot(string path) { Interlocked.Increment(ref Calls); return new(path, Availability, DateTime.UtcNow, IsDirectory: true); }
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private long _ticks = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc).Ticks;
+        public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref _ticks), TimeSpan.Zero);
+        public void Advance(TimeSpan elapsed) => Interlocked.Add(ref _ticks, elapsed.Ticks);
     }
 
     private sealed class FakeFactory : ILibraryWatcherFactory

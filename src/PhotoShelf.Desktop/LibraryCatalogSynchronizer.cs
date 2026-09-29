@@ -1,5 +1,6 @@
 using System.IO;
 using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Media;
 
 namespace PhotoShelf.Desktop;
 
@@ -20,7 +21,9 @@ public sealed class LibraryCatalogSynchronizer(
         string? browsedFolder, bool browseRecursively, bool includeSystem, CancellationToken token,
         IReadOnlyList<string>? libraryRoots = null)
     {
-        libraryRoots ??= batch.ReconcileRoots.Where(root => !root.Equals(browsedFolder, StringComparison.OrdinalIgnoreCase)).ToArray();
+        libraryRoots ??= batch.ReconcileRoots.Concat((batch.DirectoryChanges ?? []).Select(change => change.OwnerRoot))
+            .Where(root => !root.Equals(browsedFolder, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         bool InLibrary(string path) => libraryRoots.Any(root => IsUnder(path, root)) && inclusion.IsIncluded(path);
         bool Observe(string path) => !PhotoScanner.IsIgnoredPath(path, includeSystem) &&
             (InLibrary(path) || IsBrowsed(path));
@@ -36,7 +39,12 @@ public sealed class LibraryCatalogSynchronizer(
             foreach (var paths in batch.ChangedPaths.Where(Observe).Where(PhotoItem.IsSupported).Chunk(128))
                 await ObservePathsCoreAsync(paths, forceContent: true, token, MarkCommitted);
 
-            foreach (var root in batch.ReconcileRoots)
+            // A directory notification describes its own old/new subtree. It must not
+            // restart enumeration of the whole watched drive. The catalog pass below
+            // also covers a deleted subtree without deleting any catalog records.
+            var targets = batch.ReconcileRoots.Concat((batch.DirectoryChanges ?? []).Select(change => change.Path))
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            foreach (var root in targets)
             {
                 token.ThrowIfCancellationRequested();
                 var rootResult = _probe.ProbeRoot(root);
@@ -106,6 +114,9 @@ public sealed class LibraryCatalogSynchronizer(
                     var revalidate = forceContent || previous?.Availability is FileAvailability.AccessDenied or FileAvailability.RootOffline ||
                         previous is { Availability: FileAvailability.NeedsVerification, AvailabilityErrorCode: not null };
                     if (previous is null && current.Availability != FileAvailability.Available) continue;
+                    // .ts/.mts are also source-code extensions. Probe only new admissions,
+                    // on this worker path; never remove/reclassify existing catalog entries.
+                    if (previous is null && MediaAdmissionProbe.Probe(path, token) == MediaAdmissionKind.NonMediaText) continue;
                     if (previous is null && current.FileIdentity is { Length: > 0 } identity)
                     {
                         var matches = await store.FindByFileIdentityAsync(identity, token: token);

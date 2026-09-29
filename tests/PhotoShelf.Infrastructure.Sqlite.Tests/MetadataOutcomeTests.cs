@@ -71,6 +71,7 @@ public sealed class MetadataOutcomeTests : IDisposable
             connection.Open();using var command=connection.CreateCommand();
             command.CommandText="""
                 DROP INDEX ix_desktop_metadata_due;
+                DROP INDEX ix_desktop_metadata_queue;
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_status;
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_attempted_ticks;
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_retry_ticks;

@@ -144,7 +144,7 @@ try {
         $browseSmoke.recursiveCountVerified -ne $true -or $browseSmoke.checkboxVerified -ne $true -or
         $browseSmoke.freshDiscoveryVerified -ne $true -or $browseSmoke.rapidSelectionVerified -ne $true -or
         $browseSmoke.wrongFolderPublications -ne 0 -or $browseSmoke.originalHashesVerified -ne $true -or
-        $browseSmoke.originalsChecked -ne 4 -or $browseSmoke.decoderReadersDrained -ne $true -or
+        $browseSmoke.originalsChecked -ne 5 -or $browseSmoke.decoderReadersDrained -ne $true -or
         $browseSmoke.catalogWritersDrained -ne $true -or $browseSmoke.gracefulExit -ne $true -or
         $browseSmoke.errorCount -ne 0 -or $browseSmoke.exitCode -ne 0) {
         throw 'Production browse/monitor smoke did not pass every functional/safety assertion.'
@@ -161,6 +161,10 @@ try {
             $observation.quietWallMs -lt 3000 -or $observation.quietCpuMs -lt 0) {
             throw 'Filesystem noise reset/flashed the grid or monitoring failed to settle.'
         }
+    }
+    if ($browseSmoke.background.pauseVerified -ne $true -or $browseSmoke.background.pausePersisted -ne $true -or
+        $browseSmoke.background.resumeVerified -ne $true -or $browseSmoke.background.idleVerified -ne $true) {
+        throw 'Browse smoke did not verify persisted background pause, queued media discovery and idle after resume.'
     }
     $searchSort = $browseSmoke.searchSort
     if ($searchSort.passed -ne $true -or $searchSort.originalHashesVerified -ne $true -or

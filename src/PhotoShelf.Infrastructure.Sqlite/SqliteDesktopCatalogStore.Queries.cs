@@ -259,7 +259,7 @@ public sealed partial class SqliteDesktopCatalogStore
     private static string BuildFrom(CatalogViewQuery query,SqliteCommand command, CancellationToken token = default)
         => BuildFromWithIndex(query, command, token, null);
 
-    private static string BuildFromWithIndex(CatalogViewQuery query, SqliteCommand command, CancellationToken token, string? folderIndex)
+    private static string BuildFromWithIndex(CatalogViewQuery query, SqliteCommand command, CancellationToken token, string? folderIndex, bool preserveIndexSource = false)
     {
         var where=new List<string>{"is_quarantined=0"};
         if(query.MetadataDueAtUtc is { } due)
@@ -304,6 +304,15 @@ public sealed partial class SqliteDesktopCatalogStore
                     command.Parameters.AddWithValue($"$folderEnd{index}", ranges.Bounded[index][1]);
                 }
                 where.Add("(" + string.Join(" OR ", alternatives) + ")");
+            }
+            else if (preserveIndexSource)
+            {
+                // Metadata queue walks only pending rows in path order. Keep that partial
+                // index even for many rules; expanding all catalog paths would reintroduce
+                // terminal-row reads and a date/union sort into every background page.
+                where.Add("(path_key>=$folderTail OR EXISTS (SELECT 1 FROM json_each($folderRanges) AS ranges WHERE path_key>=json_extract(ranges.value,'$[0]') AND path_key<json_extract(ranges.value,'$[1]'))) ");
+                command.Parameters.AddWithValue("$folderRanges", JsonSerializer.Serialize(ranges.Bounded));
+                command.Parameters.AddWithValue("$folderTail", ranges.Tail);
             }
             else
             {

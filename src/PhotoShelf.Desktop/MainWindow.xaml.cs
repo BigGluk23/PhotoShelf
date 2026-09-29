@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.9";
+    private const string VersionLabel = "Ultra v0.10.10";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -56,6 +56,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         AppTitleText.Text = $"PhotoShelf {VersionLabel}";
         DataContext = this;
         _catalogState = initialState;
+        _backgroundProcessingPaused = initialState.BackgroundProcessingPaused;
         TileWidth = Math.Clamp(_catalogState.TileWidth, 72, 260);
         ThumbnailSizeSlider.Value = TileWidth;
         ShowVideos = _catalogState.ShowVideos;
@@ -83,6 +84,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _metadataRetryTimer.Tick += (_, _) => { if (_metadataTask.IsCompleted) StartMetadataIndexing(false); };
         _metadataRetryTimer.Start();
         Closed += (_, _) => _metadataRetryTimer.Stop();
+        StartBackgroundActivityDisplay();
 
         if (_activeFolder is not null) AddFolder(_activeFolder);
         foreach (var path in _catalogState.ExpandedFolders) AddFolder(path);
@@ -594,7 +596,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private Task ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
     {
-        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return Task.CompletedTask;
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return Task.CompletedTask;
         _scanCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         var previous = _scanTask;
@@ -942,114 +944,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return state;
         });
     }
-
-    private void StartMetadataIndexing(bool resetExisting)
-    {
-        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing) return;
-        _metadataIndexCancellation?.Cancel();
-        var previous = _metadataTask;
-        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _metadataIndexCancellation = operation;
-        _metadataTask = RunMetadataWorkerAsync(resetExisting, operation, previous);
-    }
-
-
-    private async Task RunMetadataWorkerAsync(bool resetExisting, CancellationTokenSource operation, Task previous)
-    {
-        var updates = new List<SavedMediaItem>(128);
-        var groupingChanged = false;
-        var indexed = 0;
-        async Task PublishBatchAsync()
-        {
-            if (updates.Count == 0) return;
-            var batch = updates.ToArray(); updates.Clear();
-            var orderChanged = groupingChanged; groupingChanged = false;
-            var count = indexed;
-            await Dispatcher.InvokeAsync(() =>
-            {
-                if (_lifetime.IsCancellationRequested || _closing) return;
-                (PhotoRows as VirtualPhotoRows)?.ApplyMetadata(batch);
-                foreach (var saved in batch)
-                    if (_selection.Find(saved.Path) is { } selected && selected.FileSizeBytes == saved.SizeBytes && selected.FileModifiedAt == saved.FileModifiedAt && selected.ObservationVersion == saved.ObservationVersion)
-                        selected.ApplyIndexedCaptureDate(saved.CaptureDate, saved.MetadataStatus);
-                MetadataStatusText.Text = $"Метаданные: {count:N0}";
-                if (orderChanged && (_dateGroupingMode == DateGroupingMode.CaptureDate || _showOnlyMissingCaptureDate) &&
-                    IsCurrentViewAffected(new(batch, [], [], false))) NoteCatalogChanged();
-            }, DispatcherPriority.Background);
-        }
-        try
-        {
-            await previous;
-            var token = operation.Token; token.ThrowIfCancellationRequested();
-            MetadataStatusText.Text = "Индексирую метаданные…";
-            var rules = _folderInclusion.Snapshot();
-            await Task.Run(async () =>
-            {
-                if (resetExisting) await _desktopCatalogStore.ResetMetadataIndexAsync(token);
-                await foreach (var item in _desktopCatalogStore.EnumerateAsync(new CatalogViewQuery { IncludeSystemFolders = true, MetadataDueAtUtc = DateTime.UtcNow,
-                    ExcludedFolders = rules.ExcludedFolders, IncludedFolders = rules.IncludedFolders }, token))
-                {
-                    var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
-                        _ => ToSavedItem(item.Path), token);
-                    var result = fresh is null
-                        ? new PhotoShelf.Application.Metadata.CaptureDateReadResult(PhotoShelf.Application.Metadata.MetadataReadStatus.TransientError, ErrorCode: "unavailable-file")
-                        : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, _ => CaptureDateReader.Read(item.Path), token);
-                    // Bind the result to both the database fingerprint and the actual post-read file state.
-                    var after = fresh is null ? null : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, _ => ToSavedItem(item.Path), token);
-                    if (fresh is not null && (after is null || fresh.SizeBytes != after.SizeBytes || fresh.FileModifiedAt != after.FileModifiedAt)) continue;
-                    var previousDate = item.CaptureDate;
-                    if (fresh is not null && (fresh.SizeBytes != item.SizeBytes || fresh.FileModifiedAt != item.FileModifiedAt))
-                    {
-                        // The scan/monitor owns file-state updates. A changed input cannot publish
-                        // metadata read against an older catalog observation.
-                        var probe = new FileSystemObservationProbe().ProbeFile(item.Path);
-                        if (probe.Availability == FileAvailability.Available)
-                            await _desktopCatalogStore.ApplyObservationAsync(new(LibraryCatalogSynchronizer.Available(probe)), item, token);
-                        await Dispatcher.InvokeAsync(() =>
-                        {
-                            if (IsCurrentViewAffected(new([item], [], [], false))) NoteCatalogChanged();
-                        }, DispatcherPriority.Background);
-                        continue;
-                    }
-                    fresh ??= item;
-                    fresh.ObservationVersion = item.ObservationVersion;
-                    fresh.Availability = item.Availability;
-                    fresh.AvailabilityCheckedAtUtc = item.AvailabilityCheckedAtUtc;
-                    fresh.AvailabilityErrorCode = item.AvailabilityErrorCode;
-                    fresh.AssetId = item.AssetId;
-                    var attempted = DateTime.UtcNow;
-                    if (!await _desktopCatalogStore.UpdateMetadataResultAsync(item.Path, fresh.SizeBytes, fresh.FileModifiedAt, result, attempted, token, expectedObservationVersion: item.ObservationVersion)) continue;
-                    var date = result.ApplyTo(item.CaptureDate);
-                    groupingChanged |= previousDate != date;
-                    fresh.CaptureDate = date; fresh.MetadataIndexed = result.IsTerminal; fresh.MetadataStatus = result.Status;
-                    fresh.MetadataAttemptedAtUtc = attempted; fresh.MetadataRetryAtUtc = result.RetryAtUtc(attempted); fresh.MetadataErrorCode = result.ErrorCode;
-                    updates.Add(fresh); indexed++;
-                    if (updates.Count >= 128) await PublishBatchAsync();
-                }
-            }, token);
-            await PublishBatchAsync();
-            if (!token.IsCancellationRequested) MetadataStatusText.Text = "Метаданные: готово";
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { MetadataStatusText.Text = $"Метаданные: {ex.Message}"; }
-        finally
-        {
-            // These writes already committed. Cancellation must not lose the final partial batch.
-            await PublishBatchAsync();
-            if (ReferenceEquals(_metadataIndexCancellation, operation))
-            {
-                _metadataIndexCancellation = null;
-                CompleteCatalogStage();
-                _ = Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_metadataRefreshPending && !_closing && !_fileOperationActive && !_hasPendingRecovery)
-                    { _metadataRefreshPending = false; StartMetadataIndexing(false); }
-                }), DispatcherPriority.Background);
-            }
-            operation.Dispose();
-        }
-    }
-
 
     private async Task LoadSavedCatalogAsync()
     {

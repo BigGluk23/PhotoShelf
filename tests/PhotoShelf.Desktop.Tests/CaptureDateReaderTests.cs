@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -58,6 +59,35 @@ public sealed class CaptureDateReaderTests : IDisposable
         AddApp1(path, Encoding.UTF8.GetBytes("http://ns.adobe.com/xap/1.0/\0" + xml));
         var result = CaptureDateReader.Read(path);
         Assert.Equal(MetadataReadStatus.Found, result.Status); Assert.Equal(new DateTime(2021, 2, 3, 4, 5, 6), result.CaptureDate);
+    }
+
+    [Fact] public void ExcessiveGifMetadataIsTerminalWithoutErasingAKnownDateOrChangingTheOriginal()
+    {
+        var path = Path.Combine(_root, "many-comments.gif");
+        using (var output = File.Create(path))
+        {
+            output.Write(Encoding.ASCII.GetBytes("GIF89a"));
+            output.Write(new byte[] { 1, 0, 1, 0, 0, 0, 0 }); // 1x1 logical screen, no global palette
+            for (var i = 0; i <= MetadataReadBudgetStream.DefaultMaximumOperations; i++)
+                output.Write(new byte[] { 0x21, 0xfe, 1, (byte)'x', 0 });
+            output.WriteByte(0x3b);
+        }
+        var hash = SHA256.HashData(File.ReadAllBytes(path)); var modified = File.GetLastWriteTimeUtc(path);
+        var result = CaptureDateReader.Read(path);
+        Assert.Equal(MetadataReadStatus.Unsupported, result.Status);
+        Assert.Equal("metadata-read-budget", result.ErrorCode);
+        Assert.True(result.IsTerminal); Assert.False(result.IsAuthoritative);
+        Assert.Null(result.RetryAtUtc(DateTime.UtcNow));
+        var previous = new DateTime(2019, 2, 3); Assert.Equal(previous, result.ApplyTo(previous));
+        Assert.Equal(hash, SHA256.HashData(File.ReadAllBytes(path))); Assert.Equal(modified, File.GetLastWriteTimeUtc(path));
+        // A returned result means the reader really released its lease; there is no orphaned timed-out task.
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+    }
+
+    [Fact] public void CancelledReadPropagatesCancellationBeforeOpeningTheFile()
+    {
+        using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
+        Assert.Throws<OperationCanceledException>(() => CaptureDateReader.Read(Path.Combine(_root, "missing.jpg"), cancellation.Token));
     }
 
     private static void CreateImage(string path, string format)
