@@ -24,6 +24,7 @@ class RepositoryGateTests(unittest.TestCase):
             "Directory.Build.props": "<Project><PropertyGroup><Version>1.2.3-ultra</Version><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
             "global.json": '{"sdk":{"version":"10.0.100"}}',
             "README.md": "# PhotoShelf Ultra v1.2.3\n",
+            "src/PhotoShelf.Desktop/RUNNING.txt": "PhotoShelf Ultra — Windows x64\n",
             "src/PhotoShelf.Desktop/MainWindow.xaml.cs": 'private const string VersionLabel = "Ultra v1.2.3";',
             "src/PhotoShelf.Desktop/MainWindow.xaml": '<Window xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"><TextBlock x:Name="AppTitleText" Text="PhotoShelf Ultra v1.2.3"/></Window>',
         }
@@ -77,6 +78,11 @@ class RepositoryGateTests(unittest.TestCase):
         (self.root / "conflict.cs").unlink()
         self.write("README.md", "# PhotoShelf Ultra v1.2.2\n")
         with self.assertRaisesRegex(ValueError, "README heading"):
+            self.validate()
+
+    def test_release_instructions_cannot_keep_an_old_version(self):
+        self.write("src/PhotoShelf.Desktop/RUNNING.txt", "PhotoShelf Ultra v0.10.6 — Windows x64\n")
+        with self.assertRaisesRegex(ValueError, "RUNNING source heading"):
             self.validate()
 
 

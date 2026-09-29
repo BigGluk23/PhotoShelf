@@ -44,8 +44,7 @@ internal static class QuarantineConfiguration
         };
         if (picker.ShowDialog() != Forms.DialogResult.OK) return null;
         var root = Path.GetFullPath(picker.SelectedPath);
-        if (StoragePrivacyPolicy.IsUnder(root, LocalCatalogStore.CatalogDirectory) ||
-            StoragePrivacyPolicy.IsUnder(root, LocalCatalogStore.DerivedDataDirectory))
+        if (CatalogStoragePaths.InternalRoots.Any(storage => StoragePrivacyPolicy.IsUnder(root, storage)))
         {
             System.Windows.MessageBox.Show(owner, "Карантин должен находиться вне служебной папки PhotoShelf и кэша.", "Выберите другую папку");
             return null;

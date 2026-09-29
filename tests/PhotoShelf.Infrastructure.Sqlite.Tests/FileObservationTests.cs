@@ -293,6 +293,7 @@ public sealed class FileObservationTests : IDisposable
                 ALTER TABLE desktop_media_items DROP COLUMN availability_error_code;
                 ALTER TABLE desktop_media_items DROP COLUMN file_identity;
                 ALTER TABLE desktop_media_items DROP COLUMN observation_version;
+                UPDATE desktop_settings SET value='4' WHERE key='catalog_schema';
                 """; command.ExecuteNonQuery();
         }
         await store.InitializeAsync(); await store.InitializeAsync();

@@ -53,7 +53,7 @@ public partial class MainWindow
         var dialog = new MovePlanWindow(requests, destination, byYear) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         var journal = Path.Combine(OperationsDirectory, $"move-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.jsonl");
-        await RunFileOperationAsync((progress, token) => new FileMoveService().ExecuteAsync(dialog.Plan, journal, CommitFileMoveAsync, progress, token), dialog.Plan.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase));
+        await RunFileOperationAsync((progress, token) => FileOperations.CreateService().ExecuteAsync(dialog.Plan, journal, CommitFileMoveAsync, progress, token), dialog.Plan.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase));
     }
     private async Task CommitFileMoveAsync(MoveEntry entry)
     {
@@ -120,16 +120,16 @@ public partial class MainWindow
     private async Task CheckPendingOperationsAsync()
     {
         _hasPendingRecovery = true;
-        var operations = await Task.Run(() => new FileMoveService().ReadHistory(OperationsDirectory));
+        var operations = await Task.Run(() => FileOperations.CreateService().ReadHistory(OperationsDirectory));
         _hasPendingRecovery = operations.Any(x => x.PendingFiles > 0 || x.Error is not null);
         if (_hasPendingRecovery) StatusText.Text = "Есть незавершённые операции — откройте «Операции»";
     }
-    private void OnOperationsClicked(object sender, RoutedEventArgs e)
+    private async void OnOperationsClicked(object sender, RoutedEventArgs e)
     {
         if (_fileOperationActive || _closing) return;
         var window = new OperationsWindow(OperationsDirectory, async (history, undo) =>
         {
-            var service = new FileMoveService();
+            var service = FileOperations.CreateService();
             var undoJournal = Path.Combine(OperationsDirectory, $"undo-{Guid.NewGuid():N}.jsonl");
             var entries = await Task.Run(() => service.ReadPlan(history.JournalPath));
             var paths = entries.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -138,5 +138,10 @@ public partial class MainWindow
                 : service.RecoverAsync(history.JournalPath, CommitFileMoveAsync, progress, token), paths);
         }, () => _desktopCatalogStore.CreateBackupAsync(_lifetime.Token), GetBackgroundActivity, ToggleBackgroundProcessingAsync) { Owner = this };
         window.ShowDialog();
+        if (!_closing)
+        {
+            await CheckPendingOperationsAsync();
+            QueueLibraryMonitoring();
+        }
     }
 }

@@ -9,19 +9,22 @@ namespace PhotoShelf.Application.Media;
 public sealed record RgbaFrame(int Width, int Height, int Stride, byte[] Pixels);
 
 /// <summary>A bounded pipe protocol. The separate worker is containment, not an OS sandbox.</summary>
-public sealed class HeifDecoderClient
+public sealed partial class HeifDecoderClient
 {
     public const long MaxInputBytes = 128L * 1024 * 1024;
     private static readonly SemaphoreSlim DecoderSlot = new(1, 1);
     private readonly string _executablePath;
     private readonly string[] _argumentPrefix;
     private readonly TimeSpan _timeout;
+    private readonly bool _requireBundledLibraries;
 
-    public HeifDecoderClient(string? executablePath = null, IReadOnlyList<string>? argumentPrefix = null, TimeSpan? timeout = null)
+    public HeifDecoderClient(string? executablePath = null, IReadOnlyList<string>? argumentPrefix = null, TimeSpan? timeout = null,
+        bool requireBundledLibraries = false)
     {
         _executablePath = executablePath ?? Path.Combine(AppContext.BaseDirectory, "codecs", "heif", "PhotoShelf.HeifWorker.exe");
         _argumentPrefix = argumentPrefix?.ToArray() ?? [];
         _timeout = timeout ?? TimeSpan.FromSeconds(15);
+        _requireBundledLibraries = executablePath is null || requireBundledLibraries;
         if (_timeout <= TimeSpan.Zero || _timeout > TimeSpan.FromMinutes(5)) throw new ArgumentOutOfRangeException(nameof(timeout));
     }
 
@@ -86,6 +89,7 @@ public sealed class HeifDecoderClient
         var tasks = new List<Task>(4);
         try
         {
+            VerifyInstallationFiles(); // Diagnose the installation before opening a user's original.
             source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
             if (source.Length is < 16 or > MaxInputBytes) throw new InvalidDataException("HEIF input must be between 16 bytes and 128 MiB.");
             if (!HasHeifSignature(source)) throw new InvalidDataException("The file does not contain a supported HEIF file-type signature.");
@@ -139,7 +143,10 @@ public sealed class HeifDecoderClient
         }
     }
 
-    private ProcessStartInfo CreateStartInfo(int maxDimension)
+    private ProcessStartInfo CreateStartInfo(int maxDimension) =>
+        CreateStartInfo(["--max-dimension", maxDimension.ToString(CultureInfo.InvariantCulture)]);
+
+    private ProcessStartInfo CreateStartInfo(IReadOnlyList<string> arguments)
     {
         var info = new ProcessStartInfo(_executablePath)
         {
@@ -147,7 +154,7 @@ public sealed class HeifDecoderClient
             RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
         };
         foreach (var argument in _argumentPrefix) info.ArgumentList.Add(argument);
-        info.ArgumentList.Add("--max-dimension"); info.ArgumentList.Add(maxDimension.ToString(CultureInfo.InvariantCulture));
+        foreach (var argument in arguments) info.ArgumentList.Add(argument);
         foreach (var key in info.Environment.Keys.Where(key => key.Equals("LIBHEIF_SECURITY_LIMITS", StringComparison.OrdinalIgnoreCase) ||
                      key.Equals("LIBHEIF_PLUGIN_PATH", StringComparison.OrdinalIgnoreCase)).ToArray()) info.Environment.Remove(key);
         // Prevent an inherited plugin search path from loading arbitrary external codec modules.
@@ -218,12 +225,14 @@ public sealed class HeifDecoderClient
         foreach (var task in tasks) try { await task.ConfigureAwait(false); } catch { /* observe failure after termination */ }
     }
 
-    private static async Task ReapAsync(Process process, WindowsHeifJob? job, FileStream source, IReadOnlyList<Task> tasks)
+    private static async Task ReapAsync(Process process, WindowsHeifJob? job, FileStream? source, IReadOnlyList<Task> tasks)
     {
         // This exceptional path deliberately retains resources instead of permitting a move
         // while an unconfirmed worker might still be reading the original's pipe.
         while (!await TerminateAndWaitAsync(process, job).ConfigureAwait(false)) await Task.Delay(1000).ConfigureAwait(false);
         await ObserveAsync(tasks).ConfigureAwait(false);
-        job?.Dispose(); process.Dispose(); await source.DisposeAsync().ConfigureAwait(false); DecoderSlot.Release();
+        job?.Dispose(); process.Dispose();
+        if (source is not null) await source.DisposeAsync().ConfigureAwait(false);
+        DecoderSlot.Release();
     }
 }

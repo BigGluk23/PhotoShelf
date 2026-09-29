@@ -3,6 +3,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Windows.Threading;
 using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Media;
 using PhotoShelf.Infrastructure.Sqlite;
 
 namespace PhotoShelf.Desktop;
@@ -18,6 +19,7 @@ internal sealed class UiSmokeSession
     public bool PreviewRendered { get; private set; }
     public bool NativeDecoderVerified { get; private set; }
     public bool HeifDecoderVerified { get; private set; }
+    private HeifInstallationInfo? _heifInstallation;
     public bool ViewerStatusVerified { get; private set; }
     private byte[]? _fixtureHash;
     public double ElapsedReadySeconds { get; private set; }
@@ -57,6 +59,10 @@ internal sealed class UiSmokeSession
             65536, FileOptions.Asynchronous))
             await embedded.CopyToAsync(output);
         _fixtureHash = SHA256.HashData(await File.ReadAllBytesAsync(_fixturePath));
+        _heifInstallation = await Task.Run(() => new HeifDecoderClient().VerifyInstallationAsync());
+        if (_heifInstallation.Protocol != "PSH1" || string.IsNullOrWhiteSpace(_heifInstallation.LibheifVersion) ||
+            string.IsNullOrWhiteSpace(_heifInstallation.Libde265Version))
+            throw new InvalidOperationException("Published HEIF installation did not confirm its bounded protocol and libraries.");
         HeifDecoderVerified = await Task.Run(() =>
         {
             var decoded = MediaBitmapLoader.LoadStillBounded(_fixturePath, 2048);
@@ -125,7 +131,7 @@ internal sealed class UiSmokeSession
 
     public object CreateReport(int exitCode) => new
     {
-        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && HeifDecoderVerified && ViewerStatusVerified && GracefulExit && DispatcherTicks >= 20 &&
+        status = exitCode == 0 && Ready && PreviewRendered && NativeDecoderVerified && HeifDecoderVerified && _heifInstallation is not null && ViewerStatusVerified && GracefulExit && DispatcherTicks >= 20 &&
             MaxDispatcherGapMs <= 2000 && ErrorReporter.ErrorCount == 0 ? "passed" : "failed",
         check = "ui-smoke",
         version = ErrorReporter.Version,
@@ -135,6 +141,10 @@ internal sealed class UiSmokeSession
         previewRendered = PreviewRendered,
         nativeDecoderVerified = NativeDecoderVerified,
         heifDecoderVerified = HeifDecoderVerified,
+        heifInstallationVerified = _heifInstallation is not null,
+        heifProtocol = _heifInstallation?.Protocol,
+        libheifVersion = _heifInstallation?.LibheifVersion,
+        libde265Version = _heifInstallation?.Libde265Version,
         viewerStatusVerified = ViewerStatusVerified,
         elapsedReadySeconds = ElapsedReadySeconds,
         dispatcherTicks = DispatcherTicks,

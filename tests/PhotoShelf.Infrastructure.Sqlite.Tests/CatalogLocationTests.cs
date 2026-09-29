@@ -31,34 +31,41 @@ public sealed class CatalogLocationTests
     }
 
     [Fact]
-    public void SmokeCannotRedirectAnAlreadyUsedProductionCatalog()
+    public async Task SmokeCannotRedirectAnAlreadyPinnedProductionCatalog()
     {
         var root = Directory.CreateTempSubdirectory("photoshelf-location-test-").FullName;
         var location = new CatalogLocation(Path.Combine(root, "local"), Path.Combine(root, "roaming"));
-        var production = location.DirectoryPath;
-        Assert.Equal(Path.Combine(root, "local"), production);
-        Assert.Throws<InvalidOperationException>(() => location.CreateIsolatedSmokeDirectory());
-        Assert.False(location.IsIsolatedSmoke);
-        Assert.Equal(production, location.DirectoryPath);
-        Directory.Delete(root);
+        try
+        {
+            using var prepared = await new CatalogGenerationMigration().PrepareAsync(location, null);
+            await new SqliteDesktopCatalogStore(prepared.DirectoryPath).InitializeAsync();
+            location.CommitPrepared(prepared);
+            Assert.Throws<InvalidOperationException>(() => location.CreateIsolatedSmokeDirectory());
+            Assert.False(location.IsIsolatedSmoke);
+            Assert.Equal(prepared.DirectoryPath, location.DirectoryPath);
+        }
+        finally { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(root, true); }
     }
 
     [Fact]
-    public void ExistingRoamingCatalogAndJournalsStayTogetherWhileDerivedDataUsesLocalStorage()
+    public void ExistingRoamingEvidenceIsDiscoveredWithoutPinningOrWriting()
     {
         var root = Directory.CreateTempSubdirectory("photoshelf-location-test-").FullName;
         try
         {
             var local = Path.Combine(root, "local"); var roaming = Path.Combine(root, "roaming");
             Directory.CreateDirectory(roaming);
-            var journal = Path.Combine(roaming, "operation.jsonl"); File.WriteAllText(journal, "must survive");
+            var operations = Directory.CreateDirectory(Path.Combine(roaming, "operations")).FullName;
+            var journal = Path.Combine(operations, "operation.jsonl"); File.WriteAllText(journal, "must survive");
             var location = new CatalogLocation(local, roaming);
-            Assert.Equal(roaming, location.DirectoryPath);
-            Assert.True(location.UsesLegacyStorage);
+            var source = Assert.Single(location.Discover().Candidates, candidate => candidate.HasEvidence);
+            Assert.Equal(roaming, source.DirectoryPath);
+            Assert.True(source.HasOperationEvidence);
+            Assert.Throws<InvalidOperationException>(() => location.DirectoryPath);
             Assert.Equal(local, location.DerivedDataDirectory);
             Assert.False(Directory.Exists(local));
             Assert.Equal("must survive", File.ReadAllText(journal));
-            File.Delete(journal); Directory.Delete(roaming);
+            File.Delete(journal); Directory.Delete(operations); Directory.Delete(roaming);
         }
         finally { Directory.Delete(root); }
     }

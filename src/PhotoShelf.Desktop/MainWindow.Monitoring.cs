@@ -117,7 +117,7 @@ public partial class MainWindow
                      scope.BrowseFolder is not null && LibraryFolderScope.Contains(path, scope.BrowseFolder, scope.Recursive));
                 foreach (var removed in _libraryRootStates.Keys.Except(roots, StringComparer.OrdinalIgnoreCase).ToArray()) _libraryRootStates.Remove(removed);
                 var configuration = new LibraryMonitorConfiguration(roots,
-                    [LocalCatalogStore.CatalogDirectory, LocalCatalogStore.DerivedDataDirectory],
+                    CatalogStoragePaths.InternalRoots,
                     ShouldObservePath: _monitorPathFilter, ShouldObserveFilePath: PhotoItem.IsSupported,
                     NonRecursiveRoots: roots.Where(root => !_includeSubfolders &&
                         !libraryRoots.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))).ToArray());

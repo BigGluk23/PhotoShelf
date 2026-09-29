@@ -10,6 +10,7 @@ public partial class App : System.Windows.Application
 {
     private Mutex? _instanceMutex;
     private FileStream? _catalogLease;
+    private FileStream? _startupLease;
     private bool _startupCompleted;
     private readonly bool _verificationOnly;
     private readonly UiSmokeSession? _uiSmoke;
@@ -61,19 +62,15 @@ public partial class App : System.Windows.Application
                 System.Windows.MessageBox.Show("PhotoShelf уже запущен. Откройте его окно через значок в области уведомлений.", "PhotoShelf");
                 _instanceMutex.Dispose(); _instanceMutex = null; Shutdown(); return;
             }
-            // The handle protects this catalog across Windows login sessions too.
-            Directory.CreateDirectory(LocalCatalogStore.CatalogDirectory);
-            _catalogLease = new FileStream(Path.Combine(LocalCatalogStore.CatalogDirectory, "writer.lock"),
-                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-
             // Keep every stage inside the same error boundary, including the splash XAML and Show().
             var loading = new LoadingWindow();
             loading.Show();
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             if (Dispatcher.HasShutdownStarted) return;
+            var preparedState = await PrepareCatalogStorageAsync(loading);
             if (_uiSmoke is not null) await _uiSmoke.SeedCatalogAsync();
             if (_uiBrowseSmoke is not null) await _uiBrowseSmoke.SeedCatalogAsync();
-            var state = await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
+            var state = preparedState ?? await PhotoShelf.Desktop.MainWindow.LoadInitialCatalogStateAsync();
             QuarantineConfiguration.ApplyLoaded(state);
             if (Dispatcher.HasShutdownStarted) return;
             var mainWindow = new MainWindow(state);
@@ -83,6 +80,7 @@ public partial class App : System.Windows.Application
             _startupCompleted = true;
             ShutdownMode = ShutdownMode.OnMainWindowClose;
             loading.Close();
+            if (!LocalCatalogStore.IsIsolatedSmokeCatalog) await CheckHeifInstallationAsync(mainWindow);
             if (_uiSmoke is not null) await _uiSmoke.ObserveAndCloseAsync(mainWindow);
             if (_uiBrowseSmoke is not null) await _uiBrowseSmoke.ObserveAndCloseAsync(mainWindow);
         }
@@ -96,6 +94,7 @@ public partial class App : System.Windows.Application
     protected override void OnExit(ExitEventArgs e)
     {
         _catalogLease?.Dispose();
+        _startupLease?.Dispose();
         if (_instanceMutex is not null) { _instanceMutex.ReleaseMutex(); _instanceMutex.Dispose(); }
         base.OnExit(e);
     }

@@ -21,12 +21,14 @@ public sealed record MoveJournalEntry(string Source, string Destination, string 
     DateTime? DestinationModifiedUtc = null, DateTime? RestoreModifiedUtc = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? WindowsSecurityDescriptor = null);
 public sealed record MoveOperationHistory(string JournalPath, DateTime StartedUtc, int TotalFiles, int CompletedFiles,
-    int PendingFiles, bool IsUndone, bool CanUndo, string? UndoJournalPath, string? Error);
+    int PendingFiles, bool IsUndone, bool CanUndo, string? UndoJournalPath, string? Error, bool IsLegacy = false,
+    bool LegacyReviewed = false, bool HasRecoverableTail = false);
 
 /// <summary>Test seam: production uses durable checkpoints without a callback.</summary>
 public sealed class FileMoveOptions
 {
     public bool AlwaysCopy { get; init; }
+    public JournalPathRelocation? JournalRelocation { get; init; }
     public Func<string, MoveJournalEntry, Task>? Checkpoint { get; init; }
 }
 
@@ -43,6 +45,8 @@ public sealed class FileMoveService
     private static readonly StringComparer Paths = StringComparer.OrdinalIgnoreCase;
     private readonly FileMoveOptions _options;
     public FileMoveService(FileMoveOptions? options = null) => _options = options ?? new();
+
+    private string ResolveJournal(string path) => _options.JournalRelocation?.Resolve(path) ?? path;
 
     public IReadOnlyList<MoveEntry> Plan(IEnumerable<MoveRequest> requests, string destination, CollisionPolicy collision, bool byYear = false, CancellationToken token = default, MoveLayoutOptions? layout = null)
     {
@@ -124,13 +128,13 @@ public sealed class FileMoveService
     {
         token.ThrowIfCancellationRequested();
         ValidatePlanSize(plan);
-        await using var journal = DurableMoveJournal.Create(journalPath);
+        await using var journal = DurableMoveJournal.Create(ResolveJournal(journalPath));
         return await ExecuteGroupsAsync(plan, journal, commitCatalog, progress, token);
     }
 
     public IReadOnlyList<MoveEntry> ReadPlan(string journalPath, CancellationToken token = default)
     {
-        var records = Latest(DurableMoveJournal.Read(journalPath, token).Entries);
+        var records = Latest(DurableMoveJournal.Read(ResolveJournal(journalPath), token).Entries);
         foreach (var entry in records) { token.ThrowIfCancellationRequested(); ValidateRecord(entry); }
         return records.Select(ToEntry).ToArray();
     }
@@ -144,18 +148,21 @@ public sealed class FileMoveService
             token.ThrowIfCancellationRequested();
             try
             {
-                var records = DurableMoveJournal.Read(path, token).Entries;
+                var data = DurableMoveJournal.Read(path, token);
+                var records = data.Entries;
                 var latest = Latest(records);
                 var completed = latest.Count(entry => entry.Status == "completed");
                 var undone = latest.Count > 0 && latest.All(entry => entry.Status == "undone");
                 history.Add(new(path, File.GetCreationTimeUtc(path), latest.Count, completed,
                     latest.Count(entry => entry.Status is not ("completed" or "undone")), undone,
-                    completed > 0 && latest.All(entry => entry.Status is "completed" or "undone"),
-                    latest.Select(entry => entry.UndoJournalPath).FirstOrDefault(value => value is not null),
-                    latest.Select(entry => entry.Error).FirstOrDefault(value => value is not null)));
+                    data.TailLength == 0 && completed > 0 && latest.All(entry => entry.Status is "completed" or "undone"),
+                    latest.Select(entry => entry.UndoJournalPath is { } link ? ResolveJournal(link) : null).FirstOrDefault(value => value is not null),
+                    data.TailLength > 0 ? "Журнал содержит незавершённую запись; требуется проверка/восстановление" :
+                    latest.Select(entry => entry.Error).FirstOrDefault(value => value is not null),
+                    HasRecoverableTail: data.TailLength > 0 && latest.Count > 0));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-            { history.Add(new(path, default, 0, 0, 0, false, false, null, ex.Message)); }
+            { history.Add(LegacyJournalReviewService.TryReadHistory(path, token) ?? new(path, default, 0, 0, 0, false, false, null, ex.Message)); }
         }
         return history.OrderByDescending(entry => entry.StartedUtc).ToArray();
     }
@@ -164,6 +171,7 @@ public sealed class FileMoveService
         IProgress<int>? progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        journalPath = ResolveJournal(journalPath);
         await using var journal = DurableMoveJournal.Open(journalPath, token);
         var records = Latest(journal.Entries);
         var results = new List<MoveResult>();
@@ -175,7 +183,7 @@ public sealed class FileMoveService
             foreach (var record in records)
                 if (!originalsByDestination.TryAdd(record.Destination, record))
                     throw new IOException("Неоднозначные целевые пути в исходном журнале; файлы сохранены");
-        foreach (var undoGroup in pendingUndo.GroupBy(entry => entry.UndoJournalPath))
+        foreach (var undoGroup in pendingUndo.GroupBy(entry => entry.UndoJournalPath is { } link ? ResolveJournal(link) : null))
         {
             if (undoGroup.Key is null || Paths.Equals(Path.GetFullPath(undoGroup.Key), Path.GetFullPath(journalPath)))
                 throw new IOException("Некорректная ссылка на журнал отката");
@@ -190,7 +198,7 @@ public sealed class FileMoveService
                 token.ThrowIfCancellationRequested();
                 if (!originalsByDestination.TryGetValue(inverse.Source, out var item) || !IsInverseOf(inverse, item)
                     || !(item.Status == "completed" && item.UndoJournalPath is null
-                        || (item.Status is "completed" or "undo_pending" or "undone") && Paths.Equals(item.UndoJournalPath, undoGroup.Key))
+                        || (item.Status is "completed" or "undo_pending" or "undone") && item.UndoJournalPath is { } linked && Paths.Equals(ResolveJournal(linked), undoGroup.Key))
                     || !matchedSources.Add(item.Source))
                     throw new IOException("Журнал отката не соответствует исходной операции; файлы сохранены");
                 matching.Add(item);
@@ -265,6 +273,8 @@ public sealed class FileMoveService
         Func<MoveEntry, Task> commitCatalog, IProgress<int>? progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        journalPath = ResolveJournal(journalPath);
+        undoJournalPath = ResolveJournal(undoJournalPath);
         if (Paths.Equals(Path.GetFullPath(journalPath), Path.GetFullPath(undoJournalPath))) throw new IOException("Откату нужен отдельный журнал");
         await using var original = DurableMoveJournal.Open(journalPath, token);
         var records = Latest(original.Entries);

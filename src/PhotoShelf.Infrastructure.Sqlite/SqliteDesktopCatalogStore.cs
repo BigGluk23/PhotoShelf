@@ -16,9 +16,12 @@ public sealed partial class SqliteDesktopCatalogStore
         _connectionString = CatalogDatabaseAccess.ConnectionString(_directory);
     }
 
-    public Task InitializeAsync(CancellationToken cancellationToken = default) => Task.Run(() =>
+    public Task InitializeAsync(CancellationToken cancellationToken = default) => InitializeCoreAsync(cancellationToken, validatePathKeys: false);
+
+    private Task InitializeCoreAsync(CancellationToken cancellationToken, bool validatePathKeys, bool requirePublishedGeneration = false) => Task.Run(() =>
         CatalogDatabaseAccess.WriteAsync(_directory, async () =>
         {
+            await ValidateCompatibilityCoreAsync(cancellationToken, validatePathKeys, requirePublishedGeneration);
             Directory.CreateDirectory(_directory);
             await using var connection = await OpenAsync(cancellationToken);
             var exists = await TableExistsAsync(connection, null, "desktop_media_items", cancellationToken);
@@ -142,7 +145,7 @@ public sealed partial class SqliteDesktopCatalogStore
             while (await reader.ReadAsync(cancellationToken))
             {
                 var key = reader.GetString(0); var value = reader.GetString(1);
-                if (key != "catalog_schema") state.ReadItemsFromSqlite = true;
+                if (key == LegacyImportMarker && IsCompletedImport(value)) state.ReadItemsFromSqlite = true;
                 switch (key)
                 {
                     case "include_system": if (bool.TryParse(value, out var system)) state.IncludeSystemFolders = system; break;
@@ -182,6 +185,7 @@ public sealed partial class SqliteDesktopCatalogStore
             }
             var values = new Dictionary<string,string>
             {
+                [LegacyImportMarker] = "sqlite",
                 ["tile_width"] = state.TileWidth.ToString(CultureInfo.InvariantCulture), ["show_videos"] = state.ShowVideos.ToString(),
                 ["date_grouping_mode"] = state.DateGroupingMode, ["include_system"] = state.IncludeSystemFolders.ToString(),
                 ["active_folder"] = state.ActiveFolder ?? "", ["view_mode"] = state.ViewMode, ["newest_first"] = state.SortNewestFirst.ToString(),

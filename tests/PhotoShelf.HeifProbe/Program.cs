@@ -6,7 +6,8 @@ using System.Text.Json;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (var i = 0; i + 1 < args.Length; i += 2) options.Add(args[i], args[i + 1]);
 var mode = options["--probe-mode"]; var report = options["--probe-report"];
-var maximum = int.Parse(options["--max-dimension"], System.Globalization.CultureInfo.InvariantCulture);
+var versionProbe = args.Contains("--version", StringComparer.Ordinal);
+var maximum = versionProbe ? 256 : int.Parse(options["--max-dimension"], System.Globalization.CultureInfo.InvariantCulture);
 var input = Console.OpenStandardInput();
 using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 var chunk = new byte[65536]; long received = 0; int count;
@@ -22,6 +23,22 @@ var data = new
 };
 await File.WriteAllTextAsync(report + ".tmp", JsonSerializer.Serialize(data));
 File.Move(report + ".tmp", report);
+if (versionProbe)
+{
+    if (mode == "version-timeout") { await Task.Delay(Timeout.Infinite); return 0; }
+    if (mode == "version-nonzero") return 9;
+    if (mode == "version-stderr-flood")
+        for (var i = 0; i < 2048; i++) await Console.Error.WriteAsync(new string('x', 4096));
+    await Console.Out.WriteAsync(mode switch
+    {
+        "version-compatible" => "PhotoShelf.HeifWorker PSH1; libheif 1.24.0-trusted; libde265 1.1.4+local\n",
+        "version-old" => "PhotoShelf.HeifWorker PSH1; libheif 1.20.0; libde265 1.1.3\n",
+        "version-invalid" => "PhotoShelf.HeifWorker PSH2; libheif 1.23.5; libde265 1.1.3\n",
+        "version-overflow" => new string('x', 4096),
+        _ => "PhotoShelf.HeifWorker PSH1; libheif 1.23.5; libde265 1.1.3\n"
+    });
+    return 0;
+}
 if (mode == "timeout") { await Task.Delay(Timeout.Infinite); return 0; }
 if (mode == "nonzero") { await Console.Error.WriteAsync("Synthetic decoder failure."); return 9; }
 if (mode == "stderr-flood")

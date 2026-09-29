@@ -52,3 +52,9 @@ Logical fault injection checks exceptions and interruption boundaries. `PhotoShe
 Win32 reference contracts:
 - https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirststreamw
 - https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-win32_find_stream_data
+
+## Upgrade evidence (v0.10.13)
+
+- Working storage is isolated from historical executables. Copy the entire journal evidence set before activating a new catalog; do not rewrite checksummed records to update absolute undo paths. Only the explicitly selected source/current operations roots may be mapped.
+- Legacy v0.9.7 journals never execute recovery or undo. Completed-only acknowledgement requires a fresh read-only SHA-256 verification of every destination, absence of every source/staging/temporary, accessible source parent and explicit confirmation. A separate no-overwrite durable receipt identifies the exact journal hash; it is historical verification, not a backup or future file lock.
+- Malformed, unknown, incomplete, inaccessible or oversized evidence remains blocked and available for manual export. Never delete evidence to unblock moves. A torn modern tail is visible as an error, even if its valid prefix contains only completed records.

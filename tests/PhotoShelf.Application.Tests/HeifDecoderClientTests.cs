@@ -71,6 +71,102 @@ public sealed class HeifDecoderClientTests : IDisposable
     }
 
     [Theory]
+    [InlineData("version-valid", "1.23.5", "1.1.3")]
+    [InlineData("version-compatible", "1.24.0-trusted", "1.1.4+local")]
+    [InlineData("version-stderr-flood", "1.23.5", "1.1.3")]
+    public async Task InstallationProbeAcceptsCompatibleLibrariesWithoutSendingMedia(string mode, string heif, string de265)
+    {
+        var hash = Hash(Source); var modified = File.GetLastWriteTimeUtc(Source); var report = Report();
+        // The source can even be locked exclusively: checking an installation must not open it.
+        using (var originalLock = new FileStream(Source, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var result = await Client(mode, report).VerifyInstallationAsync();
+            Assert.Equal(new HeifInstallationInfo("PSH1", heif, de265), result);
+            using var data = ReadReport(report);
+            Assert.Equal(0, data.RootElement.GetProperty("inputBytes").GetInt64());
+            AssertDead(data.RootElement.GetProperty("pid").GetInt32());
+            if (OperatingSystem.IsWindows())
+            {
+                Assert.Equal(0x2508u, data.RootElement.GetProperty("jobFlags").GetUInt32());
+                Assert.Equal(1u, data.RootElement.GetProperty("jobProcesses").GetUInt32());
+                Assert.Equal(1024UL * 1024 * 1024, data.RootElement.GetProperty("jobMemory").GetUInt64());
+            }
+        }
+        Assert.Equal(hash, Hash(Source)); Assert.Equal(modified, File.GetLastWriteTimeUtc(Source));
+    }
+
+    [Theory]
+    [InlineData("version-old")]
+    [InlineData("version-invalid")]
+    [InlineData("version-overflow")]
+    [InlineData("version-nonzero")]
+    public async Task InstallationProbeRejectsIncompatibleOrUnboundedResponsesAndReleasesSlot(string mode)
+    {
+        var report = Report();
+        var error = await Assert.ThrowsAsync<HeifInstallationException>(() => Client(mode, report).VerifyInstallationAsync());
+        Assert.Contains("распакуйте весь ZIP", error.Message);
+        using var data = ReadReport(report); AssertDead(data.RootElement.GetProperty("pid").GetInt32());
+        Assert.Equal("PSH1", (await Client("version-valid", Report("next")).VerifyInstallationAsync()).Protocol);
+    }
+
+    [Fact]
+    public async Task InstallationProbeTimeoutKillsTheActualWorkerAndAllowsRetry()
+    {
+        var report = Report(); var elapsed = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<HeifInstallationException>(() => Client("version-timeout", report, TimeSpan.FromSeconds(3)).VerifyInstallationAsync());
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(12));
+        using var data = ReadReport(report); AssertDead(data.RootElement.GetProperty("pid").GetInt32());
+        Assert.Equal("PSH1", (await Client("version-valid", Report("next")).VerifyInstallationAsync()).Protocol);
+    }
+
+    [Fact]
+    public async Task InstallationProbeCancellationWaitsForWorkerAndDoesNotBecomeAnInstallationError()
+    {
+        var report = Report(); using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        var probe = Client("version-timeout", report).VerifyInstallationAsync(cancellation.Token);
+        try
+        {
+            await WaitForReportAsync(report, probe);
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probe);
+            using var data = ReadReport(report); AssertDead(data.RootElement.GetProperty("pid").GetInt32());
+            Assert.Equal("PSH1", (await Client("version-valid", Report("next")).VerifyInstallationAsync()).Protocol);
+        }
+        finally { cancellation.Cancel(); try { await probe; } catch { } }
+    }
+
+    [Theory]
+    [InlineData("PhotoShelf.HeifWorker.exe")]
+    [InlineData("heif.dll")]
+    [InlineData("libde265.dll")]
+    public async Task MissingInstalledComponentIsReportedBeforeOpeningAnyOriginal(string missing)
+    {
+        foreach (var name in new[] { "PhotoShelf.HeifWorker.exe", "heif.dll", "libde265.dll" })
+            if (name != missing) File.WriteAllText(Path.Combine(_root, name), "synthetic component, never executed");
+        var client = new HeifDecoderClient(Path.Combine(_root, "PhotoShelf.HeifWorker.exe"), requireBundledLibraries: true);
+        var check = await Assert.ThrowsAsync<HeifInstallationException>(() => client.VerifyInstallationAsync());
+        Assert.Contains(missing, check.Message);
+        // This path is deliberately absent: installation diagnostics take precedence over opening media.
+        var decode = await Assert.ThrowsAsync<HeifInstallationException>(() => client.DecodeAsync(Path.Combine(_root, "absent.heic"), 256));
+        Assert.Contains(missing, decode.Message);
+    }
+
+    [Theory]
+    [InlineData("PhotoShelf.HeifWorker.exe")]
+    [InlineData("heif.dll")]
+    [InlineData("libde265.dll")]
+    public async Task TruncatedInstalledComponentIsReportedBeforeOpeningAnyOriginal(string empty)
+    {
+        foreach (var name in new[] { "PhotoShelf.HeifWorker.exe", "heif.dll", "libde265.dll" })
+            File.WriteAllText(Path.Combine(_root, name), name == empty ? "" : "synthetic component, never executed");
+        var client = new HeifDecoderClient(Path.Combine(_root, "PhotoShelf.HeifWorker.exe"), requireBundledLibraries: true);
+        var check = await Assert.ThrowsAsync<HeifInstallationException>(() => client.VerifyInstallationAsync());
+        Assert.Contains(empty, check.Message);
+        var decode = await Assert.ThrowsAsync<HeifInstallationException>(() => client.DecodeAsync(Path.Combine(_root, "absent.heic"), 256));
+        Assert.Contains(empty, decode.Message);
+    }
+
+    [Theory]
     [InlineData("bad-header")]
     [InlineData("truncated")]
     [InlineData("oversize")]

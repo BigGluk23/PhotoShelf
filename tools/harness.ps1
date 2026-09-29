@@ -31,6 +31,7 @@ try {
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
     Invoke-Checked $Python @('-B', 'tools/test_harness_checks.py')
+    Invoke-Checked $Python @('-B', 'tools/test_package_checks.py')
     Invoke-Checked $Python @('tools/harness_checks.py', 'repository')
     $result.commit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Git revision.' }
@@ -76,7 +77,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not record resolved publish dependency inventory.' }
     & $DotNet list src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj package --vulnerable --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'publish-dependency-audit.json') -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw 'Could not check publish dependency advisories.' }
-    $exe = Join-Path $publish 'PhotoShelf.exe'
+    # Validate what the user downloads: generate the versioned instructions/inventory,
+    # archive once, extract into a new directory, then run every EXE smoke from there.
+    Invoke-Checked $Python @('tools/package_checks.py', 'create', $publish, '--version', $result.version, '--commit', $result.commit)
+    $archive = Join-Path $artifactRoot ($packageName + '.zip')
+    Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $archive -CompressionLevel Optimal
+    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $extracted = Join-Path $artifactRoot ('extracted-' + $packageName)
+    Expand-Archive -LiteralPath $archive -DestinationPath $extracted
+    Invoke-Checked $Python @('tools/package_checks.py', 'verify', $extracted, '--version', $result.version, '--commit', $result.commit,
+        '--report', (Join-Path $results 'package-verification.json'))
+    $exe = Join-Path $extracted 'PhotoShelf.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Publish did not produce PhotoShelf.exe.' }
     & (Join-Path $repoRoot 'scripts/test-startup-package.ps1') -ExePath $exe -ReportDirectory $results
 
@@ -106,7 +117,9 @@ try {
         throw 'New error logs were written during the isolated UI smoke.'
     }
     if ($smokeProcess.ExitCode -ne 0 -or $smoke.status -ne 'passed' -or $smoke.check -ne 'ui-smoke' -or $smoke.ready -ne $true -or $smoke.previewRendered -ne $true -or
-        $smoke.nativeDecoderVerified -ne $true -or $smoke.heifDecoderVerified -ne $true -or $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
+        $smoke.nativeDecoderVerified -ne $true -or $smoke.heifDecoderVerified -ne $true -or $smoke.heifInstallationVerified -ne $true -or
+        $smoke.heifProtocol -ne 'PSH1' -or $smoke.libheifVersion -ne '1.23.5' -or $smoke.libde265Version -ne '1.1.3' -or
+        $smoke.gracefulExit -ne $true -or $smoke.errorCount -ne 0 -or $smoke.elapsedReadySeconds -lt 5 -or
         $smoke.dispatcherTicks -lt 20 -or $smoke.maxDispatcherGapMs -gt 2000 -or $smoke.exitCode -ne 0 -or
         -not ($smoke.version -eq $result.version -or $smoke.version.StartsWith($result.version + '+', [StringComparison]::Ordinal))) {
         throw 'UI smoke did not confirm the published version, ready window, at least 5 seconds of responsiveness, zero errors, and graceful exit.'
@@ -198,12 +211,14 @@ try {
     $result.browseSmokeVerified = $true
     $result.searchSortSmokeVerified = $true
     Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'
-    $archive = Join-Path $artifactRoot ($packageName + '.zip')
-    Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $archive -CompressionLevel Optimal
-    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Smoke must not mutate the installation, and the published ZIP must be the exact
+    # archive whose extracted bytes were tested. Catalog/log writes stay in owned TEMP.
+    Invoke-Checked $Python @('tools/package_checks.py', 'verify', $extracted, '--version', $result.version, '--commit', $result.commit)
+    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash) { throw 'Release ZIP changed after extraction.' }
     ($hash + '  ' + [System.IO.Path]::GetFileName($archive)) | Set-Content -LiteralPath ($archive + '.sha256') -Encoding utf8
     $result.archive = $archive
     $result.archiveSha256 = $hash
+    $result.extractedPackageVerified = $true
     Invoke-Checked $Python @('tools/harness_checks.py', 'repository')
     $result.status = 'passed'
     if (-not $Scale) { Write-Output 'NOT RUN: CatalogScale (opt in with -Scale).' }

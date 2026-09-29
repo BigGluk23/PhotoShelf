@@ -18,7 +18,7 @@ public static class PhotoScanner
 
         var normalized = Path.GetFullPath(path);
         if (QuarantineConfiguration.IsKnownQuarantine(normalized)) return true;
-        if (IsInternalStoragePath(normalized, LocalCatalogStore.CatalogDirectory, LocalCatalogStore.DerivedDataDirectory))
+        if (IsInternalStoragePath(normalized, CatalogStoragePaths.InternalRoots))
         {
             return true;
         }
@@ -68,8 +68,8 @@ public static class PhotoScanner
             StringComparison.OrdinalIgnoreCase);
     }
 
-    internal static bool IsInternalStoragePath(string path, string catalogDirectory, string derivedDataDirectory) =>
-        LibraryCatalogSynchronizer.IsUnder(path, catalogDirectory) || LibraryCatalogSynchronizer.IsUnder(path, derivedDataDirectory);
+    internal static bool IsInternalStoragePath(string path, params string[] storageRoots) =>
+        storageRoots.Any(root => LibraryCatalogSynchronizer.IsUnder(path, root));
 
     public static IEnumerable<string> GetDefaultDiscoveryRoots()
     {

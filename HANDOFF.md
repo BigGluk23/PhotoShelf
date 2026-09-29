@@ -1,7 +1,13 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.12** (`0.10.12-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.13** (`0.10.13-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Безопасное обновление v0.10.13
+
+`CatalogLocation` больше не выбирает папку по Directory.Exists: нормальный старт обязан Discover → выбрать источник → PrepareAsync → initialize/import/load → CommitPrepared. SQL compatibility guard read-only; unknown/future schema не изменяется. Working generation изолирована от старых EXE, selection+manifest имеют identity, legacy source сохранён. Modern UndoJournalPath перенаправляется через `JournalPathRelocation`, checksummed bytes не переписываются. `LegacyJournalReviewService` только читает v0.9.7 и сверяет завершённые destinations по SHA-256; отдельная receipt не даёт права выполнять legacy recovery/undo. Не восстанавливать каталоги копированием старой DB поверх новой.
+
+Windows harness создаёт manifest, распаковывает готовый ZIP и выполняет smoke на извлечённом EXE. HEIF preflight проверяет комплект без открытия фото, runtime допускает совместимые заменяемые LGPL-библиотеки. Подробности и точные результаты проверки: `docs/v0.10.13-safe-upgrade.md`.
 
 ## Координированный просмотр v0.10.12
 

@@ -76,6 +76,7 @@ public sealed class MetadataOutcomeTests : IDisposable
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_attempted_ticks;
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_retry_ticks;
                 ALTER TABLE desktop_media_items DROP COLUMN metadata_error_code;
+                UPDATE desktop_settings SET value='3' WHERE key='catalog_schema';
                 """;command.ExecuteNonQuery();
         }
         await store.InitializeAsync();

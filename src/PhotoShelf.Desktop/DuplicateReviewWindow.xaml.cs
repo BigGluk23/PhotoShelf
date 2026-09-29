@@ -142,7 +142,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
         try
         {
             var directory = Path.Combine(LocalCatalogStore.CatalogDirectory, "operations");
-            var history = await Task.Run(() => new FileMoveService().ReadHistory(directory, _pageCancellation.Token));
+            var history = await Task.Run(() => FileOperations.CreateService().ReadHistory(directory, _pageCancellation.Token));
             if (!IsLoaded) return false;
             if (history.Any(operation => operation.PendingFiles > 0 || operation.Error is not null))
             {
@@ -217,7 +217,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
                             var actual = Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellation.Token));
                             if (!actual.Equals(group.Hash, StringComparison.OrdinalIgnoreCase)) throw new IOException($"Сохраняемый файл изменился: {group.KeepPath}. Повторите поиск дублей.");
                         }
-                        return await new FileMoveService().ExecuteAsync(plan, journal, _commitCatalog, progress, cancellation.Token);
+                        return await FileOperations.CreateService().ExecuteAsync(plan, journal, _commitCatalog, progress, cancellation.Token);
                     }
                     finally { foreach (var stream in locks) await stream.DisposeAsync(); }
                 });

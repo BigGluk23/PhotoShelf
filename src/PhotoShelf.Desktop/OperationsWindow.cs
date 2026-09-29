@@ -21,6 +21,8 @@ public sealed class OperationsWindow : Window
     private readonly Button _recover = new() { Content = "Продолжить / восстановить", Margin = new Thickness(6), Padding = new Thickness(8) };
     private readonly Button _undo = new() { Content = "Откатить перенос", Margin = new Thickness(6), Padding = new Thickness(8) };
     private readonly Button _export = new() { Content = "Сохранить журнал для разбора", Margin = new Thickness(6), Padding = new Thickness(8) };
+    private readonly Button _reviewLegacy = new() { Content = "Проверить старый журнал", Margin = new Thickness(6), Padding = new Thickness(8) };
+    private CancellationTokenSource? _reviewCancellation;
     private bool _busy;
     private int _revision;
     public OperationsWindow(string directory, Func<MoveOperationHistory, bool, Task> execute, Func<Task<string>> backup,
@@ -75,10 +77,12 @@ public sealed class OperationsWindow : Window
         AddColumn(_history, "Журнал", nameof(MoveOperationHistory.JournalPath), 260);
         AddColumn(_files, "Исходный путь", nameof(MoveEntry.Source), 420);
         AddColumn(_files, "Целевой путь", nameof(MoveEntry.Destination), 420);
-        AddColumn(_files, "Размер", nameof(MoveEntry.Length), 90);
-        var buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        AddColumn(_files, "Проверка", nameof(LegacyJournalFile.Problem), 330);
+        var buttons = new WrapPanel { Orientation = Orientation.Horizontal };
         buttons.Children.Add(_recover); buttons.Children.Add(_undo);
         buttons.Children.Add(_export);
+        buttons.Children.Add(_reviewLegacy);
+        _reviewLegacy.Click += async (_, _) => await ReviewLegacyAsync();
         _export.Click += async (_, _) => await ExportJournalAsync();
         var refresh = new Button { Content = "Обновить", Padding = new Thickness(8), Margin = new Thickness(6) };
         var backupButton = new Button { Content = "Резервная копия каталога", Padding = new Thickness(8), Margin = new Thickness(6) };
@@ -97,7 +101,7 @@ public sealed class OperationsWindow : Window
         _undo.Click += async (_, _) => await ExecuteAsync(true);
         _history.SelectionChanged += async (_, _) => await ShowPlanAsync();
         Loaded += async (_, _) => await RefreshAsync();
-        Closing += (_, e) => { if (_busy) e.Cancel = true; };
+        Closing += (_, e) => { if (_busy) { _reviewCancellation?.Cancel(); e.Cancel = true; } };
     }
     private static void AddColumn(DataGrid grid, string title, string property, double width) =>
         grid.Columns.Add(new DataGridTextColumn { Header = title, Binding = new Binding(property), Width = width });
@@ -105,7 +109,7 @@ public sealed class OperationsWindow : Window
     {
         try
         {
-            _history.ItemsSource = await Task.Run(() => new FileMoveService().ReadHistory(_directory));
+            _history.ItemsSource = await Task.Run(() => FileOperations.CreateService().ReadHistory(_directory));
             if (_history.Items.Count > 0) _history.SelectedIndex = 0;
         }
         catch (Exception ex) { _status.Text = ex.Message; }
@@ -117,7 +121,13 @@ public sealed class OperationsWindow : Window
         if (_history.SelectedItem is not MoveOperationHistory operation) return;
         try
         {
-            var plan = await Task.Run(() => new FileMoveService().ReadPlan(operation.JournalPath));
+            if (operation.IsLegacy)
+            {
+                _files.ItemsSource = null;
+                _status.Text = operation.LegacyReviewed ? "Старый перенос проверен. Автоматический откат для этого формата недоступен." : "Нажмите «Проверить старый журнал». Будут прочитаны файлы назначения и сверены их SHA-256; файлы не перемещаются. Закрытие окна отменяет проверку.";
+                return;
+            }
+            var plan = await Task.Run(() => FileOperations.CreateService().ReadPlan(operation.JournalPath));
             if (revision == _revision) _files.ItemsSource = plan;
         }
         catch (Exception ex) { _files.ItemsSource = null; _status.Text = $"Автоматическое восстановление недоступно: {ex.Message}"; }
@@ -125,10 +135,38 @@ public sealed class OperationsWindow : Window
     private void SetButtons()
     {
         var operation = _history.SelectedItem as MoveOperationHistory;
-        _recover.IsEnabled = !_busy && operation is { PendingFiles: > 0 };
+        _recover.IsEnabled = !_busy && operation is { IsLegacy: false } && (operation.PendingFiles > 0 || operation.HasRecoverableTail);
         _undo.IsEnabled = !_busy && operation?.CanUndo == true;
+        _reviewLegacy.IsEnabled = !_busy && operation is { IsLegacy: true, LegacyReviewed: false };
         _export.IsEnabled = !_busy && operation is not null;
         _history.IsEnabled = !_busy;
+    }
+    private async Task ReviewLegacyAsync()
+    {
+        if (_busy || _history.SelectedItem is not MoveOperationHistory { IsLegacy: true } operation) return;
+        _busy = true; SetButtons();
+        using var cancellation = new CancellationTokenSource();
+        _reviewCancellation = cancellation;
+        try
+        {
+            _status.Text = "Проверяю файлы старой операции по SHA-256. Закрытие окна отменяет проверку…";
+            var review = await LegacyJournalReviewService.ReviewAsync(operation.JournalPath, cancellation.Token);
+            _files.ItemsSource = review.Files;
+            if (!review.CanAcknowledge)
+            {
+                _status.Text = "Есть неподтверждённые файлы. Блокировка сохранена; смотрите причины в таблице. Сохраните журнал для ручного разбора. Не удаляйте оригиналы, журналы и временные файлы.";
+                return;
+            }
+            _status.Text = $"Проверены {review.Files.Count:N0} файлов. Назначения совпадают с хэшами; исходные и временные пути свободны.";
+            if (System.Windows.MessageBox.Show(this, "Все завершённые переносы этого старого журнала проверены. Записать результат проверки и снять блокировку для этой операции? Медиа и старый журнал останутся без изменений. Автоматический откат старого формата недоступен.",
+                "Подтвердить результат проверки", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK) return;
+            await LegacyJournalReviewService.AcknowledgeCompletedAsync(operation.JournalPath, cancellation.Token);
+            await RefreshAsync();
+            _status.Text = "Результат проверки сохранён отдельным файлом. Старый журнал и медиа сохранены.";
+        }
+        catch (OperationCanceledException) { _status.Text = "Проверка отменена; блокировка сохранена."; }
+        catch (Exception ex) { _status.Text = "Проверка не завершена: " + ex.Message; }
+        finally { _reviewCancellation = null; _busy = false; SetButtons(); }
     }
     private async Task ExportJournalAsync()
     {

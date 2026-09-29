@@ -77,6 +77,8 @@ def repository():
         raise ValueError("MainWindow XAML title differs from Directory.Build.props.")
     if (ROOT / "README.md").read_text(encoding="utf-8").splitlines()[0] != "# PhotoShelf " + label:
         raise ValueError("README heading differs from Directory.Build.props.")
+    if (ROOT / "src/PhotoShelf.Desktop/RUNNING.txt").read_text(encoding="utf-8").splitlines()[0] != "PhotoShelf Ultra — Windows x64":
+        raise ValueError("RUNNING source heading must be version-neutral; packaging generates the release version.")
     print(f"OK repository: {len(candidates)} source candidates; version {version}; SDK {sdk}; no generated files/conflicts")
 
 

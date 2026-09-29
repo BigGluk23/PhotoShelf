@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.12";
+    private const string VersionLabel = "Ultra v0.10.13";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -951,10 +951,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return await Task.Run(async () =>
         {
             var store = new SqliteDesktopCatalogStore();
-            await store.InitializeAsync();
-            var state = await store.LoadAsync(includeItems: false);
-            if (!state.ReadItemsFromSqlite) state = LocalCatalogStore.Load();
-            return state;
+            await store.InitializeAndImportLegacyAsync(LocalCatalogStore.CatalogPath);
+            return await store.LoadAsync(includeItems: false);
         });
     }
 
@@ -963,18 +961,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await _desktopCatalogStore.InitializeAsync(_lifetime.Token);
         await _metadataIndexStore.InitializeAsync(_lifetime.Token);
         await _duplicateHashStore.InitializeAsync(_lifetime.Token);
-        if (!_catalogState.ReadItemsFromSqlite && _catalogState.Items.Count > 0)
-        {
-            foreach (var batch in _catalogState.Items.Chunk(128))
-            {
-                var restored = await Task.Run(() => batch.Select(saved =>
-                {
-                    var current = ToSavedItem(saved.Path) ?? saved; current.IsFavorite = saved.IsFavorite; return current;
-                }).ToArray(), _lifetime.Token);
-                await _desktopCatalogStore.UpsertItemsAsync(restored, preserveFavorites: false, _lifetime.Token);
-            }
-            _catalogState.Items.Clear();
-        }
         await CheckPendingOperationsAsync();
         _catalogLoaded = true;
         await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
