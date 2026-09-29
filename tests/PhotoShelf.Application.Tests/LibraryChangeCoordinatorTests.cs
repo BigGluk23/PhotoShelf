@@ -14,6 +14,257 @@ public sealed class LibraryChangeCoordinatorTests
     };
 
     [Fact]
+    public async Task AtomicRequestSharesEvenAnImmediatelyCompletedInitialPass()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions with { Debounce = TimeSpan.Zero }, factory, new FakeProbe());
+
+        var request = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        var sentinel = Path.Combine(root, "after-initial.jpg");
+        factory.Latest(root).Change(new(sentinel));
+        await Until(() => batches.Any(batch => batch.ChangedPaths.Contains(sentinel)));
+
+        Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.Empty(batches.SelectMany(batch => batch.DirectoryChanges ?? []));
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
+    public async Task ExplicitRequestsSharePendingAndActiveInitialPasses()
+    {
+        var root = RootPath(); var child = Path.Combine(root, "photos");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.ReconcileRoots.Count > 0) { entered.TrySetResult(); await release.Task.WaitAsync(token); }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        var pending = monitor.ReconcileAsync([child, root, root]);
+        Assert.False(initial.Completion.IsCompleted); Assert.False(pending.IsCompleted);
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        Assert.Equal(0, monitor.Activity.PendingDirectoryCount);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var active = monitor.ReconcileAsync([child]);
+        Assert.False(active.IsCompleted);
+        Assert.Equal(0, monitor.Activity.PendingReconciliationRootCount);
+        Assert.Equal(0, monitor.Activity.PendingDirectoryCount);
+        release.TrySetResult();
+        await Task.WhenAll(initial.Completion, pending, active).WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.Empty(batches.SelectMany(batch => batch.DirectoryChanges ?? []));
+    }
+
+    [Fact]
+    public async Task EachRequestAfterCompletionRequiresANewSuccessfulPass()
+    {
+        var root = RootPath(); var calls = 0;
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        {
+            if (batch.ReconcileRoots.Contains(root)) Interlocked.Increment(ref calls);
+            return Task.CompletedTask;
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await initial.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        // Request immediately from the previous completion continuation. The finished
+        // batch must already be unjoinable, including before the worker's finally runs.
+        for (var expected = 2; expected <= 16; expected++)
+        {
+            await monitor.ReconcileAsync([root]).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(expected, Volatile.Read(ref calls));
+        }
+    }
+
+    [Fact]
+    public async Task ChildRequestAndResumeWithoutBroadReconciliationLeaveOtherRootsQuiet()
+    {
+        var root = RootPath(); var other = RootPath(); var child = Path.Combine(root, "photos");
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions, new FakeFactory(), new FakeProbe());
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root, other]), [root, other]);
+        await initial.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        var baseline = batches.Count;
+        var request = monitor.ReconcileAsync([child]);
+        Assert.False(request.IsCompleted);
+        Assert.Equal(1, monitor.Activity.PendingDirectoryCount);
+        Assert.Equal(0, monitor.Activity.PendingReconciliationRootCount);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await request.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+
+        Assert.Empty(batches.Skip(baseline).SelectMany(batch => batch.ReconcileRoots));
+        Assert.Equal([new LibraryDirectoryChange(root, child)],
+            batches.Skip(baseline).SelectMany(batch => batch.DirectoryChanges ?? []));
+        Assert.All(batches.Skip(baseline), batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+    }
+
+    [Fact]
+    public async Task CancellingWaiterDoesNotAcknowledgePassAndPauseStillDrainsActualCallback()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readerReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var calls = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (Interlocked.Increment(ref calls) != 1) return;
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancellationObserved.TrySetResult(); await readerReleased.Task; }
+        }, FastOptions with { Debounce = TimeSpan.Zero }, factory, new FakeProbe());
+        using var cancelledCaller = new CancellationTokenSource();
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root], cancelledCaller.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            cancelledCaller.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => initial.Completion);
+            Assert.True(monitor.Activity.IsProcessing);
+            Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+            Assert.False(cancellationObserved.Task.IsCompleted); // A detached waiter does not stop the reader.
+
+            var pause = monitor.PauseAsync();
+            await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var changed = Path.Combine(root, "changed-during-stop.jpg");
+            factory.Latest(root).Change(new(changed));
+            Assert.False(pause.IsCompleted);
+            readerReleased.TrySetResult();
+            await pause.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(monitor.Activity.IsProcessing);
+            Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+            Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+            Assert.Equal(1, monitor.PendingPathCount);
+
+            var resumed = monitor.ReconcileAsync([root]);
+            await monitor.ResumeAsync(reconcileAllRoots: false);
+            await resumed.WaitAsync(TimeSpan.FromSeconds(5));
+            await Until(() => batches.Skip(1).Any(batch => batch.ChangedPaths.Contains(changed)));
+            Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+            Assert.All(batches, batch => Assert.Empty(batch.RevalidateContentRoots ?? []));
+        }
+        finally { readerReleased.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task RequestWaitsForRetryAfterConsumerFailureInsteadOfReportingSuccess()
+    {
+        var root = RootPath(); var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var retryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (!batch.ReconcileRoots.Contains(root)) return;
+            if (Interlocked.Increment(ref attempts) == 1) { failed.TrySetResult(); throw new IOException("Synthetic consumer error"); }
+            retryEntered.TrySetResult(); await release.Task.WaitAsync(token);
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        var request = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await failed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await retryEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(request.Completion.IsCompleted);
+        Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+        release.TrySetResult();
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, attempts);
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
+    public async Task ReconfigurationTransfersRequestsToCoveringOwnerButCancelsRemovedScopes()
+    {
+        var root = RootPath(); var child = Path.Combine(root, "photos"); var removed = RootPath();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        await monitor.ConfigureAsync(new([child, removed]));
+        var surviving = monitor.ReconcileAsync([child]);
+        var cancelled = monitor.ReconcileAsync([removed]);
+        await monitor.ConfigureAsync(new([root]));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled);
+        Assert.False(surviving.IsCompleted);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await surviving.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal([root], batches.SelectMany(batch => batch.ReconcileRoots));
+    }
+
+    [Fact]
+    public async Task RemovingRecursiveCoverageCancelsRequestRatherThanCertifyingOnlyDirectFiles()
+    {
+        var root = RootPath();
+        await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
+            FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        await monitor.ConfigureAsync(new([root]));
+        var request = monitor.ReconcileAsync([root]);
+        await monitor.ConfigureAsync(new([root], NonRecursiveRoots: [root]));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
+        var direct = monitor.ReconcileAsync([root]);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await direct.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task DisposeFaultsPendingRequestWithoutLeavingAnInfiniteWaiter()
+    {
+        var root = RootPath();
+        await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
+            FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await monitor.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => request.Completion);
+    }
+
+    [Fact]
+    public async Task InvalidOrUncoveredRequestsFailExplicitlyAndDoNotPauseExistingMonitoring()
+    {
+        var root = RootPath(); var outside = RootPath();
+        await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
+            FastOptions with { MaximumRoots = 2 }, new FakeFactory(), new FakeProbe());
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await initial.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Throws<ArgumentException>(() => { _ = monitor.ReconcileAsync([outside]); });
+        Assert.Throws<ArgumentException>(() => { _ = monitor.ReconcileAsync([root, outside, RootPath()]); });
+        await Assert.ThrowsAsync<ArgumentException>(() => monitor.ConfigureAndReconcileAsync(new([root]), [outside]));
+        Assert.False(monitor.Activity.IsPaused);
+        await monitor.ReconcileAsync([root]).WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.ConfigureAsync(new([root], NonRecursiveRoots: [root]));
+        Assert.Throws<ArgumentException>(() => { _ = monitor.ReconcileAsync([Path.Combine(root, "child")]); });
+    }
+
+    [Fact]
+    public async Task CancelledQueuedWaiterLeavesDiscoveryIntentForTheNextCaller()
+    {
+        var root = RootPath();
+        await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
+            FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        using var cancellation = new CancellationTokenSource();
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root], cancellation.Token);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => initial.Completion);
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        var next = monitor.ReconcileAsync([root]);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await next.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
     public async Task LongReconciliationWaitsAFullPeriodicIntervalAfterSuccessfulCompletion()
     {
         var root = RootPath(); var factory = new FakeFactory(); var clock = new ManualClock();

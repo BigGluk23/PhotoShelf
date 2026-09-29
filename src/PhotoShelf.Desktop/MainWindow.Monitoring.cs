@@ -8,6 +8,7 @@ namespace PhotoShelf.Desktop;
 public partial class MainWindow
 {
     internal bool AllowIsolatedLibraryMonitoring { get; set; }
+    internal Func<Func<LibraryMonitorBatch, CancellationToken, Task>, LibraryChangeCoordinator>? LibraryMonitorFactory { get; set; }
     private int _monitorCallbacksActive;
     internal bool LibraryMonitorCallbackActive => Volatile.Read(ref _monitorCallbacksActive) > 0;
     private readonly HashSet<string> _watchedFolders = new(StringComparer.OrdinalIgnoreCase);
@@ -32,12 +33,15 @@ public partial class MainWindow
         _monitorConfigurationTask = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision);
     }
 
-    private async Task ConfigureLibraryMonitoringAsync(Task previous, long revision)
+    private async Task<Task> ConfigureLibraryMonitoringAsync(Task previous, long revision,
+        string[]? requestedRoots = null, CancellationToken requestToken = default)
     {
         try
         {
             await previous;
-            if (_closing || _fileOperationActive || _hasPendingRecovery || _backgroundProcessingPaused || revision != _monitorConfigurationRevision) return;
+            requestToken.ThrowIfCancellationRequested();
+            if (_closing || _fileOperationActive || _hasPendingRecovery || _backgroundProcessingPaused || revision != _monitorConfigurationRevision)
+                return requestedRoots is null ? Task.CompletedTask : Task.FromCanceled(new CancellationToken(true));
             if (!_monitorRootsRestored)
             {
                 foreach (var root in _catalogState.WatchedFolders) RegisterWatchedFolder(root);
@@ -59,7 +63,9 @@ public partial class MainWindow
                 _monitorRootsRestored = true;
                 await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
             }
-            if (_closing || _fileOperationActive || _backgroundProcessingPaused || revision != _monitorConfigurationRevision) return;
+            requestToken.ThrowIfCancellationRequested();
+            if (_closing || _fileOperationActive || _backgroundProcessingPaused || revision != _monitorConfigurationRevision)
+                return requestedRoots is null ? Task.CompletedTask : Task.FromCanceled(new CancellationToken(true));
             var rules = _folderInclusion.Snapshot();
             var browse = _viewMode == LibraryViewMode.Folder ? _activeFolder : null;
             var libraryRoots = LibraryFolderScope.IncludedRoots(_watchedFolders, rules);
@@ -71,7 +77,7 @@ public partial class MainWindow
             if (_libraryMonitor is null)
             {
                 _librarySynchronizer = new(_desktopCatalogStore, PublishLibraryUpdateAsync);
-                _libraryMonitor = new LibraryChangeCoordinator(async (batch, token) =>
+                async Task ProcessBatchAsync(LibraryMonitorBatch batch, CancellationToken token)
                 {
                     Interlocked.Increment(ref _monitorCallbacksActive);
                     try
@@ -81,8 +87,15 @@ public partial class MainWindow
                             scope.BrowseFolder, scope.Recursive, scope.IncludeSystem, token, scope.LibraryRoots);
                     }
                     finally { Interlocked.Decrement(ref _monitorCallbacksActive); }
-                });
+                }
+                _libraryMonitor = LibraryMonitorFactory?.Invoke(ProcessBatchAsync) ?? new LibraryChangeCoordinator(ProcessBatchAsync);
+                if (_searchStopped)
+                {
+                    await _libraryMonitor.PauseAsync();
+                    _monitorPaused = true;
+                }
             }
+            Task reconciliation = Task.CompletedTask;
             if (_monitorConfigurationKey != key)
             {
                 _monitorScope = new(rules, browse, _includeSubfolders, _includeSystemFolders, libraryRoots);
@@ -90,24 +103,33 @@ public partial class MainWindow
                     (scope.LibraryRoots.Any(root => LibraryCatalogSynchronizer.IsUnder(path, root)) && scope.Rules.MayContainIncluded(path) ||
                      scope.BrowseFolder is not null && LibraryFolderScope.Contains(path, scope.BrowseFolder, scope.Recursive));
                 foreach (var removed in _libraryRootStates.Keys.Except(roots, StringComparer.OrdinalIgnoreCase).ToArray()) _libraryRootStates.Remove(removed);
-                await _libraryMonitor.ConfigureAsync(new(roots,
+                var configuration = new LibraryMonitorConfiguration(roots,
                     [LocalCatalogStore.CatalogDirectory, LocalCatalogStore.DerivedDataDirectory],
                     ShouldObservePath: _monitorPathFilter, ShouldObserveFilePath: PhotoItem.IsSupported,
                     NonRecursiveRoots: roots.Where(root => !_includeSubfolders &&
-                        !libraryRoots.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))).ToArray()));
+                        !libraryRoots.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))).ToArray());
                 if (_monitorRulesKey.Length > 0 && _monitorRulesKey != rulesKey) _libraryMonitor.RequestReconciliation();
+                if (requestedRoots is null) await _libraryMonitor.ConfigureAsync(configuration);
+                else reconciliation = (await _libraryMonitor.ConfigureAndReconcileAsync(configuration, requestedRoots, requestToken)).Completion;
                 _monitorRulesKey = rulesKey;
                 _monitorConfigurationKey = key;
             }
-            if (_monitorPaused && !_backgroundProcessingPaused)
+            else if (requestedRoots is not null) reconciliation = _libraryMonitor.ReconcileAsync(requestedRoots, requestToken);
+            if (_monitorPaused && !_backgroundProcessingPaused && !_searchStopped)
             {
-                await _libraryMonitor.ResumeAsync();
+                await _libraryMonitor.ResumeAsync(reconcileAllRoots: requestedRoots is null);
                 _monitorPaused = false;
             }
-            LibraryStatusText.Text = _backgroundProcessingPaused ? "Автообновление: пауза" : roots.Count == 0 ? "Автообновление: добавьте папку" : "Автообновление включено";
+            LibraryStatusText.Text = _backgroundProcessingPaused ? "Автообновление: пауза" :
+                _searchStopped ? "Поиск остановлен · автообновление: пауза" : roots.Count == 0 ? "Автообновление: добавьте папку" : "Автообновление включено";
+            return reconciliation;
         }
-        catch (OperationCanceledException) { }
-        catch (Exception exception) { LibraryStatusText.Text = $"Автообновление: {exception.Message}"; }
+        catch (OperationCanceledException) { return requestedRoots is null ? Task.CompletedTask : Task.FromCanceled(new CancellationToken(true)); }
+        catch (Exception exception)
+        {
+            LibraryStatusText.Text = $"Автообновление: {exception.Message}";
+            return requestedRoots is null ? Task.CompletedTask : Task.FromException(exception);
+        }
     }
 
     private void RegisterWatchedFolder(string path)
@@ -131,7 +153,9 @@ public partial class MainWindow
                 if (_folderNodes.TryGetValue(NormalizePath(state.Path), out var node)) node.AvailabilityText = RootAvailabilityText(state);
             }
             var unavailable = _libraryRootStates.Values.Where(state => state.Availability != FileAvailability.Available).ToArray();
-            LibraryStatusText.Text = unavailable.Length == 0 ? "Автообновление включено" :
+            LibraryStatusText.Text = _searchStopping ? "Поиск: останавливаю…" :
+                _searchStopped ? "Поиск остановлен · автообновление: пауза" :
+                unavailable.Length == 0 ? "Автообновление включено" :
                 $"Автообновление: {unavailable.Length} папок требуют внимания";
             LibraryStatusText.ToolTip = string.Join("\n", unavailable.Select(state => $"{state.Path}: {RootAvailabilityText(state)}"));
             var retained = (PhotoRows as VirtualPhotoRows)?.LoadedItems.ToArray() ?? [];

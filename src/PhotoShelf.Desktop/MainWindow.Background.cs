@@ -253,7 +253,7 @@ public partial class MainWindow
 
     private Task BrowseFolderAsync(string folder)
     {
-        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return Task.CompletedTask;
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused || _searchStopping) return Task.CompletedTask;
         QueueLibraryMonitoring();
         _browseCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -364,6 +364,8 @@ public partial class MainWindow
     }
     private async Task StopCatalogWritersAsync(bool stopDuplicates = true)
     {
+        // Stop may already be waiting for a real native reader, not just its token.
+        await _searchStopTask;
         await _monitorConfigurationTask;
         if (_libraryMonitor is not null) { await _libraryMonitor.PauseAsync(); _monitorPaused = true; }
         _scanCancellation?.Cancel(); _browseCancellation?.Cancel();

@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.10";
+    private const string VersionLabel = "Ultra v0.10.11";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -293,9 +293,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         RefreshChrome();
     }
 
-    private void OnCancelScanClicked(object sender, RoutedEventArgs e)
+    private async void OnCancelScanClicked(object sender, RoutedEventArgs e)
     {
-        _scanCancellation?.Cancel();
+        await StopSearchAsync();
     }
 
     private void OnReindexMetadataClicked(object sender, RoutedEventArgs e)
@@ -407,8 +407,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         // Keep interrupted checkbox scans in the set until their complete revision finishes.
         // A second check must not cancel and forget the first selected subtree.
         var roots = _pendingFolderScans.ToArray();
-        await ScanRootsAsync(roots, changeView: false);
-        if (revision == _folderCheckRevision) _pendingFolderScans.ExceptWith(roots);
+        var completed = await ScanRootsAsync(roots, changeView: false);
+        if (completed && revision == _folderCheckRevision) _pendingFolderScans.ExceptWith(roots);
     }
 
     private void OnShowInfoChanged(object sender, RoutedEventArgs e)
@@ -594,31 +594,44 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await FindExactDuplicatesAsync(DuplicateSearchScope.CurrentFolder);
     }
 
-    private Task ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
+    private Task<bool> ScanRootsAsync(IEnumerable<string> roots, bool changeView = true)
     {
-        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return Task.CompletedTask;
+        if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return Task.FromResult(false);
         _scanCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         var previous = _scanTask;
         _scanCancellation = operation;
-        return _scanTask = RunScanAsync(roots.ToArray(), changeView, operation, previous);
+        // Capture the preceding stop. A stop requested after this search must be
+        // able to await it without creating a search -> stop -> search cycle.
+        var scan = RunScanAsync(roots.ToArray(), changeView, operation, previous, _searchStopTask);
+        _scanTask = scan;
+        return scan;
     }
-    private async Task RunScanAsync(string[] roots, bool changeView, CancellationTokenSource operation, Task previous)
+    private async Task<bool> RunScanAsync(string[] roots, bool changeView, CancellationTokenSource operation, Task previous, Task precedingStop)
     {
         try
         {
             await previous;
+            await precedingStop;
             var token = operation.Token; token.ThrowIfCancellationRequested();
+            if (_fileOperationActive || _hasPendingRecovery || _closing || _backgroundProcessingPaused) return false;
+            _searchStopped = false;
+            _searchStopError = null;
             SetScanning(true);
             foreach (var root in roots) { AddFolder(root); RegisterWatchedFolder(root); }
-            QueueLibraryMonitoring();
             if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
-            await PhotoScanner.ScanAsync(roots, batch => IndexScanBatchAsync(batch, token), _includeSystemFolders, token,
-                inclusion: _folderInclusion.Snapshot());
+            // Configuration and initial request registration are atomic in the
+            // coordinator, including for an empty/very quickly scanned folder.
+            var revision = ++_monitorConfigurationRevision;
+            var configure = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision, roots, token);
+            _monitorConfigurationTask = configure;
+            await await configure;
+            token.ThrowIfCancellationRequested();
             await RefreshCatalogCountAsync(); SaveCatalogState(); StartMetadataIndexing(false);
+            return true;
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusText.Text = $"Ошибка сканирования: {ex.Message}"; }
+        catch (OperationCanceledException) { return false; }
+        catch (Exception ex) { StatusText.Text = $"Ошибка сканирования: {ex.Message}"; return false; }
         finally { if (ReferenceEquals(_scanCancellation, operation)) { _scanCancellation = null; SetScanning(false); CompleteCatalogStage(); } operation.Dispose(); }
     }
 
@@ -703,7 +716,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void SetScanning(bool isScanning)
     {
-        CancelScanButton.IsEnabled = isScanning;
+        RefreshSearchControls(isScanning);
     }
 
     protected override void OnClosed(EventArgs e)

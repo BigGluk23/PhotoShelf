@@ -1,7 +1,13 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.10** (`0.10.10-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.11** (`0.10.11-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Поиск и остановка v0.10.11
+
+Полные пользовательские поиски идут через `LibraryChangeCoordinator`, без параллельного `PhotoScanner` в `RunScanAsync`. `ConfigureAndReconcileAsync` атомарно регистрирует ticket до запуска первого обхода; конфигурация возвращается отдельно от `Completion`, иначе остановка может ждать сама себя. Запрос дочерней папки использует targeted directory queue. Отмена waiter не означает завершения читателей: Stop отдельно ждёт `PauseAsync`.
+
+`MainWindow.Search.cs` ставит guard до отмены, ожидает callback/публикацию committed данных, отменяет отложенные checkbox scans и сохраняет их watched roots. Watchers и bounded recovery queues сохраняются на паузе. Обычный `QueueLibraryMonitoring` не снимает остановку; explicit search использует `ResumeAsync(false)`, без добавления всех тихих корней. Прерванные и новые события сохраняются. Глобальная пауза и её сохранение в settings остаются отдельным механизмом; остановка поиска действует в текущем сеансе. Метаданные управляются отдельно. Сборка/проверки этого выпуска: [v0.10.11](docs/v0.10.11-single-scan-stop.md).
 
 ## Фоновые задачи v0.10.10
 

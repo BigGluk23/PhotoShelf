@@ -18,6 +18,9 @@ public sealed record LibraryMonitorActivity(long Generation, bool IsPaused, bool
     DateTime? LastReconciliationCompletedAtUtc, int ActiveDirectoryCount, int PendingDirectoryCount,
     long CompletedDirectoryReconciliationCount);
 
+/// <summary>Configuration has finished; Completion waits for its actual reconciliation callback.</summary>
+public sealed record LibraryReconciliationRequest(Task Completion);
+
 public sealed record LibraryMonitorOptions
 {
     public int MaximumRoots { get; init; } = 4096;
@@ -60,6 +63,8 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     private readonly DirtyRootQueue _dirty = new();
     private readonly HashSet<string> _revalidateContent = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Root> _roots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<ReconciliationWaiter> _reconciliationWaiters = [];
+    private const int MaximumReconciliationWaiters = 256;
     private readonly Task _worker;
     private LibraryMonitorConfiguration _configuration = new([]);
     private CancellationTokenSource _generationCancellation = new();
@@ -109,7 +114,24 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
 
     private DateTime UtcNow => _clock.GetUtcNow().UtcDateTime;
 
-    public async Task ConfigureAsync(LibraryMonitorConfiguration configuration)
+    public async Task ConfigureAsync(LibraryMonitorConfiguration configuration) =>
+        await ConfigureCoreAsync(configuration, null, CancellationToken.None).ConfigureAwait(false);
+
+    /// <summary>
+    /// Registers a request before the newly configured worker can start. The returned
+    /// ticket avoids racing a fast initial pass, without making configuration wait for I/O.
+    /// Cancelling the request does not abandon configuration or its reader drain.
+    /// </summary>
+    public async Task<LibraryReconciliationRequest> ConfigureAndReconcileAsync(
+        LibraryMonitorConfiguration configuration, IEnumerable<string> paths, CancellationToken token = default)
+    {
+        var requested = NormalizeReconciliationPaths(paths);
+        var completion = await ConfigureCoreAsync(configuration, requested, token).ConfigureAwait(false);
+        return new(completion!);
+    }
+
+    private async Task<Task?> ConfigureCoreAsync(LibraryMonitorConfiguration configuration,
+        string[]? requestedPaths, CancellationToken requestToken)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         // Normalize strings only; configuring from the UI performs no filesystem I/O.
@@ -121,6 +143,14 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         var nonRecursive = (configuration.NonRecursiveRoots ?? []).Select(Normalize).Distinct(StringComparer.OrdinalIgnoreCase).Take(_options.MaximumRoots + 1).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (nonRecursive.Count > _options.MaximumRoots) throw new ArgumentException("Too many nonrecursive roots.", nameof(configuration));
         bool Recurse(string path) => configuration.IncludeSubdirectories && !nonRecursive.Contains(path);
+        // Validate before retiring subscriptions: an invalid request cannot leave monitoring paused.
+        if (requestedPaths is not null)
+            foreach (var path in requestedPaths)
+                if (!roots.Any(root => !ignored.Any(ignore => Under(root, ignore)) &&
+                    (root.Equals(path, StringComparison.OrdinalIgnoreCase) || Recurse(root) && Under(path, root))) ||
+                    ignored.Any(ignore => Under(path, ignore)) || HasPrivateComponent(path))
+                    throw new ArgumentException($"No configured monitoring scope covers '{path}'.", nameof(requestedPaths));
+        Task? requestCompletion = null;
         await _control.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -207,11 +237,15 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                     if (owner is null) _directories.Remove(path);
                     else _directories[path] = owner;
                 }
+                ReassignReconciliationWaiters();
+                if (requestedPaths is not null)
+                    requestCompletion = RegisterReconciliation(requestedPaths, requestToken);
                 _callbackRetryAt = default;
             }
             await Task.Run(() => { foreach (var watcher in retired) watcher.Dispose(); }).ConfigureAwait(false);
             lock (_sync) if (!_explicitlyPaused) StartGeneration();
             Wake();
+            return requestCompletion;
         }
         finally { _control.Release(); }
     }
@@ -231,7 +265,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         finally { _control.Release(); }
     }
 
-    public async Task ResumeAsync()
+    public async Task ResumeAsync(bool reconcileAllRoots = true)
     {
         await _control.WaitAsync().ConfigureAwait(false);
         try
@@ -244,7 +278,11 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 _generation++;
                 // Notifications collected during the pause still require targeted content checks.
                 _callbackRetryAt = default;
-                foreach (var root in _roots.Values) { _dirty.Add(root.Path); root.NextProbe = default; root.NextWatchAttempt = default; }
+                foreach (var root in _roots.Values)
+                {
+                    if (reconcileAllRoots) _dirty.Add(root.Path);
+                    root.NextProbe = default; root.NextWatchAttempt = default;
+                }
                 StartGeneration();
             }
             Wake();
@@ -260,6 +298,115 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             foreach (var root in _roots.Keys) _dirty.Add(root);
         }
         Wake();
+    }
+
+    /// <summary>
+    /// Waits for a successful full callback covering the requested paths. A pending or
+    /// active covering pass is shared; a completed old pass is never reused. A child of
+    /// a recursive root is queued as a directory target, not a new whole-drive pass.
+    /// Cancellation only detaches this caller. PauseAsync separately drains real readers.
+    /// </summary>
+    public Task ReconcileAsync(IEnumerable<string> paths, CancellationToken token = default)
+    {
+        var requested = NormalizeReconciliationPaths(paths);
+        Task completion;
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            completion = RegisterReconciliation(requested, token);
+        }
+        Wake();
+        return completion;
+    }
+
+    private string[] NormalizeReconciliationPaths(IEnumerable<string> paths)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        var requested = paths.Select(Normalize).Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(_options.MaximumRoots + 1).ToArray();
+        if (requested.Length > _options.MaximumRoots) throw new ArgumentException("Too many reconciliation paths.", nameof(paths));
+        return requested;
+    }
+
+    // These helpers run under _sync. Continuations always run asynchronously.
+    private Task RegisterReconciliation(string[] paths, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return Task.FromCanceled(token);
+        if (paths.Length == 0) return Task.CompletedTask;
+        if (_reconciliationWaiters.Count >= MaximumReconciliationWaiters)
+            return Task.FromException(new InvalidOperationException("Too many pending reconciliation requests."));
+        var targets = paths.Select(path =>
+        {
+            var owner = FindReconciliationOwner(path);
+            if (owner is null || IsIgnored(path)) throw new ArgumentException($"No configured monitoring scope covers '{path}'.", nameof(paths));
+            return new ReconciliationTarget(path, owner.Path, owner.IncludeSubdirectories);
+        }).ToList();
+        var waiter = new ReconciliationWaiter(targets);
+        _reconciliationWaiters.Add(waiter);
+        foreach (var target in targets) EnsureReconciliationQueued(target);
+        return WaitForReconciliationAsync(waiter, token);
+    }
+
+    private async Task WaitForReconciliationAsync(ReconciliationWaiter waiter, CancellationToken token)
+    {
+        using var registration = token.Register(() => waiter.Completion.TrySetCanceled(token));
+        try { await waiter.Completion.Task.ConfigureAwait(false); }
+        finally { lock (_sync) _reconciliationWaiters.Remove(waiter); }
+    }
+
+    private Root? FindReconciliationOwner(string path, bool requireRecursive = false) => _roots.Values
+        .Where(root => (!requireRecursive || root.IncludeSubdirectories) &&
+            (root.Path.Equals(path, StringComparison.OrdinalIgnoreCase) || root.IncludeSubdirectories && Under(path, root.Path)))
+        .OrderByDescending(root => root.Path.Length).FirstOrDefault();
+
+    private static bool Covers(string passPath, bool recursive, ReconciliationTarget target) =>
+        (recursive || !target.Recursive) && (passPath.Equals(target.Path, StringComparison.OrdinalIgnoreCase) || recursive && Under(target.Path, passPath));
+
+    private bool BatchCovers(LibraryMonitorBatch batch, ReconciliationTarget target) =>
+        batch.ReconcileRoots.Any(path => _roots.TryGetValue(path, out var root) && Covers(path, root.IncludeSubdirectories, target)) ||
+        (batch.DirectoryChanges ?? []).Any(change => _roots.TryGetValue(change.OwnerRoot, out var owner) && Covers(change.Path, owner.IncludeSubdirectories, target));
+
+    private void EnsureReconciliationQueued(ReconciliationTarget target)
+    {
+        if (_activeBatch is not null && _activeBatch.Generation == _generation && BatchCovers(_activeBatch, target)) return;
+        if (_roots.Values.Any(root => _dirty.Contains(root.Path) && Covers(root.Path, root.IncludeSubdirectories, target))) return;
+        if (_directories.Any(pair => _roots.TryGetValue(pair.Value, out var owner) && Covers(pair.Key, owner.IncludeSubdirectories, target))) return;
+        if (target.Path.Equals(target.OwnerRoot, StringComparison.OrdinalIgnoreCase)) _dirty.Add(target.OwnerRoot);
+        else
+        {
+            // Explicit requests have already been checked against configured ownership.
+            // Admission filters are applied by the consumer; do not silently drop a waiter.
+            if (_directories.Count >= _options.MaximumPendingDirectories) _dirty.Add(target.OwnerRoot);
+            else _directories[target.Path] = target.OwnerRoot;
+        }
+    }
+
+    private void ReassignReconciliationWaiters()
+    {
+        foreach (var waiter in _reconciliationWaiters.ToArray())
+        {
+            if (waiter.Completion.Task.IsCompleted) { _reconciliationWaiters.Remove(waiter); continue; }
+            var owners = waiter.Targets.Select(target => FindReconciliationOwner(target.Path, target.Recursive)).ToArray();
+            if (owners.Any(owner => owner is null) || waiter.Targets.Any(target => IsIgnored(target.Path)))
+            {
+                waiter.Completion.TrySetCanceled(); _reconciliationWaiters.Remove(waiter); continue;
+            }
+            for (var i = 0; i < waiter.Targets.Count; i++)
+            {
+                waiter.Targets[i] = waiter.Targets[i] with { OwnerRoot = owners[i]!.Path };
+                EnsureReconciliationQueued(waiter.Targets[i]);
+            }
+        }
+    }
+
+    private void CompleteReconciliationWaiters(LibraryMonitorBatch batch)
+    {
+        foreach (var waiter in _reconciliationWaiters.ToArray())
+        {
+            waiter.Targets.RemoveAll(target => BatchCovers(batch, target));
+            if (waiter.Targets.Count != 0) continue;
+            waiter.Completion.TrySetResult(); _reconciliationWaiters.Remove(waiter);
+        }
     }
 
     private void StartGeneration()
@@ -313,13 +460,15 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                     token.ThrowIfCancellationRequested();
                     var batch = TakeBatch(generation);
                     if (batch is null) continue;
-                    lock (_sync) _activeBatch = batch;
                     try
                     {
                         await _callback(batch, token).ConfigureAwait(false);
                         token.ThrowIfCancellationRequested();
                         lock (_sync)
                         {
+                            token.ThrowIfCancellationRequested();
+                            if (_paused || generation != _generation)
+                                throw new OperationCanceledException("Reconciliation generation stopped before acknowledgement.", token);
                             var completedAt = UtcNow;
                             foreach (var path in batch.ReconcileRoots)
                             {
@@ -334,9 +483,13 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                             _completedDirectoryReconciliations += batch.DirectoryChanges?.Count ?? 0;
                             foreach (var state in batch.RootStates.Where(state => state.ErrorCode == "ConsumerFailedRetryScheduled"))
                                 if (_roots.TryGetValue(state.Path, out var root)) root.PendingState = root.LastState;
+                            // A waiter continuation may immediately request another pass.
+                            // Do not let it join this already acknowledged callback.
+                            _activeBatch = null;
+                            CompleteReconciliationWaiters(batch);
                         }
                     }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    catch (OperationCanceledException) when (token.IsCancellationRequested || IsGenerationStopped(generation))
                     {
                         lock (_sync)
                         {
@@ -475,7 +628,9 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 ? _paths.Keys.Take(_options.MaximumPathsPerBatch).ToArray() : [];
             foreach (var path in paths) _paths.Remove(path);
             if (states.Length + reconcile.Length + paths.Length + directories.Length == 0) return null;
-            return new(generation, paths, reconcile, states, revalidate, directories);
+            // Publish ownership in the same lock as dequeuing, so a manual request can
+            // join this pass instead of enqueueing a duplicate in the hand-off gap.
+            return _activeBatch = new(generation, paths, reconcile, states, revalidate, directories);
         }
     }
 
@@ -561,10 +716,13 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
 
     private bool IsIgnored(string path)
     {
-        if (path.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
-            .Any(component => component.StartsWith(".photoshelf-", StringComparison.OrdinalIgnoreCase))) return true;
+        if (HasPrivateComponent(path)) return true;
         return (_configuration.IgnoredDirectories ?? []).Any(ignored => Under(path, ignored));
     }
+
+    private static bool HasPrivateComponent(string path) => path
+        .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+        .Any(component => component.StartsWith(".photoshelf-", StringComparison.OrdinalIgnoreCase));
 
     private void OnWatcherError(Root root)
     {
@@ -590,6 +748,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     private static bool ScopesOverlap(string first, bool firstRecursive, string second, bool secondRecursive) =>
         first.Equals(second, StringComparison.OrdinalIgnoreCase) || firstRecursive && Under(second, first) || secondRecursive && Under(first, second);
     private static string Normalize(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+    private bool IsGenerationStopped(long generation) { lock (_sync) return _paused || _generation != generation; }
     private void Wake() { try { _wake.Release(); } catch (SemaphoreFullException) { } }
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -600,6 +759,12 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            lock (_sync)
+            {
+                foreach (var waiter in _reconciliationWaiters)
+                    waiter.Completion.TrySetException(new ObjectDisposedException(nameof(LibraryChangeCoordinator)));
+                _reconciliationWaiters.Clear();
+            }
             await PauseCoreAsync().ConfigureAwait(false);
             await _lifetime.CancelAsync().ConfigureAwait(false);
             Wake();
@@ -607,6 +772,13 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
             _generationCancellation.Dispose(); _lifetime.Dispose();
         }
         finally { _control.Release(); }
+    }
+
+    private sealed record ReconciliationTarget(string Path, string OwnerRoot, bool Recursive);
+    private sealed class ReconciliationWaiter(List<ReconciliationTarget> targets)
+    {
+        public List<ReconciliationTarget> Targets { get; } = targets;
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     // FIFO membership prevents a root receiving a continuous event stream from starving

@@ -31,7 +31,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                        <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.10" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.11" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
