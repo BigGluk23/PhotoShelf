@@ -27,6 +27,14 @@ internal static class Program
     private static readonly List<MemorySample> Memory = [];
     private static readonly List<object> Supersessions = [];
     private static readonly List<ProjectionTimingSample> ProjectionTimings = [];
+    private static readonly List<PhaseTiming> Phases = [];
+    private static readonly List<object> FolderDiagnostics = [];
+    private const int SeedCacheKiB = 65536;
+    private static readonly object SetupProfile = new
+    {
+        name = "seed-connection-cache-64mib-v1", seedCacheKiB = SeedCacheKiB, seedConnectionPooling = false,
+        synchronous = "FULL", journalMode = "WAL", checkpoint = "TRUNCATE", queryCache = "production-default"
+    };
     private static string _mediaRoot = "";
     private static int _count;
     private static int _repetitions;
@@ -63,34 +71,47 @@ internal static class Program
                 MainWindow? window = null;
                 try
                 {
-                    var state = await MainWindow.LoadInitialCatalogStateAsync();
-                    window = new MainWindow(state) { Width = 1280, Height = 800, WindowState = WindowState.Normal };
-                    app.MainWindow = window;
-                    window.Show();
-                    var ready = (Task<Exception?>)typeof(MainWindow).GetProperty("InitialCatalogReady", PrivateInstance)!.GetValue(window)!;
-                    if (await ready.WaitAsync(TimeSpan.FromSeconds(120)) is { } error) throw new InvalidOperationException("Startup failed.", error);
-                    // Identical controlled profile: wait for real readers to stop, not just request cancellation.
-                    await QuiesceAsync(window);
-                    await WaitForIdleAsync(window);
-                    catalogBefore = await SnapshotCatalogAsync();
+                    using (var phase = BeginPhase("startup-and-quiesce"))
+                    {
+                        var state = await MainWindow.LoadInitialCatalogStateAsync();
+                        window = new MainWindow(state) { Width = 1280, Height = 800, WindowState = WindowState.Normal };
+                        app.MainWindow = window;
+                        window.Show();
+                        var ready = (Task<Exception?>)typeof(MainWindow).GetProperty("InitialCatalogReady", PrivateInstance)!.GetValue(window)!;
+                        if (await ready.WaitAsync(TimeSpan.FromSeconds(120)) is { } error) throw new InvalidOperationException("Startup failed.", error);
+                        // Identical controlled profile: wait for real readers to stop, not just request cancellation.
+                        await QuiesceAsync(window);
+                        await WaitForIdleAsync(window);
+                        phase.Complete();
+                    }
+                    using (var phase = BeginPhase("integrity-before"))
+                    { catalogBefore = await SnapshotCatalogAsync(); phase.Complete(); }
                     await MeasureUiAsync(window);
-                    await QuiesceAsync(window);
-                    await WaitForIdleAsync(window);
-                    catalogAfter = await SnapshotCatalogAsync();
+                    using (var phase = BeginPhase("final-quiesce"))
+                    { await QuiesceAsync(window); await WaitForIdleAsync(window); phase.Complete(); }
+                    using (var phase = BeginPhase("integrity-after"))
+                    { catalogAfter = await SnapshotCatalogAsync(); phase.Complete(); }
                     if (catalogBefore != catalogAfter || catalogBefore.RowCount != _count)
                         throw new InvalidDataException("UI query workload changed catalog media rows.");
                     if ((int)typeof(ErrorReporter).GetProperty("ErrorCount", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)! != 0)
                         throw new InvalidOperationException("Application wrote an error report during the benchmark.");
-                    var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    window.Closed += (_, _) => closed.TrySetResult();
-                    window.Close();
-                    await closed.Task.WaitAsync(TimeSpan.FromSeconds(60));
+                    using (var phase = BeginPhase("shutdown"))
+                    {
+                        var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                        window.Closed += (_, _) => closed.TrySetResult();
+                        window.Close();
+                        await closed.Task.WaitAsync(TimeSpan.FromSeconds(60));
+                        phase.Complete();
+                    }
                     exitCode = 0;
                 }
                 catch (Exception ex) { failure = ex.ToString(); }
                 finally { app.Shutdown(exitCode); }
             }));
             app.Run();
+            // All comparable measurements, integrity scans and memory samples are already complete.
+            // A diagnostic failure is reported separately; it cannot rewrite their verdict or timings.
+            if (exitCode == 0) DiagnoseFolderGroupsAsync(store).GetAwaiter().GetResult();
         }
         catch (Exception ex) { failure = ex.ToString(); }
         var fixtureRetained = true;
@@ -99,6 +120,7 @@ internal static class Program
         {
             try
             {
+                using var phase = BeginPhase("fixture-cleanup");
                 // Only this atomically-created fixture is eligible. Failed runs remain available for diagnosis.
                 var expectedParent = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
                 if (!LocalCatalogStore.IsIsolatedSmokeCatalog || LocalCatalogStore.CatalogDirectory != catalog ||
@@ -109,6 +131,7 @@ internal static class Program
                 SqliteConnection.ClearAllPools();
                 Directory.Delete(catalog, recursive: true);
                 fixtureRetained = false;
+                phase.Complete();
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             { cleanupError = ex.Message; }
@@ -119,6 +142,7 @@ internal static class Program
             revision = _revision, label = _label, applicationVersion = ErrorReporter.Version,
             count = _count, repetitions = _repetitions, warmups = 2, catalogRoot = catalog, fixtureRetained, cleanupError,
             fixture = "deterministic-v1-catalog-only", syntheticFileBytes = 0,
+            setupProfile = SetupProfile, phaseTimings = Phases, postWorkloadFolderDiagnostics = FolderDiagnostics,
             scope = "SQLite queries and actual WPF event-to-bound-data-page/layout; absent synthetic media, decoding/indexing and physical input excluded; background writers quiesced",
             clock = "Stopwatch", clockFrequency = Stopwatch.Frequency, timestampUtc = DateTime.UtcNow,
             machine = new { name = Environment.MachineName, os = RuntimeInformation.OSDescription,
@@ -140,16 +164,37 @@ internal static class Program
 
     private static async Task SeedAsync(SqliteDesktopCatalogStore store)
     {
-        await store.InitializeAsync();
-        await store.SaveAsync(new LocalCatalogState { IncludeSystemFolders = true, DateGroupingMode = "FileDate" }, saveItems: false);
+        using (var phase = BeginPhase("seed-initialize"))
+        {
+            await store.InitializeAsync();
+            await store.SaveAsync(new LocalCatalogState { IncludeSystemFolders = true, DateGroupingMode = "FileDate" }, saveItems: false);
+            phase.Complete();
+        }
         await using var db = new SqliteConnection(new SqliteConnectionStringBuilder
         { DataSource = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite"), Pooling = false }.ToString());
         await db.OpenAsync();
+        using (var phase = BeginPhase("seed-configure"))
+        {
+            await using var setup = db.CreateCommand();
+            // Fixture setup only: this unpooled connection closes before any query timing.
+            // Do not change production connection settings, cache_spill, indexes or durability.
+            setup.CommandText = $"PRAGMA synchronous=FULL; PRAGMA cache_size=-{SeedCacheKiB};";
+            await setup.ExecuteNonQueryAsync();
+            setup.CommandText = "PRAGMA cache_size;";
+            if (Convert.ToInt64(await setup.ExecuteScalarAsync()) != -SeedCacheKiB)
+                throw new InvalidDataException("Fixture cache profile was not applied.");
+            setup.CommandText = "PRAGMA synchronous;";
+            if (Convert.ToInt64(await setup.ExecuteScalarAsync()) != 2)
+                throw new InvalidDataException("Fixture setup requires FULL durability.");
+            setup.CommandText = "PRAGMA journal_mode;";
+            if (!string.Equals(Convert.ToString(await setup.ExecuteScalarAsync()), "wal", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Fixture setup requires the production WAL mode.");
+            phase.Complete();
+        }
         await using var command = db.CreateCommand();
         // Bulk setup is deliberately outside measurements and does not benchmark production ingestion.
         // Populate only common columns: each revision retains its real schema, defaults, triggers and indexes.
         command.CommandText = """
-            PRAGMA synchronous=FULL;
             WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)), numbers(i) AS (
               SELECT a.n+10*b.n+100*c.n+1000*d.n+10000*e.n+100000*f.n
               FROM digits a,digits b,digits c,digits d,digits e,digits f
@@ -167,15 +212,29 @@ internal static class Program
                 CASE WHEN i%7=0 THEN NULL ELSE date-864000000000 END,
                 CASE WHEN i%7=0 THEN NULL ELSE strftime('%Y-%m','2015-01-01',printf('%+d days',i%3650-1)) END,
                 1,CASE WHEN i%7=0 THEN 2 ELSE 1 END,0,'2026-09-28T00:00:00Z' FROM fixture;
-            PRAGMA wal_checkpoint(TRUNCATE);
             """;
         command.Parameters.AddWithValue("$root", _mediaRoot);
         command.Parameters.AddWithValue("$ticks", new DateTime(2015, 1, 1).Ticks);
         command.Parameters.AddWithValue("$count", _count);
         command.CommandTimeout = 600;
-        await command.ExecuteNonQueryAsync();
-        if (await store.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }) != _count)
-            throw new InvalidDataException("Fixture count mismatch.");
+        using (var phase = BeginPhase("seed-insert"))
+        { await command.ExecuteNonQueryAsync(); phase.Complete(); }
+        using (var phase = BeginPhase("seed-checkpoint-and-close"))
+        {
+            await using var checkpoint = db.CreateCommand();
+            checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            await using (var reader = await checkpoint.ExecuteReaderAsync())
+                if (!await reader.ReadAsync() || reader.GetInt64(0) != 0)
+                    throw new InvalidDataException("Fixture WAL checkpoint was busy or incomplete.");
+            await db.CloseAsync();
+            phase.Complete();
+        }
+        using (var phase = BeginPhase("seed-verify-count"))
+        {
+            if (await store.CountAsync(new CatalogViewQuery { IncludeSystemFolders = true }) != _count)
+                throw new InvalidDataException("Fixture count mismatch.");
+            phase.Complete();
+        }
     }
 
     private static async Task MeasureSqlAsync(SqliteDesktopCatalogStore store)
@@ -221,11 +280,95 @@ internal static class Program
 
     private static async Task RepeatAsync(string name, Func<Task<string>> operation)
     {
+        using var phase = BeginPhase(name);
         for (var i = -2; i < _repetitions; i++)
         {
             var watch = Stopwatch.StartNew(); var fingerprint = await operation();
             if (i >= 0) Samples.Add(new(name, i, watch.Elapsed.TotalMilliseconds, fingerprint));
         }
+        phase.Complete();
+    }
+
+    private static async Task DiagnoseFolderGroupsAsync(SqliteDesktopCatalogStore store)
+    {
+        // Same queries on both revisions, after shutdown. No samples, memory snapshots or
+        // performance gates consume these single diagnostic timings or query plans.
+        foreach (var bucket in new[] { "bucket00", "bucket01" })
+        {
+            using var phase = BeginPhase("post-workload-folder." + bucket);
+            var query = new CatalogViewQuery
+            {
+                Folder = Path.Combine(_mediaRoot, bucket), ViewMode = "Folder", IncludeSubfolders = true,
+                IncludeSystemFolders = true, ShowVideos = true, UseCaptureDate = true, NewestFirst = false
+            };
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var watch = Stopwatch.StartNew();
+                var groups = await store.QueryGroupsAsync(query, timeout.Token);
+                var elapsed = watch.Elapsed.TotalMilliseconds;
+                if (groups.Sum(group => group.Count) != _count / 100)
+                    throw new InvalidDataException("Diagnostic folder group count mismatch.");
+                await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+                {
+                    DataSource = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite"),
+                    Mode = SqliteOpenMode.ReadOnly, Pooling = false
+                }.ToString());
+                await connection.OpenAsync(timeout.Token);
+                using var interrupt = timeout.Token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
+                await using var transaction = connection.BeginTransaction(deferred: true);
+                var helper = typeof(SqliteDesktopCatalogStore).GetMethod("BuildGroupsCommandAsync", BindingFlags.Static | BindingFlags.NonPublic);
+                await using var command = helper is not null
+                    ? await (Task<SqliteCommand>)helper.Invoke(null, [query, connection, transaction, timeout.Token])!
+                    : BuildBaselineGroupsCommand(query, connection, transaction, timeout.Token);
+                var sql = command.CommandText;
+                var parameters = command.Parameters.Cast<SqliteParameter>().ToDictionary(parameter => parameter.ParameterName, parameter => parameter.Value);
+                command.CommandText = "EXPLAIN QUERY PLAN " + sql;
+                var plan = new List<object>();
+                await using (var reader = await command.ExecuteReaderAsync(timeout.Token))
+                    while (await reader.ReadAsync(timeout.Token))
+                        plan.Add(new { id = reader.GetInt64(0), parent = reader.GetInt64(1), detail = reader.GetString(3) });
+                FolderDiagnostics.Add(new
+                {
+                    status = "passed", folder = bucket, query.UseCaptureDate, query.NewestFirst, query.IncludeSubfolders,
+                    query.SearchText, query.IncludeSystemFolders, query.ShowVideos, expectedItems = _count / 100,
+                    groupCount = groups.Count, itemCount = groups.Sum(group => group.Count), milliseconds = elapsed,
+                    fingerprint = string.Join(";", groups.Select(group => $"{group.Key}:{group.Count}")),
+                    commandBuilder = helper is null ? "baseline-BuildFrom-BuildGroupFilter" : "production-BuildGroupsCommandAsync",
+                    sql, parameters, explainQueryPlan = plan,
+                    scope = "Single post-workload diagnostic; not a comparable sample or performance gate. EXPLAIN uses a separate read-only snapshot."
+                });
+                phase.Complete();
+            }
+            catch (Exception ex)
+            {
+                // Keep diagnostics visibly incomplete, rather than fabricating a query plan or
+                // making an optional reflection hook alter already completed benchmark samples.
+                FolderDiagnostics.Add(new { status = "failed", folder = bucket, error = ex.ToString() });
+            }
+        }
+    }
+
+    private static SqliteCommand BuildBaselineGroupsCommand(CatalogViewQuery query, SqliteConnection connection,
+        SqliteTransaction transaction, CancellationToken token)
+    {
+        var type = typeof(SqliteDesktopCatalogStore);
+        var buildFrom = type.GetMethod("BuildFrom", BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(type.FullName, "BuildFrom");
+        var groupFilter = type.GetMethod("BuildGroupFilter", BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(type.FullName, "BuildGroupFilter");
+        var command = connection.CreateCommand(); command.Transaction = transaction;
+        try
+        {
+            // Exact v0.10.8 QueryGroupsAsync shape; both predicates and parameters come
+            // from that unmodified revision's production builders, never a test filter.
+            var month = query.UseCaptureDate ? "capture_month" : "file_month";
+            var from = (string)buildFrom.Invoke(null, [query, command, token])!;
+            var filter = (string)groupFilter.Invoke(null, [query, command])!;
+            command.CommandText = $"SELECT {month},COUNT(*) FROM {from} WHERE {filter} GROUP BY {month} ORDER BY {month} {(query.NewestFirst ? "DESC" : "ASC")};";
+            return command;
+        }
+        catch { command.Dispose(); throw; }
     }
 
     private static async Task MeasureUiAsync(MainWindow window)
@@ -243,7 +386,8 @@ internal static class Program
         }, query => query.NewestFirst == expectedNewestFirst);
         await MeasureActionAsync(window, "ui.search", () => search.Text = search.Text == "needle_" ? "synthetic_" : "needle_",
             q => q.SearchText == search.Text);
-        search.Text = ""; await WaitForIdleAsync(window);
+        using (var phase = BeginPhase("ui.clear-search"))
+        { search.Text = ""; await WaitForIdleAsync(window); phase.Complete(); }
         var bucket = 0;
         await MeasureActionAsync(window, "ui.folder", () =>
         {
@@ -251,6 +395,7 @@ internal static class Program
             var node = new FolderNode(Path.Combine(_mediaRoot, $"bucket{bucket:00}")) { ChildrenLoaded = true };
             Invoke(window, "OnFolderTreeSelectedItemChanged", window.FindName("FolderTree"), new RoutedPropertyChangedEventArgs<object>(null!, node));
         }, q => q.Folder == Path.Combine(_mediaRoot, $"bucket{bucket:00}"));
+        using var supersessionPhase = BeginPhase("ui.supersessions");
         Invoke(window, "OnAllPhotosClicked", window, new RoutedEventArgs());
         await WaitForIdleAsync(window);
         for (var repeat = 0; repeat < 5; repeat++)
@@ -277,10 +422,12 @@ internal static class Program
                 throw new InvalidOperationException("Stale results appeared after final publication.");
         }
         SnapshotMemory(window, "end");
+        supersessionPhase.Complete();
     }
 
     private static async Task MeasureActionAsync(MainWindow window, string name, Action action, Func<CatalogViewQuery, bool> expected)
     {
+        using var phase = BeginPhase(name);
         for (var i = -2; i < _repetitions; i++)
         {
             await QuiesceAsync(window); await WaitForIdleAsync(window);
@@ -317,6 +464,7 @@ internal static class Program
             }
             finally { window.PropertyChanged -= Observe; }
         }
+        phase.Complete();
     }
 
     private static async Task QuiesceAsync(MainWindow window) =>
@@ -409,11 +557,37 @@ internal static class Program
 
     private static string Fingerprint(IEnumerable<string> paths) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
         string.Join("\n", paths.Select(x => Path.GetRelativePath(_mediaRoot, x))))));
+    private static PhaseScope BeginPhase(string name) => new(name);
+
+    private sealed class PhaseScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly DateTime _startedUtc;
+        private readonly Stopwatch _watch;
+        private bool _completed;
+        public PhaseScope(string name)
+        {
+            _name = name; _startedUtc = DateTime.UtcNow;
+            Console.WriteLine($"{_startedUtc:O} {_label} {_count} BEGIN {name}");
+            Console.Out.Flush();
+            _watch = Stopwatch.StartNew();
+        }
+        public void Complete() => _completed = true;
+        public void Dispose()
+        {
+            var elapsed = _watch.Elapsed.TotalMilliseconds;
+            var outcome = _completed ? "completed" : "interrupted";
+            Phases.Add(new(_name, _startedUtc, elapsed, outcome));
+            Console.WriteLine(FormattableString.Invariant($"{DateTime.UtcNow:O} {_label} {_count} END {_name} {outcome} {elapsed:F1} ms"));
+            Console.Out.Flush();
+        }
+    }
     private static T Get<T>(object target, string name) => (T)(typeof(MainWindow).GetField(name, PrivateInstance)
         ?? throw new MissingFieldException(typeof(MainWindow).FullName, name)).GetValue(target)!;
     private static object? Invoke(object target, string name, params object?[] args) =>
         (typeof(MainWindow).GetMethod(name, PrivateInstance) ?? throw new MissingMethodException(typeof(MainWindow).FullName, name)).Invoke(target, args);
     private sealed record Sample(string Name, int Iteration, double Milliseconds, string Fingerprint);
+    private sealed record PhaseTiming(string Name, DateTime StartedUtc, double Milliseconds, string Outcome);
     private sealed record CatalogSnapshot(long RowCount, string Sha256);
     private sealed record ProjectionTimingSample(string Scenario, int Iteration, bool Available, long? OperationId,
         string? Outcome, IReadOnlyDictionary<string, double>? Durations);

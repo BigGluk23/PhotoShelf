@@ -122,12 +122,12 @@ public sealed partial class SqliteDesktopCatalogStore
     {
         await using var connection=await OpenAsync(token);
         using var interrupt=token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
-        await using var command=connection.CreateCommand();
-        var month=query.UseCaptureDate ? "capture_month" : "file_month";
-        command.CommandText=$"SELECT {month},COUNT(*) FROM {BuildFrom(query,command,token)} WHERE {BuildGroupFilter(query,command)} GROUP BY {month} ORDER BY {month} {(query.NewestFirst ? "DESC" : "ASC")};";
         var result=new List<CatalogDateGroup>();
         try
         {
+            // Keep the bounded scope estimate and its grouping query on one read snapshot.
+            await using var transaction=connection.BeginTransaction(deferred:true);
+            await using var command=await BuildGroupsCommandAsync(query,connection,transaction,token);
             await using var reader=await command.ExecuteReaderAsync(token);
             while(await reader.ReadAsync(token))
             {
@@ -140,6 +140,53 @@ public sealed partial class SqliteDesktopCatalogStore
         catch(SqliteException) when(token.IsCancellationRequested) {throw new OperationCanceledException(token);}
         return result;
     },token);
+
+    private static async Task<SqliteCommand> BuildGroupsCommandAsync(CatalogViewQuery query,
+        SqliteConnection connection, SqliteTransaction transaction, CancellationToken token)
+    {
+        var folderIndex = await ChooseFolderGroupingIndexAsync(query, connection, transaction, token);
+        var command = connection.CreateCommand(); command.Transaction = transaction;
+        try
+        {
+            var month = query.UseCaptureDate ? "capture_month" : "file_month";
+            command.CommandText = $"SELECT {month},COUNT(*) FROM {BuildFromWithIndex(query, command, token, folderIndex)} WHERE {BuildGroupFilter(query, command)} GROUP BY {month} ORDER BY {month} {(query.NewestFirst ? "DESC" : "ASC")};";
+            return command;
+        }
+        catch { await command.DisposeAsync(); throw; }
+    }
+
+    private static async Task<string?> ChooseFolderGroupingIndexAsync(CatalogViewQuery query,
+        SqliteConnection connection, SqliteTransaction transaction, CancellationToken token)
+    {
+        if (query.ViewMode != "Folder" || string.IsNullOrWhiteSpace(query.Folder)) return null;
+        await using var command = connection.CreateCommand(); command.Transaction = transaction;
+        // SQLite's unfiltered COUNT uses an index page count. It does not materialize media rows.
+        command.CommandText = "SELECT COUNT(*) FROM desktop_media_items;";
+        var total = Convert.ToInt64(await command.ExecuteScalarAsync(token));
+        token.ThrowIfCancellationRequested();
+        // Probe at most 65,536 covering-index entries. A broad root retains the date-group
+        // planner; forcing path seeks there would cause table lookups for the whole library.
+        var probeLimit = Math.Min(total / 16 + 1, 65_536);
+        var folder = NormalizePathKey(query.Folder);
+        var index = query.IncludeSubfolders ? "ix_desktop_path_key" : "ix_desktop_folder_path";
+        string predicate;
+        if (query.IncludeSubfolders)
+        {
+            predicate = "path_key>=$folderStart AND path_key<$folderEnd";
+            command.Parameters.AddWithValue("$folderStart", folder + "/");
+            command.Parameters.AddWithValue("$folderEnd", folder + "0");
+        }
+        else
+        {
+            predicate = "folder_key=$folder";
+            command.Parameters.AddWithValue("$folder", folder);
+        }
+        command.CommandText = $"SELECT COUNT(*) FROM (SELECT 1 FROM desktop_media_items INDEXED BY {index} WHERE {predicate} LIMIT $probeLimit);";
+        command.Parameters.AddWithValue("$probeLimit", probeLimit);
+        var candidates = Convert.ToInt64(await command.ExecuteScalarAsync(token));
+        token.ThrowIfCancellationRequested();
+        return candidates < probeLimit ? index : null;
+    }
 
     public async IAsyncEnumerable<SavedMediaItem> EnumerateAsync(CatalogViewQuery query, [EnumeratorCancellation] CancellationToken token=default)
     {
@@ -210,6 +257,9 @@ public sealed partial class SqliteDesktopCatalogStore
     },token);
 
     private static string BuildFrom(CatalogViewQuery query,SqliteCommand command, CancellationToken token = default)
+        => BuildFromWithIndex(query, command, token, null);
+
+    private static string BuildFromWithIndex(CatalogViewQuery query, SqliteCommand command, CancellationToken token, string? folderIndex)
     {
         var where=new List<string>{"is_quarantined=0"};
         if(query.MetadataDueAtUtc is { } due)
@@ -236,7 +286,7 @@ public sealed partial class SqliteDesktopCatalogStore
             }
             else {where.Add("folder_key=$folder");command.Parameters.AddWithValue("$folder",folder);}
         }
-        var source = "desktop_media_items";
+        var source = folderIndex is null ? "desktop_media_items" : $"desktop_media_items INDEXED BY {folderIndex}";
         // Explorer folder views intentionally show that folder even when not included in the library.
         if(query.ViewMode!="Folder" && query.ExcludedFolders.Count>0)
         {

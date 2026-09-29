@@ -77,6 +77,25 @@ def projection_diagnostics(reports, metric_names):
     return result
 
 
+def phase_diagnostics(reports):
+    grouped = defaultdict(list)
+    for index, report in enumerate(reports, 1):
+        phases = report.get("phaseTimings", [])
+        if not isinstance(phases, list):
+            raise ValueError("Invalid coarse phase diagnostics.")
+        seen = set()
+        for phase in phases:
+            name, value = phase.get("name"), phase.get("milliseconds")
+            if not isinstance(name, str) or not name or name in seen or type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("Invalid coarse phase diagnostic duration or name.")
+            if phase.get("outcome") not in ("completed", "interrupted"):
+                raise ValueError("Invalid coarse phase diagnostic outcome.")
+            seen.add(name)
+            grouped[name].append({"run": index, "label": report["label"], "milliseconds": value, "outcome": phase["outcome"]})
+    return {"scope": "Coarse phase wall times include warmups and waits where applicable; excluded from comparable samples and regression gates.",
+            "available": bool(grouped), "phases": [{"name": name, "runs": runs} for name, runs in sorted(grouped.items())]}
+
+
 def compare(paths):
     reports = [json.loads(Path(path).read_text(encoding="utf-8-sig")) for path in paths]
     if len(reports) != 4 or [r["label"] for r in reports] != ["baseline", "current", "current", "baseline"]:
@@ -88,6 +107,12 @@ def compare(paths):
         for key in ("schema", "count", "repetitions", "warmups", "fixture", "syntheticFileBytes", "scope", "machine", "clockFrequency"):
             if report[key] != reference[key]:
                 raise ValueError(f"Incomparable benchmark property: {key}")
+        # Legacy reports remain reproducible together; they cannot be mixed with the
+        # new explicitly recorded seed cache profile or any other setup profile.
+        if report.get("setupProfile") != reference.get("setupProfile"):
+            raise ValueError("Incomparable benchmark property: setupProfile")
+        if "setupProfile" in report and (not isinstance(report["setupProfile"], dict) or not report["setupProfile"].get("name")):
+            raise ValueError("Invalid setupProfile metadata.")
         if report["confirmedSupersessions"] != 5:
             raise ValueError("UI cancellation/supersession verification was incomplete.")
         if report["warmups"] < 2 or report["repetitions"] < 5:
@@ -110,6 +135,7 @@ def compare(paths):
     if not runs[0] or any(set(run) != set(runs[0]) for run in runs):
         raise ValueError("Metric sets differ between runs.")
     diagnostics = projection_diagnostics(reports, runs[0])
+    phases = phase_diagnostics(reports)
     # SQL correctness is part of the comparison: no faster-but-different query result is accepted.
     for name in (n for n in runs[0] if n.startswith("sql.")):
         fingerprints = {s["fingerprint"] for r in reports for s in r["samples"] if s["name"] == name}
@@ -143,11 +169,13 @@ def compare(paths):
             "runOrder": [r["label"] for r in reports], "metrics": metrics, "memoryPeaks": memory,
             "catalogDataIntegrity": {"allRunsUnchanged": True, "table": "desktop_media_items", "rowsPerSnapshot": reference["count"], "snapshotCount": 8},
             "projectionDiagnostics": diagnostics,
+            "setupProfile": reference.get("setupProfile", {"name": "legacy-unrecorded"}), "phaseDiagnostics": phases,
             "limitations": ["Same host and same job; hosted-runner CPU/storage interference can still occur.",
                             "Warm query/UI projection workload; no cold storage, thumbnail decode, ingestion, hardware input or manual UX claim.",
                             "100 ms acknowledgement / 500 ms first page are p95 targets, reported honestly rather than advertised guarantees.",
                             "Regression gate compares medians with 30% relative, 20 ms SQL / 50 ms UI absolute, 6 MAD noise allowances and both process medians.",
                             "Memory is sampled process/cache memory, not a continuous maximum or a declared whole-process budget.",
+                            "Fixture seed cache is connection-local, not a production setting. OS cache and retained allocator memory can reflect setup; only this same-profile paired experiment is comparable.",
                             "Internal stage diagnostics are unavailable in the unmodified baseline and do not affect comparable samples, goals or regression gates.",
                             "Media-row fingerprints prove unchanged synthetic catalog data during UI queries; settings/caches and original media file bytes are outside this check."]}
 
@@ -182,6 +210,18 @@ def markdown(result):
             value = stage["milliseconds"]
             lines.append(f"| {stage['scenario']} | {stage['stage']} | {value['p50']:.2f} / {value['p95']:.2f} |")
         lines.append("")
+    lines += ["", "Fixture setup profile (not a production application setting):", "", "```json",
+              json.dumps(result["setupProfile"], indent=2), "```", "",
+              "Coarse phase wall times (diagnostic only; include warmups/waits, and are not additional performance gates):", ""]
+    if not result["phaseDiagnostics"]["available"]:
+        lines.append("Unavailable in these legacy reports; setup duration cannot be reconstructed from action samples.")
+    else:
+        lines += ["| Phase | Baseline process seconds | Current process seconds |", "|---|---:|---:|"]
+        for phase in result["phaseDiagnostics"]["phases"]:
+            def render(label):
+                return " / ".join(f"{run['milliseconds'] / 1000:.2f}" + (" (interrupted)" if run["outcome"] != "completed" else "")
+                                  for run in phase["runs"] if run["label"] == label) or "unavailable"
+            lines.append(f"| {phase['name']} | {render('baseline')} | {render('current')} |")
     lines += ["", "Limits:", ""] + ["- " + s for s in result["limitations"]]
     lines += ["", "Machine:", "", "```json", json.dumps(result["machine"], indent=2), "```", ""]
     return "\n".join(lines)

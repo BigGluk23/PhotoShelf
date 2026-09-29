@@ -145,6 +145,39 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "diagnostic samples are incomplete"):
             self.run_comparison(reports)
 
+    def test_different_setup_profiles_are_rejected(self):
+        reports = self.reports()
+        for report in reports:
+            report["setupProfile"] = {"name": "seed-v1", "seedCacheKiB": 65536}
+        reports[2]["setupProfile"]["seedCacheKiB"] = 2000
+        with self.assertRaisesRegex(ValueError, "setupProfile"):
+            self.run_comparison(reports)
+
+    def test_legacy_and_new_setup_profiles_cannot_be_mixed(self):
+        reports = self.reports()
+        reports[1]["setupProfile"] = {"name": "seed-v1", "seedCacheKiB": 65536}
+        with self.assertRaisesRegex(ValueError, "setupProfile"):
+            self.run_comparison(reports)
+
+    def test_coarse_setup_durations_do_not_change_metric_gates(self):
+        reports = self.reports()
+        original = self.run_comparison(reports)
+        for report in reports:
+            report["setupProfile"] = {"name": "seed-v1", "seedCacheKiB": 65536}
+            report["phaseTimings"] = [{"name": "seed-insert", "milliseconds": 600000 if report["label"] == "current" else 1,
+                                        "outcome": "completed", "startedUtc": "2026-09-29T00:00:00Z"}]
+        result = self.run_comparison(reports)
+        self.assertEqual(original["metrics"], result["metrics"])
+        self.assertEqual(original["status"], result["status"])
+        self.assertTrue(result["phaseDiagnostics"]["available"])
+        self.assertIn("600.00", markdown(result))
+
+    def test_invalid_coarse_diagnostic_duration_is_rejected(self):
+        reports = self.reports()
+        reports[1]["phaseTimings"] = [{"name": "seed-insert", "milliseconds": float("inf"), "outcome": "completed"}]
+        with self.assertRaisesRegex(ValueError, "coarse phase diagnostic"):
+            self.run_comparison(reports)
+
 
 if __name__ == "__main__":
     unittest.main()
