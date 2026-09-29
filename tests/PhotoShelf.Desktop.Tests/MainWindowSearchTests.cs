@@ -194,6 +194,236 @@ public sealed class MainWindowSearchTests
         Assert.Equal(excludedBefore, await Fingerprint.ReadAsync(excluded));
     });
 
+    [Fact]
+    public Task ClickingIncludedFolderUsesOneMonitorTraversalWithoutIndependentDirectScanning() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync(isolateMonitorScope: true);
+        var original = await fixture.CreatePngAsync("included.png");
+        var before = await Fingerprint.ReadAsync(original);
+        fixture.RegisterLibraryRoot(fixture.Root);
+        using var reader = fixture.BlockNextReconciliation(original);
+        var browse = fixture.BrowseAsync(fixture.Root);
+        await reader.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Both user browse and initial monitor discovery refer to this same target.
+        // No separate PhotoScanner may write rows while their shared reader is held.
+        await Task.Delay(600);
+        Assert.False(browse.IsCompleted);
+        Assert.True(reader.ReaderOpen);
+        Assert.Null(await fixture.Store.GetItemAsync(original));
+        Assert.Equal(0, await fixture.CountAsync());
+        Assert.Equal([fixture.Root], fixture.ReconciliationPaths);
+
+        reader.Release();
+        await browse.WaitAsync(TimeSpan.FromSeconds(15));
+        await fixture.WaitForMonitorIdleAsync();
+        await fixture.WaitForPublishedFolderAsync(fixture.Root, 1);
+        await Task.Delay(300);
+        Assert.Equal([fixture.Root], fixture.ReconciliationPaths);
+        Assert.Equal(1, await fixture.CountAsync());
+        Assert.Equal(before, await Fingerprint.ReadAsync(original));
+    });
+
+    [Fact]
+    public Task BrowseAfterStopCanBeStoppedAgainAndWaitsForItsActualReaderWithoutResumingLibrary() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync(isolateMonitorScope: true);
+        var original = await fixture.CreatePngAsync("committed-before-stop.png");
+        var before = await Fingerprint.ReadAsync(original);
+        Assert.True(await fixture.ScanAsync().WaitAsync(TimeSpan.FromSeconds(15)));
+        await fixture.WaitForMonitorIdleAsync();
+        await fixture.Store.SetFavoriteAsync(original, true);
+        var committed = (await fixture.Store.GetItemAsync(original))!;
+        await InvokeTask(fixture.Window, "StopSearchAsync").WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(fixture.Monitor.Activity.IsPaused);
+        Assert.True(Field<bool>(fixture.Window, "_searchStopped"));
+
+        var later = await fixture.CreatePngAsync("after-stop.png");
+        var laterBefore = await Fingerprint.ReadAsync(later);
+        using var reader = fixture.BlockNextReconciliation(original);
+        var browse = fixture.BrowseAsync(fixture.Root);
+        await reader.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        var stopButton = (Button)fixture.Window.FindName("CancelScanButton");
+        await UntilAsync(() => stopButton.IsEnabled, "Stop was not enabled for the new foreground browse.");
+        Assert.True(Field<bool>(fixture.Window, "_searchStopped"));
+        Assert.True(fixture.Monitor.Activity.IsPaused);
+        Assert.True(reader.ReaderOpen);
+
+        // Exercise the actual routed Stop handler, including its asynchronous drain.
+        stopButton.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, stopButton));
+        var stop = Field<Task>(fixture.Window, "_searchStopTask");
+        await reader.CancellationObserved.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(stop.IsCompleted);
+        Assert.True(reader.ReaderOpen);
+        Assert.True(Field<bool>(fixture.Window, "_searchStopping"));
+        Assert.False(stopButton.IsEnabled);
+        Assert.Contains("Останавливаю", Assert.IsType<string>(stopButton.Content));
+        Assert.Null(await fixture.Store.GetItemAsync(later));
+        Invoke(fixture.Window, "QueueLibraryMonitoring");
+        await Task.Delay(200);
+        Assert.False(stop.IsCompleted);
+
+        reader.Release();
+        await stop.WaitAsync(TimeSpan.FromSeconds(15));
+        await browse.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.False(reader.ReaderOpen);
+        Assert.True(fixture.Monitor.Activity.IsPaused);
+        Assert.False(fixture.Monitor.Activity.IsProcessing);
+        Assert.False(stopButton.IsEnabled);
+        await AssertCommittedOriginalAsync(fixture.Store, original, committed, before);
+
+        await fixture.BrowseAsync(fixture.Root).WaitAsync(TimeSpan.FromSeconds(15));
+        await fixture.WaitForPublishedFolderAsync(fixture.Root, 2);
+        Assert.True(fixture.Monitor.Activity.IsPaused);
+        Assert.True(Field<bool>(fixture.Window, "_searchStopped"));
+        Assert.NotNull(await fixture.Store.GetItemAsync(later));
+        await AssertCommittedOriginalAsync(fixture.Store, original, committed, before);
+        Assert.Equal(laterBefore, await Fingerprint.ReadAsync(later));
+    });
+
+    [Fact]
+    public Task ChangingBrowseFromAToBPublishesBWhileCancelledAReaderDrainsAndPreservesCommittedRows() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync(isolateMonitorScope: true);
+        var pathA = await fixture.CreatePngAsync(Path.Combine("A", "favorite.png"));
+        var pathB = await fixture.CreatePngAsync(Path.Combine("B", "latest.png"));
+        var folderA = Path.GetDirectoryName(pathA)!;
+        var folderB = Path.GetDirectoryName(pathB)!;
+        var beforeA = await Fingerprint.ReadAsync(pathA);
+        var beforeB = await Fingerprint.ReadAsync(pathB);
+        var savedA = LibraryCatalogSynchronizer.Available(new FileSystemObservationProbe().ProbeFile(pathA));
+        savedA.IsFavorite = true;
+        await fixture.Store.UpsertItemsAsync([savedA]);
+        var committedA = (await fixture.Store.GetItemAsync(pathA))!;
+        using var reader = fixture.BlockNextReconciliation(pathA, folderA);
+        var browseA = fixture.BrowseAsync(folderA);
+        await reader.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        await fixture.WaitForPublishedFolderAsync(folderA, 1);
+
+        var publishedAfterB = new List<string?>();
+        fixture.Window.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(MainWindow.PhotoRows) && fixture.Window.PhotoRows is VirtualPhotoRows)
+                publishedAfterB.Add(Field<CatalogViewQuery?>(fixture.Window, "_currentQuery")?.Folder);
+        };
+        var browseB = fixture.BrowseAsync(folderB);
+        Assert.Equal(folderB, Field<string>(fixture.Window, "_activeFolder"));
+        Assert.Equal(folderB, ((TextBlock)fixture.Window.FindName("ViewTitleText")).Text);
+        // The UI can project B's existing (empty) catalog before A's actual reader exits.
+        await fixture.WaitForPublishedFolderAsync(folderB, 0);
+        await reader.CancellationObserved.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(reader.ReaderOpen);
+        Assert.False(browseB.IsCompleted);
+        reader.Release();
+        await browseA.WaitAsync(TimeSpan.FromSeconds(15));
+        await browseB.WaitAsync(TimeSpan.FromSeconds(15));
+        await fixture.WaitForPublishedFolderAsync(folderB, 1);
+        Assert.NotEmpty(publishedAfterB);
+        Assert.All(publishedAfterB, folder => Assert.Equal(folderB, folder));
+        var rows = Assert.IsType<VirtualPhotoRows>(fixture.Window.PhotoRows);
+        Assert.Contains(rows.LoadedItems, item => item.Path == pathB);
+        Assert.DoesNotContain(rows.LoadedItems, item => item.Path == pathA);
+        Assert.Empty(Field<HashSet<string>>(fixture.Window, "_watchedFolders"));
+        await AssertCommittedOriginalAsync(fixture.Store, pathA, committedA, beforeA);
+        Assert.Equal(beforeB, await Fingerprint.ReadAsync(pathB));
+    });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task BrowsingExcludedFolderHonorsRecursionWithoutExpandingLibrary(bool recursive) => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync(isolateMonitorScope: true);
+        var direct = await fixture.CreatePngAsync(Path.Combine("excluded", "direct.png"));
+        var nested = await fixture.CreatePngAsync(Path.Combine("excluded", "nested", "nested.png"));
+        var sibling = await fixture.CreatePngAsync(Path.Combine("sibling", "unrelated.png"));
+        var folder = Path.GetDirectoryName(direct)!;
+        var fingerprints = new Dictionary<string, Fingerprint>();
+        foreach (var path in new[] { direct, nested, sibling }) fingerprints[path] = await Fingerprint.ReadAsync(path);
+        var rules = Field<FolderInclusionRules>(fixture.Window, "_folderInclusion");
+        rules.SetIncluded(fixture.Root, false);
+        var excludedBefore = rules.ExcludedFolders.ToArray();
+        var includedBefore = rules.IncludedFolders.ToArray();
+        SetField(fixture.Window, "_includeSubfolders", recursive);
+
+        await fixture.BrowseAsync(folder).WaitAsync(TimeSpan.FromSeconds(15));
+        await fixture.WaitForMonitorIdleAsync();
+        await fixture.WaitForPublishedFolderAsync(folder, recursive ? 2 : 1);
+        Assert.Equal([folder], fixture.ReconciliationPaths);
+        Assert.Equal([folder], fixture.Watchers.ActiveRoots);
+        Assert.Equal(recursive, fixture.Watchers.IsRecursive(folder));
+        Assert.Empty(Field<HashSet<string>>(fixture.Window, "_watchedFolders"));
+        Assert.Equal(excludedBefore, rules.ExcludedFolders);
+        Assert.Equal(includedBefore, rules.IncludedFolders);
+        Assert.NotNull(await fixture.Store.GetItemAsync(direct));
+        if (recursive) Assert.NotNull(await fixture.Store.GetItemAsync(nested));
+        else Assert.Null(await fixture.Store.GetItemAsync(nested));
+        Assert.Null(await fixture.Store.GetItemAsync(sibling));
+        Assert.Equal(recursive ? 2 : 1, await fixture.CountAsync());
+        foreach (var pair in fingerprints) Assert.Equal(pair.Value, await Fingerprint.ReadAsync(pair.Key));
+    });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task BrowsingChildOfIdleWatchedParentUsesOneScopedPassAndExistingParentWatcher(bool recursive) => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync(isolateMonitorScope: true);
+        var original = await fixture.CreatePngAsync("already-catalogued.png");
+        Assert.True(await fixture.ScanAsync().WaitAsync(TimeSpan.FromSeconds(15)));
+        await fixture.WaitForMonitorIdleAsync();
+        await fixture.Store.SetFavoriteAsync(original, true);
+        var committed = (await fixture.Store.GetItemAsync(original))!;
+        Assert.Equal([fixture.Root], fixture.Watchers.ActiveRoots);
+        Assert.True(fixture.Watchers.IsRecursive(fixture.Root));
+        var previousBatches = fixture.Batches.Length;
+        var previousParentTraversals = fixture.FullTraversalCount;
+
+        // Create these only AFTER the parent is idle. The controlled watcher emits
+        // no events, so neither metadata nor the initial pass can discover them.
+        var direct = await fixture.CreatePngAsync(Path.Combine("photos", "direct.png"));
+        var nested = await fixture.CreatePngAsync(Path.Combine("photos", "nested", "nested.png"));
+        var unrelated = await fixture.CreatePngAsync(Path.Combine("other", "unrelated.png"));
+        var child = Path.GetDirectoryName(direct)!;
+        var fingerprints = new Dictionary<string, Fingerprint>();
+        foreach (var path in new[] { original, direct, nested, unrelated }) fingerprints[path] = await Fingerprint.ReadAsync(path);
+        SetField(fixture.Window, "_includeSubfolders", recursive);
+        using var reader = fixture.BlockNextReconciliation(direct, child);
+        var browse = fixture.BrowseAsync(child);
+        await reader.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        await Task.Delay(200);
+        Assert.False(browse.IsCompleted);
+        Assert.Null(await fixture.Store.GetItemAsync(direct));
+        Assert.Null(await fixture.Store.GetItemAsync(nested));
+        Assert.Null(await fixture.Store.GetItemAsync(unrelated));
+
+        reader.Release();
+        await browse.WaitAsync(TimeSpan.FromSeconds(15));
+        await fixture.WaitForMonitorIdleAsync();
+        await fixture.WaitForPublishedFolderAsync(child, recursive ? 2 : 1);
+        await Task.Delay(300);
+        var work = Assert.Single(fixture.Batches.Skip(previousBatches), batch => batch.BrowseTarget is not null ||
+            batch.ReconcileRoots.Count > 0 || batch.ChangedPaths.Count > 0 || (batch.DirectoryChanges?.Count ?? 0) > 0);
+        Assert.NotNull(work.BrowseTarget);
+        Assert.Equal(child, work.BrowseTarget.Path);
+        Assert.Equal(recursive, work.BrowseTarget.IncludeSubdirectories);
+        Assert.Empty(work.ReconcileRoots);
+        Assert.Empty(work.ChangedPaths);
+        Assert.Empty(work.DirectoryChanges ?? []);
+        Assert.Equal(previousParentTraversals, fixture.FullTraversalCount);
+        Assert.Equal([fixture.Root], fixture.Watchers.CreatedRoots);
+        Assert.Equal([fixture.Root], fixture.Watchers.ActiveRoots);
+        Assert.True(fixture.Watchers.IsRecursive(fixture.Root));
+        Assert.Equal([fixture.Root], Field<HashSet<string>>(fixture.Window, "_watchedFolders"));
+        Assert.NotNull(await fixture.Store.GetItemAsync(direct));
+        if (recursive) Assert.NotNull(await fixture.Store.GetItemAsync(nested));
+        else Assert.Null(await fixture.Store.GetItemAsync(nested));
+        Assert.Null(await fixture.Store.GetItemAsync(unrelated));
+        Assert.Equal(recursive ? 3 : 2, await fixture.CountAsync());
+        await AssertCommittedOriginalAsync(fixture.Store, original, committed, fingerprints[original]);
+        foreach (var pair in fingerprints) Assert.Equal(pair.Value, await Fingerprint.ReadAsync(pair.Key));
+    });
+
     private static async Task AssertCommittedOriginalAsync(SqliteDesktopCatalogStore store, string path,
         SavedMediaItem before, Fingerprint fingerprint)
     {
@@ -211,14 +441,19 @@ public sealed class MainWindowSearchTests
         private static readonly byte[] Png = Convert.FromBase64String(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=");
         private readonly ConcurrentQueue<LibraryMonitorBatch> _batches = new();
-        private ReaderBarrier? _nextReader;
+        private sealed record PendingReader(string Target, ReaderBarrier Reader);
+        private PendingReader? _nextReader;
         private readonly List<ReaderBarrier> _readers = [];
         public string Root { get; } = Directory.CreateTempSubdirectory("photoshelf-mainwindow-search-tests-").FullName;
         public MainWindow Window { get; }
         public SqliteDesktopCatalogStore Store { get; }
         public ControlledWatchers Watchers { get; } = new();
         public LibraryChangeCoordinator Monitor => Field<LibraryChangeCoordinator>(Window, "_libraryMonitor");
+        public LibraryMonitorBatch[] Batches => _batches.ToArray();
         public string[] FullTraversalRoots => _batches.SelectMany(batch => batch.ReconcileRoots).ToArray();
+        public string[] ReconciliationPaths => _batches.SelectMany(batch => batch.ReconcileRoots
+            .Concat((batch.DirectoryChanges ?? []).Select(change => change.Path))
+            .Concat(batch.BrowseTarget is { } browse ? new[] { browse.Path } : Array.Empty<string>())).ToArray();
         public int FullTraversalCount => _batches.Sum(batch => batch.ReconcileRoots.Count(path =>
             path.Equals(Root, StringComparison.OrdinalIgnoreCase)));
 
@@ -232,9 +467,13 @@ public sealed class MainWindowSearchTests
                 async (batch, token) =>
                 {
                     _batches.Enqueue(batch);
-                    if (batch.ReconcileRoots.Contains(Root, StringComparer.OrdinalIgnoreCase) &&
-                        Interlocked.Exchange(ref _nextReader, null) is { } reader)
-                        await reader.HoldAsync(token);
+                    var reader = Volatile.Read(ref _nextReader);
+                    if (reader is not null &&
+                        (batch.ReconcileRoots.Contains(reader.Target, StringComparer.OrdinalIgnoreCase) ||
+                         (batch.DirectoryChanges ?? []).Any(change => change.Path.Equals(reader.Target, StringComparison.OrdinalIgnoreCase)) ||
+                         batch.BrowseTarget?.Path.Equals(reader.Target, StringComparison.OrdinalIgnoreCase) == true) &&
+                        ReferenceEquals(Interlocked.CompareExchange(ref _nextReader, null, reader), reader))
+                        await reader.Reader.HoldAsync(token);
                     await callback(batch, token);
                 }, new LibraryMonitorOptions
                 {
@@ -244,7 +483,7 @@ public sealed class MainWindowSearchTests
             Property(Window, "LibraryMonitorFactory").SetValue(Window, factory);
         }
 
-        public static async Task<SearchFixture> CreateAsync()
+        public static async Task<SearchFixture> CreateAsync(bool isolateMonitorScope = false)
         {
             var fixture = new SearchFixture();
             try
@@ -253,6 +492,9 @@ public sealed class MainWindowSearchTests
                 var ready = (Task<Exception?>)Property(fixture.Window, "InitialCatalogReady").GetValue(fixture.Window)!;
                 Assert.Null(await ready.WaitAsync(TimeSpan.FromSeconds(15)));
                 await Field<Task>(fixture.Window, "_metadataTask").WaitAsync(TimeSpan.FromSeconds(10));
+                // The process-isolated catalog is shared by serialized tests. Browse
+                // scenarios choose their own roots, never adopt previous fixture rows.
+                if (isolateMonitorScope) SetField(fixture.Window, "_monitorRootsRestored", true);
                 // Startup cannot watch adopted folders from another test. Enable the
                 // isolated production monitor only for our explicit synthetic search.
                 Property(fixture.Window, "AllowIsolatedLibraryMonitoring").SetValue(fixture.Window, true);
@@ -264,19 +506,39 @@ public sealed class MainWindowSearchTests
         public async Task<string> CreatePngAsync(string name)
         {
             var path = Path.Combine(Root, name);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             await File.WriteAllBytesAsync(path, Png);
             return path;
         }
 
-        public ReaderBarrier BlockNextReconciliation(string path)
+        public ReaderBarrier BlockNextReconciliation(string path, string? target = null)
         {
             var reader = new ReaderBarrier(path);
-            Assert.Null(Interlocked.CompareExchange(ref _nextReader, reader, null));
+            Assert.Null(Interlocked.CompareExchange(ref _nextReader, new PendingReader(target ?? Root, reader), null));
             _readers.Add(reader);
             return reader;
         }
 
         public Task<bool> ScanAsync() => (Task<bool>)InvokeTask(Window, "ScanRootsAsync", new[] { Root }, false);
+
+        public void RegisterLibraryRoot(string path) => Invoke(Window, "RegisterWatchedFolder", path);
+
+        public Task BrowseAsync(string path)
+        {
+            var node = new FolderNode(path);
+            node.ApplyInclusion(Field<FolderInclusionRules>(Window, "_folderInclusion"));
+            Invoke(Window, "OnFolderTreeSelectedItemChanged", Window.FindName("FolderTree"),
+                new RoutedPropertyChangedEventArgs<object>(null!, node, TreeView.SelectedItemChangedEvent));
+            return Field<Task>(Window, "_browseTask");
+        }
+
+        public async Task WaitForPublishedFolderAsync(string folder, long count)
+        {
+            await UntilAsync(() => !Field<bool>(Window, "_isProjecting") && !Field<bool>(Window, "_projectionQueued") &&
+                Field<CatalogViewQuery?>(Window, "_currentQuery")?.Folder == folder &&
+                Window.PhotoRows is VirtualPhotoRows rows && rows.ItemCount == count,
+                "The selected folder was not published with its expected catalog rows.");
+        }
 
         public Task<long> CountAsync() => Store.CountAsync(new CatalogViewQuery
             { Folder = Root, ViewMode = "Folder", IncludeSubfolders = true, IncludeSystemFolders = true });
@@ -347,21 +609,28 @@ public sealed class MainWindowSearchTests
     private sealed class ControlledWatchers : ILibraryWatcherFactory
     {
         private readonly ConcurrentDictionary<string, Watcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
+        public string[] CreatedRoots => _watchers.Keys.ToArray();
         public string[] ActiveRoots => _watchers.Where(pair => !pair.Value.IsDisposed).Select(pair => pair.Key).ToArray();
         public IDisposable Watch(string root, bool includeSubdirectories, Action<LibraryWatchEvent> onChange, Action<Exception> onError)
         {
-            var watcher = new Watcher(onChange);
-            Assert.True(_watchers.TryAdd(root, watcher), "Duplicate watcher for the same root.");
+            var watcher = new Watcher(onChange, includeSubdirectories);
+            _watchers.AddOrUpdate(root, watcher, (_, previous) =>
+            {
+                Assert.True(previous.IsDisposed, "Duplicate active watcher for the same root.");
+                return watcher;
+            });
             return watcher;
         }
+        public bool IsRecursive(string root) => _watchers[root].Recursive;
         public void Emit(string path)
         {
             var watcher = Assert.Single(_watchers.Values, item => !item.IsDisposed);
             watcher.OnChange(new(path));
         }
-        private sealed class Watcher(Action<LibraryWatchEvent> onChange) : IDisposable
+        private sealed class Watcher(Action<LibraryWatchEvent> onChange, bool recursive) : IDisposable
         {
             public Action<LibraryWatchEvent> OnChange { get; } = onChange;
+            public bool Recursive { get; } = recursive;
             public bool IsDisposed { get; private set; }
             public void Dispose() => IsDisposed = true;
         }
@@ -372,6 +641,16 @@ public sealed class MainWindowSearchTests
         public static async Task<Fingerprint> ReadAsync(string path) => new(
             Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(path))),
             new FileInfo(path).Length, File.GetLastWriteTimeUtc(path));
+    }
+
+    private static async Task UntilAsync(Func<bool> condition, string message)
+    {
+        var watch = Stopwatch.StartNew();
+        while (!condition())
+        {
+            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), message);
+            await Task.Delay(20);
+        }
     }
 
     private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;

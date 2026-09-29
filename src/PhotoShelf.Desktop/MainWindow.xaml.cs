@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.11";
+    private const string VersionLabel = "Ultra v0.10.12";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -339,7 +339,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ViewTitleText.Text = folderNode.FullPath;
         _activeFolder = folderNode.FullPath;
         _viewMode = LibraryViewMode.Folder;
-        RebuildRows();
+        RebuildRows(updateMonitoring: false);
         _ = BrowseFolderAsync(folderNode.FullPath);
         RefreshChrome();
         SaveCatalogState();
@@ -619,7 +619,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _searchStopError = null;
             SetScanning(true);
             foreach (var root in roots) { AddFolder(root); RegisterWatchedFolder(root); }
-            if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(); }
+            if (changeView) { _activeFolder = null; _viewMode = LibraryViewMode.All; ViewTitleText.Text = "Все фотографии"; RebuildRows(updateMonitoring: false); }
             // Configuration and initial request registration are atomic in the
             // coordinator, including for an empty/very quickly scanned folder.
             var revision = ++_monitorConfigurationRevision;
@@ -928,11 +928,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return ShowVideos || !item.IsVideo;
     }
 
-    private void RebuildRows()
+    private void RebuildRows(bool updateMonitoring = true)
     {
         if (_isInitializing || _lifetime.IsCancellationRequested) return;
         _ = RebuildRowsAsync();
-        QueueLibraryMonitoring();
+        if (updateMonitoring) QueueLibraryMonitoring();
     }
 
     private void RefreshDateSortButton()
@@ -1010,10 +1010,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadSavedCatalogAsync();
             MarkInitialCatalogReady();
-            // A restored folder (or a click during startup) must discover its first
-            // files directly, without waiting behind the library monitor's root queue.
+            // Atomically register the selected folder before the coordinator can
+            // start an initial pass; foreground browse precedes queued library work.
             if (_viewMode == LibraryViewMode.Folder && _activeFolder is not null) _ = BrowseFolderAsync(_activeFolder);
-            QueueLibraryMonitoring();
+            else QueueLibraryMonitoring();
             if (!_hasPendingRecovery) StartMetadataIndexing(resetExisting: false);
         }
         catch (OperationCanceledException) { MarkInitialCatalogFailed(new OperationCanceledException()); }

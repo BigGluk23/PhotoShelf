@@ -122,7 +122,10 @@ public static class PhotoScanner
                         batch.Clear();
                     }
                     if (recursive) foreach (var child in Directory.EnumerateDirectories(folder, "*", options))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (rules.MayContainIncluded(child)) pending.Enqueue(child);
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 if (batch.Count > 0)

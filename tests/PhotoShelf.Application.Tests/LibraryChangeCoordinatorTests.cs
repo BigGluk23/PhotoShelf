@@ -14,6 +14,377 @@ public sealed class LibraryChangeCoordinatorTests
     };
 
     [Fact]
+    public async Task ForegroundBrowseConsumesExactInitialPassWithoutDuplicatePublicScanMarkers()
+    {
+        var root = RootPath(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions with { Debounce = TimeSpan.Zero }, factory, new FakeProbe());
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true));
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        var sentinel = Path.Combine(root, "after-browse.jpg");
+        factory.Latest(root).Change(new(sentinel));
+        await Until(() => batches.Any(batch => batch.ChangedPaths.Contains(sentinel)));
+        Assert.Single(batches, batch => batch.BrowseTarget is not null);
+        Assert.Empty(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.Empty(batches.SelectMany(batch => batch.DirectoryChanges ?? []));
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
+    public async Task BackgroundResumeDoesNotCancelOrReplayAnAlreadyRunningPausedBrowse()
+    {
+        var root = RootPath();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.BrowseTarget is not null) { entered.TrySetResult(); await release.Task.WaitAsync(token); }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var generation = monitor.Generation;
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        Assert.True(monitor.Generation > generation);
+        var joined = monitor.ReconcileAsync([root]);
+        Assert.Equal(0, monitor.Activity.PendingReconciliationRootCount);
+        release.TrySetResult();
+        await Task.WhenAll(request.Completion, joined).WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        Assert.Single(batches, batch => batch.BrowseTarget is not null);
+        Assert.Empty(batches.SelectMany(batch => batch.ReconcileRoots));
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
+    public async Task DirectBrowseUnderPausedRecursiveOwnerDoesNotAcknowledgeOrProbeTheWholeRoot()
+    {
+        var root = RootPath(); var child = Path.Combine(root, "selected"); var probe = new FakeProbe();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions, new FakeFactory(), probe);
+        await monitor.PauseAsync();
+        await monitor.ConfigureAsync(new([root]));
+        using var cancellation = new CancellationTokenSource();
+        var fullPass = monitor.ReconcileAsync([root], cancellation.Token);
+        await monitor.BrowseAsync(new(child, false)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(monitor.Activity.IsPaused);
+        Assert.False(fullPass.IsCompleted);
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+        Assert.Equal(0, probe.Calls);
+        var batch = Assert.Single(batches);
+        Assert.Equal(new LibraryBrowseTarget(child, false), batch.BrowseTarget);
+        Assert.Empty(batch.ReconcileRoots); Assert.Empty(batch.DirectoryChanges ?? []);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fullPass);
+    }
+
+    [Fact]
+    public async Task PausedBrowsePreparesOnlyItsExactRootAndLeavesUnrelatedRootUntouched()
+    {
+        var root = RootPath(); var unrelated = RootPath(); var probe = new FakeProbe(); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        { batches.Enqueue(batch); return Task.CompletedTask; }, FastOptions, factory, probe);
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root, unrelated]), new(root, true));
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal([root], probe.Roots);
+        Assert.Equal([root], factory.Items.Select(watcher => watcher.Root));
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        Assert.True(monitor.Activity.IsPaused);
+        var batch = Assert.Single(batches);
+        Assert.Equal(new LibraryBrowseTarget(root, true), batch.BrowseTarget);
+        Assert.Equal(root, Assert.Single(batch.RootStates).Path);
+        Assert.Empty(batch.ReconcileRoots);
+    }
+
+    [Fact]
+    public async Task LatestBrowseCancelsOldRequestButWaitsForItsRealCallbackToRelease()
+    {
+        var first = RootPath(); var second = RootPath();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var browses = new ConcurrentQueue<string>();
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.BrowseTarget is not { } browse) return;
+            browses.Enqueue(browse.Path);
+            if (browse.Path != first) return;
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancelled.TrySetResult(); await release.Task; }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([first, second]), new(first, true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            var next = monitor.BrowseAsync(new(second, false));
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(request.Completion.IsCompleted);
+            Assert.False(next.IsCompleted);
+            Assert.Equal([first], browses);
+            Assert.Equal(new LibraryBrowseTarget(first, true), monitor.Activity.BrowseTarget);
+            release.TrySetResult();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request.Completion);
+            await next.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal([first, second], browses);
+            Assert.True(monitor.Activity.IsPaused);
+            // The interrupted first root is still pending; it was not certified by the second folder.
+            Assert.True(monitor.Activity.PendingReconciliationRootCount >= 1);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ForegroundCancellationOrPauseCompletesOnlyAfterActualReaderDrain(bool pause)
+    {
+        var root = RootPath();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var browses = 0;
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.BrowseTarget is null) return;
+            Interlocked.Increment(ref browses); entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancelled.TrySetResult(); await release.Task; }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        using var cancellation = new CancellationTokenSource();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true), cancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            Task stopped = Task.CompletedTask;
+            if (pause) stopped = monitor.PauseAsync();
+            else cancellation.Cancel();
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(request.Completion.IsCompleted);
+            if (pause) Assert.False(stopped.IsCompleted);
+            Assert.True(monitor.Activity.IsProcessing);
+            release.TrySetResult();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request.Completion);
+            await stopped.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+            Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+            await monitor.ResumeAsync(reconcileAllRoots: false);
+            await Until(() => monitor.Activity.CompletedReconciliationCount == 1);
+            Assert.Equal(1, browses); // Resume replays background intent, never the cancelled browse.
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task IncidentalConfigurationRestartsValidBrowseAttemptWithoutCancellingItsRequest()
+    {
+        var root = RootPath(); var other = RootPath(); var calls = 0;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.BrowseTarget is null || Interlocked.Increment(ref calls) != 1) return;
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancelled.TrySetResult(); await release.Task; }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            var configuration = monitor.ConfigureAsync(new([root, other]));
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(request.Completion.IsCompleted); Assert.False(configuration.IsCompleted);
+            release.TrySetResult();
+            await configuration.WaitAsync(TimeSpan.FromSeconds(5));
+            await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(2, calls);
+            Assert.True(monitor.Activity.IsPaused);
+            Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task RemovingBrowseCoverageCancelsRequestAfterItsCallbackDrains()
+    {
+        var root = RootPath(); var other = RootPath();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.BrowseTarget?.Path != root) return;
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancelled.TrySetResult(); await release.Task; }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            var configuration = monitor.ConfigureAsync(new([other]));
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(request.Completion.IsCompleted);
+            release.TrySetResult();
+            await configuration.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request.Completion);
+            await monitor.BrowseAsync(new(other, true)).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task ForegroundFailureFaultsItsTicketAndLeavesConsumedBackgroundIntentPending()
+    {
+        var root = RootPath(); var calls = 0;
+        await using var monitor = new LibraryChangeCoordinator((batch, _) =>
+        {
+            if (batch.BrowseTarget is not null && Interlocked.Increment(ref calls) == 1)
+                throw new IOException("Synthetic browse failure");
+            return Task.CompletedTask;
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var request = await monitor.ConfigureAndBrowseAsync(new([root]), new(root, true));
+        await Assert.ThrowsAsync<IOException>(() => request.Completion);
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        Assert.Equal(0, monitor.Activity.CompletedReconciliationCount);
+        await monitor.BrowseAsync(new(root, true)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, calls);
+        Assert.Equal(1, monitor.Activity.CompletedReconciliationCount);
+    }
+
+    [Fact]
+    public async Task EventsArrivingDuringBrowseRemainPendingAndForcedContentIntentSurvivesNarrowBrowse()
+    {
+        var root = RootPath(); var child = Path.Combine(root, "selected"); var factory = new FakeFactory();
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.BrowseTarget is not null) { entered.TrySetResult(); await release.Task.WaitAsync(token); }
+        }, FastOptions with { Debounce = TimeSpan.Zero }, factory, new FakeProbe());
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await initial.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        factory.Latest(root).Error(new InternalBufferOverflowException());
+        var request = monitor.BrowseAsync(new(child, false));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var changed = Path.Combine(child, "same-size-edited.jpg");
+        factory.Latest(root).Change(new(changed));
+        Assert.Equal(1, monitor.PendingPathCount);
+        release.TrySetResult();
+        await request.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, monitor.Activity.PendingReconciliationRootCount);
+        Assert.Equal(1, monitor.PendingPathCount);
+        Assert.True(monitor.Activity.IsPaused);
+        Assert.Empty(Assert.Single(batches, batch => batch.BrowseTarget is not null).RevalidateContentRoots ?? []);
+        await monitor.ResumeAsync(reconcileAllRoots: false);
+        await Until(() => batches.Any(batch => batch.ChangedPaths.Contains(changed)) &&
+            batches.Any(batch => batch.RevalidateContentRoots?.Contains(root) == true));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task ManualRequestJoinedToQuietBrowseSurvivesItsCancellationOrFailure(bool fail, bool childTarget)
+    {
+        var root = RootPath(); var selected = childTarget ? Path.Combine(root, "selected") : root;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var batches = new ConcurrentQueue<LibraryMonitorBatch>();
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            batches.Enqueue(batch);
+            if (batch.BrowseTarget is null) return;
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+            if (fail) throw new IOException("Synthetic browse failure");
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        var initial = await monitor.ConfigureAndReconcileAsync(new([root]), [root]);
+        await initial.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource();
+        var browse = monitor.BrowseAsync(new(selected, true), cancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var manual = monitor.ReconcileAsync([selected]);
+        Assert.False(manual.IsCompleted);
+        Assert.Equal(0, monitor.Activity.PendingDirectoryCount);
+        Assert.Equal(0, monitor.Activity.PendingReconciliationRootCount);
+        if (fail) release.TrySetResult();
+        else cancellation.Cancel();
+        if (fail) await Assert.ThrowsAsync<IOException>(() => browse);
+        else await Assert.ThrowsAnyAsync<OperationCanceledException>(() => browse);
+        await manual.WaitAsync(TimeSpan.FromSeconds(5));
+        await monitor.PauseAsync();
+        if (childTarget)
+        {
+            Assert.Single(batches.SelectMany(batch => batch.ReconcileRoots));
+            Assert.Equal(selected, Assert.Single(batches.SelectMany(batch => batch.DirectoryChanges ?? [])).Path);
+        }
+        else Assert.Equal(2, batches.SelectMany(batch => batch.ReconcileRoots).Count());
+    }
+
+    [Fact]
+    public async Task CancelledReplacementNeverStartsAfterOldBrowseFinishesDraining()
+    {
+        var first = RootPath(); var second = RootPath();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var browses = new ConcurrentQueue<string>();
+        await using var monitor = new LibraryChangeCoordinator(async (batch, token) =>
+        {
+            if (batch.BrowseTarget is not { } target) return;
+            browses.Enqueue(target.Path); entered.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cancelled.TrySetResult(); await release.Task; }
+        }, FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        var initial = await monitor.ConfigureAndBrowseAsync(new([first, second]), new(first, true));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            using var cancellation = new CancellationTokenSource();
+            var next = monitor.BrowseAsync(new(second, true), cancellation.Token);
+            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cancellation.Cancel(); release.TrySetResult();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => initial.Completion);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => next);
+            Assert.Equal([first], browses);
+            Assert.True(monitor.Activity.IsPaused);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task BrowseCannotWidenAnOnlyNonrecursiveConfiguredScope()
+    {
+        var root = RootPath();
+        await using var monitor = new LibraryChangeCoordinator((_, _) => Task.CompletedTask,
+            FastOptions, new FakeFactory(), new FakeProbe());
+        await monitor.PauseAsync();
+        await monitor.ConfigureAsync(new([root], NonRecursiveRoots: [root]));
+        await Assert.ThrowsAsync<ArgumentException>(() => monitor.BrowseAsync(new(root, true)));
+        await Assert.ThrowsAsync<ArgumentException>(() => monitor.ConfigureAndBrowseAsync(new([root], NonRecursiveRoots: [root]), new(root, true)));
+        await monitor.BrowseAsync(new(root, false)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(monitor.Activity.IsPaused);
+    }
+
+    [Fact]
     public async Task AtomicRequestSharesEvenAnImmediatelyCompletedInitialPass()
     {
         var root = RootPath(); var factory = new FakeFactory();
@@ -1160,8 +1531,9 @@ public sealed class LibraryChangeCoordinatorTests
     {
         public volatile FileAvailability Availability = FileAvailability.Available;
         public int Calls;
+        public ConcurrentQueue<string> Roots { get; } = new();
         public FileSystemProbeResult ProbeFile(string path) => new(path, Availability, DateTime.UtcNow);
-        public FileSystemProbeResult ProbeRoot(string path) { Interlocked.Increment(ref Calls); return new(path, Availability, DateTime.UtcNow, IsDirectory: true); }
+        public FileSystemProbeResult ProbeRoot(string path) { Interlocked.Increment(ref Calls); Roots.Enqueue(path); return new(path, Availability, DateTime.UtcNow, IsDirectory: true); }
     }
 
     private sealed class ManualClock : TimeProvider

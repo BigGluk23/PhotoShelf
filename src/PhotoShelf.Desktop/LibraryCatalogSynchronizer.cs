@@ -21,6 +21,16 @@ public sealed class LibraryCatalogSynchronizer(
         string? browsedFolder, bool browseRecursively, bool includeSystem, CancellationToken token,
         IReadOnlyList<string>? libraryRoots = null)
     {
+        if (batch.BrowseTarget is { } browse)
+        {
+            // Foreground navigation is an immutable, exact request. It can read an
+            // unchecked folder without broadening library rules or inheriting a
+            // recursive ancestor's scope, even if the user has since selected elsewhere.
+            browsedFolder = browse.Path;
+            browseRecursively = browse.IncludeSubdirectories;
+            libraryRoots = [];
+            inclusion = new FolderInclusionRules([]);
+        }
         libraryRoots ??= batch.ReconcileRoots.Concat((batch.DirectoryChanges ?? []).Select(change => change.OwnerRoot))
             .Where(root => !root.Equals(browsedFolder, StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -42,8 +52,8 @@ public sealed class LibraryCatalogSynchronizer(
             // A directory notification describes its own old/new subtree. It must not
             // restart enumeration of the whole watched drive. The catalog pass below
             // also covers a deleted subtree without deleting any catalog records.
-            var targets = batch.ReconcileRoots.Concat((batch.DirectoryChanges ?? []).Select(change => change.Path))
-                .Distinct(StringComparer.OrdinalIgnoreCase);
+            var targets = batch.BrowseTarget is { } requestedBrowse ? [requestedBrowse.Path] :
+                batch.ReconcileRoots.Concat((batch.DirectoryChanges ?? []).Select(change => change.Path)).Distinct(StringComparer.OrdinalIgnoreCase);
             foreach (var root in targets)
             {
                 token.ThrowIfCancellationRequested();

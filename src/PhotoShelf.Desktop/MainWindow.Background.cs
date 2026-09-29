@@ -254,39 +254,43 @@ public partial class MainWindow
     private Task BrowseFolderAsync(string folder)
     {
         if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused || _searchStopping) return Task.CompletedTask;
-        QueueLibraryMonitoring();
         _browseCancellation?.Cancel();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         var previous = _browseTask;
         _browseCancellation = operation;
-        return _browseTask = RunBrowseAsync(folder, operation, _includeSystemFolders, _includeSubfolders, previous);
+        var work = RunBrowseAsync(new(folder, _includeSubfolders), operation, previous, _searchStopTask);
+        _browseTask = work;
+        RefreshSearchControls();
+        return work;
     }
-    private async Task RunBrowseAsync(string folder, CancellationTokenSource operation, bool system, bool recursive, Task previous)
+    private async Task RunBrowseAsync(LibraryBrowseTarget target, CancellationTokenSource operation, Task previous, Task precedingStop)
     {
         try
         {
             await previous;
-            operation.Token.ThrowIfCancellationRequested();
-            await PhotoScanner.ScanAsync(new[] { folder }, batch => IndexScanBatchAsync(batch, operation.Token),
-                system, operation.Token, recursive: recursive);
-            if (!operation.IsCancellationRequested) { await RefreshCatalogCountAsync(); StartMetadataIndexing(false); }
+            await precedingStop;
+            var token = operation.Token; token.ThrowIfCancellationRequested();
+            if (_fileOperationActive || _hasPendingRecovery || _closing || _backgroundProcessingPaused) return;
+            // A browse is explicit foreground work, including while library search is
+            // stopped. It never resumes unrelated reconciliation or changes inclusion.
+            var revision = ++_monitorConfigurationRevision;
+            var configure = ConfigureLibraryMonitoringAsync(_monitorConfigurationTask, revision,
+                requestToken: token, browseRequest: target);
+            _monitorConfigurationTask = configure;
+            await await configure;
+            token.ThrowIfCancellationRequested();
+            await RefreshCatalogCountAsync(); StartMetadataIndexing(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!operation.IsCancellationRequested) StatusText.Text = ex.Message; }
-        finally { if (ReferenceEquals(_browseCancellation, operation)) { _browseCancellation = null; CompleteCatalogStage(); RefreshEmptyState(); } operation.Dispose(); }
-    }
-
-    private async Task IndexScanBatchAsync(PhotoScanBatch batch, CancellationToken token)
-    {
-        var synchronizer = new LibraryCatalogSynchronizer(_desktopCatalogStore, PublishLibraryUpdateAsync);
-        await synchronizer.ObservePathsAsync(batch.Paths, forceContent: false, token);
-        await Dispatcher.InvokeAsync(() =>
+        finally
         {
-            if (_lifetime.IsCancellationRequested || _closing) return;
-            if (!token.IsCancellationRequested) StatusText.Text = $"Сканирую: {batch.SeenCount:N0} · {batch.CurrentFolder}";
-            // ObservePathsAsync already publishes actual committed changes. A scan
-            // progress tick alone must not rebuild an unrelated (possibly empty) view.
-        }, DispatcherPriority.Background);
+            if (ReferenceEquals(_browseCancellation, operation))
+            {
+                _browseCancellation = null; CompleteCatalogStage(); RefreshEmptyState(); RefreshSearchControls();
+            }
+            operation.Dispose();
+        }
     }
     private static SavedMediaItem? ToSavedItem(string path)
     {
@@ -334,8 +338,9 @@ public partial class MainWindow
     private void OnSubfoldersChanged(object sender, RoutedEventArgs e)
     {
         _includeSubfolders = SubfoldersCheckBox.IsChecked == true;
-        RebuildRows();
-        if (_viewMode == LibraryViewMode.Folder && _activeFolder is not null) _ = BrowseFolderAsync(_activeFolder);
+        var browse = _viewMode == LibraryViewMode.Folder && _activeFolder is not null;
+        RebuildRows(updateMonitoring: !browse);
+        if (browse) _ = BrowseFolderAsync(_activeFolder!);
         SaveCatalogState();
     }
 

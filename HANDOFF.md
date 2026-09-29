@@ -1,7 +1,11 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.11** (`0.10.11-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v0.10.12** (`0.10.12-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Координированный просмотр v0.10.12
+
+`BrowseFolderAsync` больше не вызывает самостоятельный `PhotoScanner`. `LibraryBrowseTarget` фиксирует папку и глубину; координатор выполняет приоритетный запрос тем же worker и ждёт завершения настоящего callback. Запрос выбранной папки разрешён при `_searchStopped`, но не возобновляет фоновые события/dirty roots. Stop остаётся доступным для активного foreground; смена папки отменяет предыдущий запрос. `LibraryCatalogSynchronizer` для `BrowseTarget` использует отдельную точную область без library roots и без изменения inclusion rules. Конфигурация не ждёт traversal ticket; scope публикуется после drain прежнего callback. Результаты текущей проверки: [v0.10.12](docs/v0.10.12-coordinated-browse.md).
 
 ## Поиск и остановка v0.10.11
 

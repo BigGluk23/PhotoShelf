@@ -7,16 +7,17 @@ public sealed record LibraryMonitorConfiguration(IReadOnlyList<string> Roots,
 
 public sealed record LibraryRootState(string Path, FileAvailability Availability, bool IsWatching, string? ErrorCode = null);
 public sealed record LibraryDirectoryChange(string OwnerRoot, string Path);
+public sealed record LibraryBrowseTarget(string Path, bool IncludeSubdirectories);
 public sealed record LibraryMonitorBatch(long Generation, IReadOnlyList<string> ChangedPaths,
     IReadOnlyList<string> ReconcileRoots, IReadOnlyList<LibraryRootState> RootStates,
     IReadOnlyList<string>? RevalidateContentRoots = null,
-    IReadOnlyList<LibraryDirectoryChange>? DirectoryChanges = null);
+    IReadOnlyList<LibraryDirectoryChange>? DirectoryChanges = null, LibraryBrowseTarget? BrowseTarget = null);
 
 public sealed record LibraryMonitorActivity(long Generation, bool IsPaused, bool IsDisposed, bool IsProcessing,
     IReadOnlyList<string> ActiveReconciliationRoots, int ActiveChangedPathCount,
     int PendingPathCount, int PendingReconciliationRootCount, long CompletedReconciliationCount,
     DateTime? LastReconciliationCompletedAtUtc, int ActiveDirectoryCount, int PendingDirectoryCount,
-    long CompletedDirectoryReconciliationCount);
+    long CompletedDirectoryReconciliationCount, LibraryBrowseTarget? BrowseTarget = null);
 
 /// <summary>Configuration has finished; Completion waits for its actual reconciliation callback.</summary>
 public sealed record LibraryReconciliationRequest(Task Completion);
@@ -73,6 +74,10 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     private DateTime _callbackRetryAt;
     private bool _paused = true, _explicitlyPaused, _disposed;
     private LibraryMonitorBatch? _activeBatch;
+    private BrowseRequest? _pendingBrowse, _activeBrowse;
+    private CancellationTokenSource? _activeBrowseCancellation;
+    private bool _suspendBrowse;
+    private long _workInterruption;
     private long _completedReconciliations;
     private long _completedDirectoryReconciliations;
     private DateTime? _lastReconciliationCompletedAtUtc;
@@ -103,12 +108,15 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         get
         {
             lock (_sync)
-                return new(_generation, _paused, _disposed, _activeBatch is not null,
+                return new(_generation, _paused, _disposed, _activeBatch is not null || _activeBrowse is not null,
                     Array.AsReadOnly(_activeBatch is null ? [] : _activeBatch.ReconcileRoots
-                        .Concat((_activeBatch.DirectoryChanges ?? []).Select(change => change.Path)).ToArray()),
+                        .Concat((_activeBatch.DirectoryChanges ?? []).Select(change => change.Path))
+                        .Concat(_activeBatch.BrowseTarget is { } browse ? [browse.Path] : [])
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToArray()),
                     _activeBatch?.ChangedPaths.Count ?? 0, _paths.Count, _dirty.Count,
                     _completedReconciliations, _lastReconciliationCompletedAtUtc,
-                    _activeBatch?.DirectoryChanges?.Count ?? 0, _directories.Count, _completedDirectoryReconciliations);
+                    _activeBatch?.DirectoryChanges?.Count ?? 0, _directories.Count, _completedDirectoryReconciliations,
+                    _activeBrowse?.Target ?? _activeBatch?.BrowseTarget);
         }
     }
 
@@ -130,8 +138,17 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         return new(completion!);
     }
 
+    /// <summary>Registers the selected folder atomically with configuration, before any initial background pass.</summary>
+    public async Task<LibraryReconciliationRequest> ConfigureAndBrowseAsync(
+        LibraryMonitorConfiguration configuration, LibraryBrowseTarget target, CancellationToken token = default)
+    {
+        target = NormalizeBrowseTarget(target);
+        var completion = await ConfigureCoreAsync(configuration, null, token, target).ConfigureAwait(false);
+        return new(completion!);
+    }
+
     private async Task<Task?> ConfigureCoreAsync(LibraryMonitorConfiguration configuration,
-        string[]? requestedPaths, CancellationToken requestToken)
+        string[]? requestedPaths, CancellationToken requestToken, LibraryBrowseTarget? browseTarget = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         // Normalize strings only; configuring from the UI performs no filesystem I/O.
@@ -150,11 +167,17 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                     (root.Equals(path, StringComparison.OrdinalIgnoreCase) || Recurse(root) && Under(path, root))) ||
                     ignored.Any(ignore => Under(path, ignore)) || HasPrivateComponent(path))
                     throw new ArgumentException($"No configured monitoring scope covers '{path}'.", nameof(requestedPaths));
+        if (browseTarget is not null && (!roots.Any(root => !ignored.Any(ignore => Under(root, ignore)) &&
+                (!browseTarget.IncludeSubdirectories || Recurse(root)) &&
+                (root.Equals(browseTarget.Path, StringComparison.OrdinalIgnoreCase) || Recurse(root) && Under(browseTarget.Path, root))) ||
+                ignored.Any(ignore => Under(browseTarget.Path, ignore)) || HasPrivateComponent(browseTarget.Path)))
+            throw new ArgumentException($"No configured monitoring scope covers '{browseTarget.Path}'.", nameof(browseTarget));
         Task? requestCompletion = null;
         await _control.WaitAsync().ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
+            if (browseTarget is not null) await CancelBrowseRequestsAsync().ConfigureAwait(false);
             await PauseCoreAsync(closeWatchers: false).ConfigureAwait(false);
             List<IDisposable> retired = [];
             lock (_sync)
@@ -238,12 +261,19 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                     else _directories[path] = owner;
                 }
                 ReassignReconciliationWaiters();
+                ValidatePendingBrowse();
                 if (requestedPaths is not null)
                     requestCompletion = RegisterReconciliation(requestedPaths, requestToken);
+                if (browseTarget is not null)
+                    requestCompletion = RegisterBrowse(browseTarget, requestToken);
                 _callbackRetryAt = default;
             }
             await Task.Run(() => { foreach (var watcher in retired) watcher.Dispose(); }).ConfigureAwait(false);
-            lock (_sync) if (!_explicitlyPaused) StartGeneration();
+            lock (_sync)
+            {
+                if (!_explicitlyPaused) StartGeneration();
+                _suspendBrowse = false;
+            }
             Wake();
             return requestCompletion;
         }
@@ -258,6 +288,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         {
             ThrowIfDisposed();
             lock (_sync) _explicitlyPaused = true;
+            await CancelBrowseRequestsAsync().ConfigureAwait(false);
             // Windows FileSystemWatcher holds directory notification handles, not media readers.
             // Keep them alive so a modal review does not create an unobserved content gap.
             await PauseCoreAsync(closeWatchers: false).ConfigureAwait(false);
@@ -319,6 +350,94 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         return completion;
     }
 
+    /// <summary>
+    /// A latest-only, priority request on the same reader gate as background reconciliation.
+    /// It can run while background monitoring is paused, without releasing background queues.
+    /// Cancellation completes only after a running callback has actually finished.
+    /// </summary>
+    public async Task BrowseAsync(LibraryBrowseTarget target, CancellationToken token = default)
+    {
+        target = NormalizeBrowseTarget(target);
+        Task completion;
+        await _control.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            lock (_sync) ValidateBrowseTarget(target);
+            await CancelBrowseRequestsAsync().ConfigureAwait(false);
+            await PauseCoreAsync(closeWatchers: false).ConfigureAwait(false);
+            lock (_sync)
+            {
+                _generation++;
+                completion = RegisterBrowse(target, token);
+                if (!_explicitlyPaused) StartGeneration();
+                _suspendBrowse = false;
+            }
+            Wake();
+        }
+        finally { _control.Release(); }
+        await completion.ConfigureAwait(false);
+    }
+
+    private static LibraryBrowseTarget NormalizeBrowseTarget(LibraryBrowseTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        return target with { Path = Normalize(target.Path) };
+    }
+
+    private void ValidateBrowseTarget(LibraryBrowseTarget target)
+    {
+        if (FindReconciliationOwner(target.Path, target.IncludeSubdirectories) is null || IsIgnored(target.Path))
+            throw new ArgumentException($"No configured monitoring scope covers '{target.Path}'.", nameof(target));
+    }
+
+    // Called under _sync, after the previous active callback has drained.
+    private Task RegisterBrowse(LibraryBrowseTarget target, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return Task.FromCanceled(token);
+        ValidateBrowseTarget(target);
+        var request = new BrowseRequest(target, CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token));
+        _pendingBrowse = request;
+        return WaitForBrowseAsync(request);
+    }
+
+    private async Task WaitForBrowseAsync(BrowseRequest request)
+    {
+        using (request.Cancellation)
+        using (request.Cancellation.Token.Register(() =>
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_pendingBrowse, request))
+                {
+                    _pendingBrowse = null;
+                    request.Completion.TrySetCanceled(request.Cancellation.Token);
+                }
+            }
+            Wake();
+        }))
+            await request.Completion.Task.ConfigureAwait(false);
+    }
+
+    private async Task CancelBrowseRequestsAsync()
+    {
+        BrowseRequest[] requests;
+        lock (_sync) requests = new[] { _pendingBrowse, _activeBrowse }.OfType<BrowseRequest>().Distinct().ToArray();
+        foreach (var request in requests)
+        {
+            try { await request.Cancellation.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { /* A completed callback already released this request. */ }
+        }
+    }
+
+    private void ValidatePendingBrowse()
+    {
+        if (_pendingBrowse is not { } request) return;
+        if (FindReconciliationOwner(request.Target.Path, request.Target.IncludeSubdirectories) is not null && !IsIgnored(request.Target.Path)) return;
+        _pendingBrowse = null;
+        request.Completion.TrySetCanceled();
+    }
+
     private string[] NormalizeReconciliationPaths(IEnumerable<string> paths)
     {
         ArgumentNullException.ThrowIfNull(paths);
@@ -364,11 +483,13 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
 
     private bool BatchCovers(LibraryMonitorBatch batch, ReconciliationTarget target) =>
         batch.ReconcileRoots.Any(path => _roots.TryGetValue(path, out var root) && Covers(path, root.IncludeSubdirectories, target)) ||
-        (batch.DirectoryChanges ?? []).Any(change => _roots.TryGetValue(change.OwnerRoot, out var owner) && Covers(change.Path, owner.IncludeSubdirectories, target));
+        (batch.DirectoryChanges ?? []).Any(change => _roots.TryGetValue(change.OwnerRoot, out var owner) && Covers(change.Path, owner.IncludeSubdirectories, target)) ||
+        batch.BrowseTarget is { } browse && Covers(browse.Path, browse.IncludeSubdirectories, target);
 
     private void EnsureReconciliationQueued(ReconciliationTarget target)
     {
-        if (_activeBatch is not null && _activeBatch.Generation == _generation && BatchCovers(_activeBatch, target)) return;
+        if (_activeBatch is not null && (_activeBatch.BrowseTarget is not null || _activeBatch.Generation == _generation) &&
+            BatchCovers(_activeBatch, target)) return;
         if (_roots.Values.Any(root => _dirty.Contains(root.Path) && Covers(root.Path, root.IncludeSubdirectories, target))) return;
         if (_directories.Any(pair => _roots.TryGetValue(pair.Value, out var owner) && Covers(pair.Key, owner.IncludeSubdirectories, target))) return;
         if (target.Path.Equals(target.OwnerRoot, StringComparison.OrdinalIgnoreCase)) _dirty.Add(target.OwnerRoot);
@@ -414,13 +535,23 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         _generationCancellation.Dispose();
         _generationCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _paused = false;
+        _suspendBrowse = false;
     }
 
     private async Task PauseCoreAsync(bool closeWatchers = true)
     {
-        CancellationTokenSource cancellation;
-        lock (_sync) { _paused = true; cancellation = _generationCancellation; }
+        CancellationTokenSource cancellation; CancellationTokenSource? browseCancellation;
+        lock (_sync)
+        {
+            _paused = true; _suspendBrowse = true; _workInterruption++;
+            cancellation = _generationCancellation; browseCancellation = _activeBrowseCancellation;
+        }
         await cancellation.CancelAsync().ConfigureAwait(false);
+        if (browseCancellation is not null)
+        {
+            try { await browseCancellation.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { /* The callback completed before cancellation reached it. */ }
+        }
         Wake();
         await _work.WaitAsync().ConfigureAwait(false);
         try
@@ -450,80 +581,34 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
                 await _work.WaitAsync(_lifetime.Token).ConfigureAwait(false);
                 try
                 {
-                    long generation; CancellationToken token;
+                    long generation, interruption; CancellationToken token;
+                    BrowseRequest? browse;
                     lock (_sync)
                     {
-                        if (_paused) continue;
-                        generation = _generation; token = _generationCancellation.Token;
+                        browse = !_suspendBrowse ? _pendingBrowse : null;
+                        if (browse is not null)
+                        {
+                            _pendingBrowse = null; _activeBrowse = browse;
+                            _activeBrowseCancellation = CancellationTokenSource.CreateLinkedTokenSource(browse.Cancellation.Token, _lifetime.Token);
+                            token = _activeBrowseCancellation.Token;
+                        }
+                        else
+                        {
+                            if (_paused) continue;
+                            token = _generationCancellation.Token;
+                        }
+                        generation = _generation; interruption = _workInterruption;
                     }
-                    MaintainRoots(generation, token);
-                    token.ThrowIfCancellationRequested();
-                    var batch = TakeBatch(generation);
-                    if (batch is null) continue;
-                    try
+                    if (browse is not null)
+                        await ProcessBrowseAsync(browse, generation, interruption, token).ConfigureAwait(false);
+                    else
                     {
-                        await _callback(batch, token).ConfigureAwait(false);
+                        MaintainRoots(generation, token);
                         token.ThrowIfCancellationRequested();
-                        lock (_sync)
-                        {
-                            token.ThrowIfCancellationRequested();
-                            if (_paused || generation != _generation)
-                                throw new OperationCanceledException("Reconciliation generation stopped before acknowledgement.", token);
-                            var completedAt = UtcNow;
-                            foreach (var path in batch.ReconcileRoots)
-                            {
-                                if (!_roots.TryGetValue(path, out var reconciled)) continue;
-                                // A long scan must be followed by a quiet interval, not another
-                                // immediately overdue periodic scan. Real events arriving during
-                                // this callback remain in _dirty and are not acknowledged here.
-                                reconciled.NextReconciliation = completedAt + _options.ReconciliationInterval;
-                                _completedReconciliations++;
-                                _lastReconciliationCompletedAtUtc = completedAt;
-                            }
-                            _completedDirectoryReconciliations += batch.DirectoryChanges?.Count ?? 0;
-                            foreach (var state in batch.RootStates.Where(state => state.ErrorCode == "ConsumerFailedRetryScheduled"))
-                                if (_roots.TryGetValue(state.Path, out var root)) root.PendingState = root.LastState;
-                            // A waiter continuation may immediately request another pass.
-                            // Do not let it join this already acknowledged callback.
-                            _activeBatch = null;
-                            CompleteReconciliationWaiters(batch);
-                        }
+                        var batch = TakeBatch(generation);
+                        if (batch is not null)
+                            await ProcessBackgroundAsync(batch, generation, interruption, token).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested || IsGenerationStopped(generation))
-                    {
-                        lock (_sync)
-                        {
-                            foreach (var path in batch.ReconcileRoots) _dirty.Add(path);
-                            foreach (var path in batch.RevalidateContentRoots ?? []) _revalidateContent.Add(path);
-                            // Replaying an interrupted path check does not justify invalidating
-                            // every cached hash in its root. AddPath escalates only on real overflow.
-                            foreach (var path in batch.ChangedPaths)
-                                foreach (var root in _roots.Keys.Where(root => Under(path, root))) AddPath(path, root);
-                            foreach (var change in batch.DirectoryChanges ?? [])
-                                if (_roots.ContainsKey(change.OwnerRoot)) AddDirectory(change.Path, change.OwnerRoot);
-                        }
-                    }
-                    catch
-                    {
-                        // A failed consumer cannot acknowledge dirtiness. Retry a complete root reconciliation.
-                        lock (_sync)
-                        {
-                            var affected = batch.ReconcileRoots.Concat(batch.RootStates.Select(state => state.Path))
-                                .Concat((batch.DirectoryChanges ?? []).Select(change => change.OwnerRoot))
-                                .Concat(_roots.Keys.Where(root => batch.ChangedPaths.Any(path => Under(path, root))))
-                                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                            foreach (var path in affected)
-                            {
-                                _dirty.Add(path);
-                                if ((batch.RevalidateContentRoots ?? []).Contains(path) || batch.ChangedPaths.Any(changed => Under(changed, path)))
-                                    _revalidateContent.Add(path);
-                                var root = _roots[path];
-                                root.PendingState = new(path, FileAvailability.NeedsVerification, root.Watcher is not null, "ConsumerFailedRetryScheduled");
-                            }
-                            _callbackRetryAt = UtcNow + _options.MaximumRetryDelay;
-                        }
-                    }
-                    finally { lock (_sync) _activeBatch = null; }
                 }
                 catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested) { }
                 finally { _work.Release(); }
@@ -532,76 +617,232 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
     }
 
-    private void MaintainRoots(long generation, CancellationToken token)
+    private async Task ProcessBackgroundAsync(LibraryMonitorBatch batch, long generation, long interruption, CancellationToken token)
     {
-        foreach (var root in _roots.Values)
+        try
         {
-            token.ThrowIfCancellationRequested();
-            var now = UtcNow;
-            bool restart;
-            lock (_sync) { restart = root.RestartRequested; root.RestartRequested = false; }
-            if (restart) { root.RevalidateWhenWatched = true; root.Watcher?.Dispose(); root.Watcher = null; root.NextProbe = default; }
-            if (now < root.NextProbe) continue;
-            root.NextProbe = now + _options.RootProbeInterval;
-            FileSystemProbeResult result;
-            try { result = _probe.ProbeRoot(root.Path); }
-            catch { result = new(root.Path, FileAvailability.NeedsVerification, now, ErrorCode: "RootProbeFailed"); }
-            token.ThrowIfCancellationRequested();
-            var availability = result.Availability;
-            string? error = result.ErrorCode;
-            if (availability != FileAvailability.Available)
-            {
-                root.RevalidateWhenAvailable = true;
-                root.RevalidateWhenWatched = root.Watcher is not null || root.RevalidateWhenWatched;
-                root.Watcher?.Dispose(); root.Watcher = null;
-            }
-            else
-            {
-                if (root.RevalidateWhenAvailable)
-                {
-                    lock (_sync) { _dirty.Add(root.Path); _revalidateContent.Add(root.Path); }
-                    root.RevalidateWhenAvailable = false;
-                }
-            }
-            if (availability == FileAvailability.Available && root.Watcher is null)
-            {
-                if (_roots.Values.Count(candidate => candidate.Watcher is not null) >= _options.MaximumWatchers)
-                { availability = FileAvailability.NeedsVerification; error = "WatcherLimitPeriodicFallback"; }
-                else if (now >= root.NextWatchAttempt)
-                {
-                    try
-                    {
-                        root.Watcher = _factory.Watch(root.Path, root.IncludeSubdirectories,
-                            change => OnChange(root, change), _ => OnWatcherError(root));
-                        root.Failures = 0; root.NextWatchAttempt = default;
-                        lock (_sync)
-                        {
-                            _dirty.Add(root.Path);
-                            if (root.RevalidateWhenWatched) { _revalidateContent.Add(root.Path); root.RevalidateWhenWatched = false; }
-                        }
-                    }
-                    catch
-                    {
-                        availability = FileAvailability.NeedsVerification; error = "WatcherFailedPeriodicFallback";
-                        root.RevalidateWhenWatched = true;
-                        root.Failures = Math.Min(root.Failures + 1, 16);
-                        root.NextWatchAttempt = now + TimeSpan.FromMilliseconds(Math.Min(_options.MaximumRetryDelay.TotalMilliseconds,
-                            _options.RetryDelay.TotalMilliseconds * Math.Pow(2, root.Failures - 1)));
-                    }
-                }
-                else { availability = FileAvailability.NeedsVerification; error = "WatcherRetryPending"; }
-            }
-            var state = new LibraryRootState(root.Path, availability, root.Watcher is not null, error);
+            await _callback(batch, token).ConfigureAwait(false);
             lock (_sync)
             {
-                if (state != root.LastState)
+                token.ThrowIfCancellationRequested();
+                if (_paused || generation != _generation || interruption != _workInterruption)
+                    throw new OperationCanceledException("Reconciliation generation stopped before acknowledgement.", token);
+                // A continuation may request another pass immediately after acknowledgement.
+                _activeBatch = null;
+                AcknowledgeBatch(batch);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested || IsGenerationStopped(generation))
+        { lock (_sync) RestoreInterruptedBatch(batch); }
+        catch
+        { lock (_sync) RecordConsumerFailure(batch); }
+        finally { lock (_sync) _activeBatch = null; }
+    }
+
+    private async Task ProcessBrowseAsync(BrowseRequest request, long generation, long interruption, CancellationToken token)
+    {
+        LibraryMonitorBatch? acknowledgement = null;
+        try
+        {
+            // Only the explicitly selected exact root is probed/subscribed here. A
+            // slow unrelated root must not delay the selected folder. Initial watcher
+            // dirtiness is recorded before taking this pass, avoiding a second scan.
+            if (_roots.TryGetValue(request.Target.Path, out var exact)) MaintainRoot(exact, token);
+            token.ThrowIfCancellationRequested();
+            LibraryMonitorBatch batch;
+            lock (_sync)
+            {
+                token.ThrowIfCancellationRequested();
+                var roots = _roots.TryGetValue(request.Target.Path, out exact) && _dirty.Contains(exact.Path) &&
+                    (request.Target.IncludeSubdirectories || !exact.IncludeSubdirectories) ? new[] { exact.Path } : [];
+                foreach (var root in roots) _dirty.Remove(root);
+                var directories = _directories.Where(pair => _roots.TryGetValue(pair.Value, out var owner) &&
+                    Covers(request.Target.Path, request.Target.IncludeSubdirectories,
+                        new ReconciliationTarget(pair.Key, pair.Value, owner.IncludeSubdirectories)))
+                    .Select(pair => new LibraryDirectoryChange(pair.Value, pair.Key)).ToArray();
+                foreach (var directory in directories) _directories.Remove(directory.Path);
+                var revalidate = roots.Where(root => _revalidateContent.Remove(root)).ToArray();
+                var states = _roots.TryGetValue(request.Target.Path, out exact) && exact.PendingState is { } state
+                    ? new[] { state } : [];
+                // Background coverage is internal bookkeeping. The consumer receives
+                // one immutable browse target, never a second duplicate scan marker.
+                acknowledgement = new(generation, [], roots, states, revalidate, directories);
+                // Keep PendingState until the ordinary state stream acknowledges it;
+                // cancellation cannot lose this observation while background is paused.
+                batch = new(generation, [], [], states, revalidate, BrowseTarget: request.Target);
+                _activeBatch = batch;
+            }
+            await _callback(batch, token).ConfigureAwait(false);
+            lock (_sync)
+            {
+                token.ThrowIfCancellationRequested();
+                request.Cancellation.Token.ThrowIfCancellationRequested();
+                // Resume changes the background generation without interrupting this
+                // foreground reader. Configuration/Stop have their own interruption stamp.
+                if (interruption != _workInterruption)
+                    throw new OperationCanceledException("Browse stopped before acknowledgement.", token);
+                _activeBatch = null;
+                AcknowledgeBatch(acknowledgement);
+                CompleteReconciliationWaiters(batch);
+                request.Completion.TrySetResult();
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested || interruption != Volatile.Read(ref _workInterruption))
+        {
+            lock (_sync)
+            {
+                RestoreInterruptedBrowse(acknowledgement);
+                if (!request.Cancellation.IsCancellationRequested && !_disposed && _pendingBrowse is null)
+                    _pendingBrowse = request; // Configuration interrupted an attempt, not the user's request.
+                else request.Completion.TrySetCanceled(request.Cancellation.Token);
+            }
+        }
+        catch (Exception exception)
+        {
+            lock (_sync)
+            {
+                RestoreInterruptedBrowse(acknowledgement);
+                request.Completion.TrySetException(exception);
+            }
+        }
+        finally
+        {
+            CancellationTokenSource? attempt;
+            lock (_sync)
+            {
+                _activeBatch = null; _activeBrowse = null;
+                attempt = _activeBrowseCancellation; _activeBrowseCancellation = null;
+            }
+            attempt?.Dispose();
+        }
+    }
+
+    // All acknowledgement/replay helpers run under _sync after the real callback has returned.
+    private void RestoreInterruptedBrowse(LibraryMonitorBatch? acknowledgement)
+    {
+        _activeBatch = null;
+        if (acknowledgement is not null) RestoreInterruptedBatch(acknowledgement);
+        // A manual request may have joined a browse on an otherwise quiet root.
+        // It has no captured dirty marker to replay, but still requires a real pass.
+        foreach (var waiter in _reconciliationWaiters.Where(waiter => !waiter.Completion.Task.IsCompleted))
+            foreach (var target in waiter.Targets) EnsureReconciliationQueued(target);
+    }
+
+    private void AcknowledgeBatch(LibraryMonitorBatch batch)
+    {
+        var completedAt = UtcNow;
+        foreach (var path in batch.ReconcileRoots)
+        {
+            if (!_roots.TryGetValue(path, out var reconciled)) continue;
+            reconciled.NextReconciliation = completedAt + _options.ReconciliationInterval;
+            _completedReconciliations++;
+            _lastReconciliationCompletedAtUtc = completedAt;
+        }
+        _completedDirectoryReconciliations += batch.DirectoryChanges?.Count ?? 0;
+        foreach (var state in batch.RootStates.Where(state => state.ErrorCode == "ConsumerFailedRetryScheduled"))
+            if (_roots.TryGetValue(state.Path, out var root)) root.PendingState = root.LastState;
+        CompleteReconciliationWaiters(batch);
+    }
+
+    private void RestoreInterruptedBatch(LibraryMonitorBatch batch)
+    {
+        foreach (var path in batch.ReconcileRoots) _dirty.Add(path);
+        foreach (var path in batch.RevalidateContentRoots ?? []) _revalidateContent.Add(path);
+        foreach (var path in batch.ChangedPaths)
+            foreach (var root in _roots.Keys.Where(root => Under(path, root))) AddPath(path, root);
+        foreach (var change in batch.DirectoryChanges ?? [])
+            if (_roots.ContainsKey(change.OwnerRoot)) AddDirectory(change.Path, change.OwnerRoot);
+    }
+
+    private void RecordConsumerFailure(LibraryMonitorBatch batch)
+    {
+        var affected = batch.ReconcileRoots.Concat(batch.RootStates.Select(state => state.Path))
+            .Concat((batch.DirectoryChanges ?? []).Select(change => change.OwnerRoot))
+            .Concat(_roots.Keys.Where(root => batch.ChangedPaths.Any(path => Under(path, root))))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in affected)
+        {
+            _dirty.Add(path);
+            if ((batch.RevalidateContentRoots ?? []).Contains(path) || batch.ChangedPaths.Any(changed => Under(changed, path)))
+                _revalidateContent.Add(path);
+            var root = _roots[path];
+            root.PendingState = new(path, FileAvailability.NeedsVerification, root.Watcher is not null, "ConsumerFailedRetryScheduled");
+        }
+        _callbackRetryAt = UtcNow + _options.MaximumRetryDelay;
+    }
+
+    private void MaintainRoots(long generation, CancellationToken token)
+    {
+        foreach (var root in _roots.Values) MaintainRoot(root, token);
+    }
+
+    private void MaintainRoot(Root root, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var now = UtcNow;
+        bool restart;
+        lock (_sync) { restart = root.RestartRequested; root.RestartRequested = false; }
+        if (restart) { root.RevalidateWhenWatched = true; root.Watcher?.Dispose(); root.Watcher = null; root.NextProbe = default; }
+        if (now < root.NextProbe) return;
+        root.NextProbe = now + _options.RootProbeInterval;
+        FileSystemProbeResult result;
+        try { result = _probe.ProbeRoot(root.Path); }
+        catch { result = new(root.Path, FileAvailability.NeedsVerification, now, ErrorCode: "RootProbeFailed"); }
+        token.ThrowIfCancellationRequested();
+        var availability = result.Availability;
+        string? error = result.ErrorCode;
+        if (availability != FileAvailability.Available)
+        {
+            root.RevalidateWhenAvailable = true;
+            root.RevalidateWhenWatched = root.Watcher is not null || root.RevalidateWhenWatched;
+            root.Watcher?.Dispose(); root.Watcher = null;
+        }
+        else
+        {
+            if (root.RevalidateWhenAvailable)
+            {
+                lock (_sync) { _dirty.Add(root.Path); _revalidateContent.Add(root.Path); }
+                root.RevalidateWhenAvailable = false;
+            }
+        }
+        if (availability == FileAvailability.Available && root.Watcher is null)
+        {
+            if (_roots.Values.Count(candidate => candidate.Watcher is not null) >= _options.MaximumWatchers)
+            { availability = FileAvailability.NeedsVerification; error = "WatcherLimitPeriodicFallback"; }
+            else if (now >= root.NextWatchAttempt)
+            {
+                try
                 {
-                    root.PendingState = state; root.LastState = state; _dirty.Add(root.Path);
+                    root.Watcher = _factory.Watch(root.Path, root.IncludeSubdirectories,
+                        change => OnChange(root, change), _ => OnWatcherError(root));
+                    root.Failures = 0; root.NextWatchAttempt = default;
+                    lock (_sync)
+                    {
+                        _dirty.Add(root.Path);
+                        if (root.RevalidateWhenWatched) { _revalidateContent.Add(root.Path); root.RevalidateWhenWatched = false; }
+                    }
                 }
-                if (now >= root.NextReconciliation)
+                catch
                 {
-                    _dirty.Add(root.Path); root.NextReconciliation = now + _options.ReconciliationInterval;
+                    availability = FileAvailability.NeedsVerification; error = "WatcherFailedPeriodicFallback";
+                    root.RevalidateWhenWatched = true;
+                    root.Failures = Math.Min(root.Failures + 1, 16);
+                    root.NextWatchAttempt = now + TimeSpan.FromMilliseconds(Math.Min(_options.MaximumRetryDelay.TotalMilliseconds,
+                        _options.RetryDelay.TotalMilliseconds * Math.Pow(2, root.Failures - 1)));
                 }
+            }
+            else { availability = FileAvailability.NeedsVerification; error = "WatcherRetryPending"; }
+        }
+        var state = new LibraryRootState(root.Path, availability, root.Watcher is not null, error);
+        lock (_sync)
+        {
+            if (state != root.LastState)
+            {
+                root.PendingState = state; root.LastState = state; _dirty.Add(root.Path);
+            }
+            if (now >= root.NextReconciliation)
+            {
+                _dirty.Add(root.Path); root.NextReconciliation = now + _options.ReconciliationInterval;
             }
         }
     }
@@ -759,6 +1000,7 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            await CancelBrowseRequestsAsync().ConfigureAwait(false);
             lock (_sync)
             {
                 foreach (var waiter in _reconciliationWaiters)
@@ -775,6 +1017,12 @@ public sealed class LibraryChangeCoordinator : IAsyncDisposable
     }
 
     private sealed record ReconciliationTarget(string Path, string OwnerRoot, bool Recursive);
+    private sealed class BrowseRequest(LibraryBrowseTarget target, CancellationTokenSource cancellation)
+    {
+        public LibraryBrowseTarget Target { get; } = target;
+        public CancellationTokenSource Cancellation { get; } = cancellation;
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
     private sealed class ReconciliationWaiter(List<ReconciliationTarget> targets)
     {
         public List<ReconciliationTarget> Targets { get; } = targets;

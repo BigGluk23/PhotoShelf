@@ -68,13 +68,16 @@ public partial class MainWindow
         var activity = _libraryMonitor?.Activity;
         var monitorWork = activity is { IsPaused: false } &&
             (activity.IsProcessing || activity.PendingReconciliationRootCount > 0 || activity.PendingDirectoryCount > 0);
-        CancelScanButton.IsEnabled = !_searchStopping && !_searchStopped && !_backgroundProcessingPaused &&
+        var browsing = _browseCancellation is { IsCancellationRequested: false } || activity?.BrowseTarget is not null;
+        CancelScanButton.IsEnabled = !_searchStopping && (!_searchStopped || browsing) && !_backgroundProcessingPaused &&
             !_fileOperationActive && !_closing &&
             (scanning || !_scanTask.IsCompleted || !_browseTask.IsCompleted || monitorWork || _pendingFolderScans.Count > 0);
         CancelScanButton.Content = _searchStopping ? "Останавливаю поиск…" : "×  Остановить поиск";
         CancelScanButton.ToolTip = "Остановить поиск и сверку папок. Метаданные управляются отдельно в «Операциях».";
         if (_searchStopping) LibraryStatusText.Text = "Поиск: останавливаю…";
         else if (_searchStopError is not null) LibraryStatusText.Text = _searchStopError;
-        else if (_searchStopped) LibraryStatusText.Text = "Поиск остановлен · автообновление: пауза";
+        else if (_searchStopped) LibraryStatusText.Text = browsing
+            ? "Читаю выбранную папку · автообновление: пауза"
+            : "Поиск остановлен · автообновление: пауза";
     }
 }

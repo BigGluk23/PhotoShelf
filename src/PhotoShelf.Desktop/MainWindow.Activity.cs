@@ -61,7 +61,9 @@ public partial class MainWindow
             _backgroundProcessingPaused ? "Фоновая обработка приостановлена. Просмотр уже добавленных файлов доступен." :
             !_metadataTask.IsCompleted || !_scanTask.IsCompleted || !_browseTask.IsCompleted || activity?.IsProcessing == true
                 ? "Выполняются фоновые задачи" : "Фоновые задачи сейчас не выполняются";
-        var monitor = activity is null ? "Не запущено" : activity.IsPaused ? "Пауза" : activity.IsProcessing
+        var monitor = activity is null ? "Не запущено" : activity.BrowseTarget is { } browse
+            ? $"Чтение выбранной папки: {browse.Path}" + (activity.IsPaused ? "; автообновление на паузе" : "")
+            : activity.IsPaused ? "Пауза" : activity.IsProcessing
             ? activity.ActiveReconciliationRoots.Count > 0 ? "Сверка: " + string.Join(", ", activity.ActiveReconciliationRoots) : "Обработка файловых событий"
             : "Ожидание изменений";
         var details = $"Поиск файлов: {(_searchStopping ? "останавливается" : _searchStopped ? "остановлен; новый поиск возобновит автообновление" : !_scanTask.IsCompleted || !_browseTask.IsCompleted ? "выполняется" : "не выполняется")}\n" +
@@ -98,9 +100,9 @@ public partial class MainWindow
             await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
             if (!_backgroundProcessingPaused)
             {
-                QueueLibraryMonitoring();
                 StartMetadataIndexing(false);
                 if (_viewMode == LibraryViewMode.Folder && _activeFolder is not null) _ = BrowseFolderAsync(_activeFolder);
+                else QueueLibraryMonitoring();
             }
         }
         finally { _backgroundPauseChanging = false; }
