@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using PhotoShelf.Application.Catalog;
 using PhotoShelf.Infrastructure.Sqlite;
 using Xunit;
@@ -138,7 +139,7 @@ public sealed class MainWindowSearchTests
         node.ApplyInclusion(rules);
         var checkbox = new CheckBox { DataContext = node };
 
-        Invoke(fixture.Window, "OnFolderIncludedChanged", checkbox, new RoutedEventArgs());
+        Invoke(fixture.Window, "OnFolderIncludedChanged", checkbox, new RoutedEventArgs(ButtonBase.ClickEvent, checkbox));
         Assert.True(node.CheckState);
         Assert.Contains(fixture.Root, Field<HashSet<string>>(fixture.Window, "_pendingFolderScans"));
         await InvokeTask(fixture.Window, "StopSearchAsync").WaitAsync(TimeSpan.FromSeconds(10));
@@ -161,6 +162,36 @@ public sealed class MainWindowSearchTests
         Assert.Equal(1, fixture.FullTraversalCount);
         Assert.Equal(1, await fixture.CountAsync());
         Assert.Equal(before, await Fingerprint.ReadAsync(original));
+    });
+
+    [Fact]
+    public Task SearchingExcludedRootScansOnlyItsExplicitlyIncludedChild() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        await using var fixture = await SearchFixture.CreateAsync();
+        var includedFolder = Path.Combine(fixture.Root, "photos");
+        Directory.CreateDirectory(includedFolder);
+        Directory.CreateDirectory(Path.Combine(fixture.Root, "excluded-sibling"));
+        var included = await fixture.CreatePngAsync(Path.Combine("photos", "included.png"));
+        var excluded = await fixture.CreatePngAsync(Path.Combine("excluded-sibling", "excluded.png"));
+        var includedBefore = await Fingerprint.ReadAsync(included);
+        var excludedBefore = await Fingerprint.ReadAsync(excluded);
+        var rules = Field<FolderInclusionRules>(fixture.Window, "_folderInclusion");
+        rules.SetIncluded(fixture.Root, false);
+        rules.SetIncluded(includedFolder, true);
+
+        // Request the excluded ancestor, as a full search/checkbox action does.
+        // Success must await the intersection with the actual included library roots.
+        Assert.True(await fixture.ScanAsync().WaitAsync(TimeSpan.FromSeconds(15)));
+        await fixture.WaitForMonitorIdleAsync();
+        Assert.Equal([includedFolder], fixture.FullTraversalRoots);
+        Assert.Equal([includedFolder], fixture.Watchers.ActiveRoots);
+        Assert.Equal(0, fixture.FullTraversalCount);
+        Assert.Equal(1, fixture.Monitor.Activity.CompletedReconciliationCount);
+        Assert.NotNull(await fixture.Store.GetItemAsync(included));
+        Assert.Null(await fixture.Store.GetItemAsync(excluded));
+        Assert.Equal(1, await fixture.CountAsync());
+        Assert.Equal(includedBefore, await Fingerprint.ReadAsync(included));
+        Assert.Equal(excludedBefore, await Fingerprint.ReadAsync(excluded));
     });
 
     private static async Task AssertCommittedOriginalAsync(SqliteDesktopCatalogStore store, string path,
@@ -187,6 +218,7 @@ public sealed class MainWindowSearchTests
         public SqliteDesktopCatalogStore Store { get; }
         public ControlledWatchers Watchers { get; } = new();
         public LibraryChangeCoordinator Monitor => Field<LibraryChangeCoordinator>(Window, "_libraryMonitor");
+        public string[] FullTraversalRoots => _batches.SelectMany(batch => batch.ReconcileRoots).ToArray();
         public int FullTraversalCount => _batches.Sum(batch => batch.ReconcileRoots.Count(path =>
             path.Equals(Root, StringComparison.OrdinalIgnoreCase)));
 
@@ -244,7 +276,7 @@ public sealed class MainWindowSearchTests
             return reader;
         }
 
-        public Task ScanAsync() => InvokeTask(Window, "ScanRootsAsync", new[] { Root }, false);
+        public Task<bool> ScanAsync() => (Task<bool>)InvokeTask(Window, "ScanRootsAsync", new[] { Root }, false);
 
         public Task<long> CountAsync() => Store.CountAsync(new CatalogViewQuery
             { Folder = Root, ViewMode = "Folder", IncludeSubfolders = true, IncludeSystemFolders = true });
@@ -268,7 +300,7 @@ public sealed class MainWindowSearchTests
             // Unloaded cancels previews but is not proof that a synchronous codec
             // has closed its file. Drain those real readers before fixture cleanup.
             using var previews = await AsyncMediaImage.PauseForFileOperationsAsync(
-                Directory.EnumerateFiles(Root).ToHashSet(StringComparer.OrdinalIgnoreCase));
+                Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).ToHashSet(StringComparer.OrdinalIgnoreCase));
             var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Window.Closed += (_, _) => closed.TrySetResult();
             Window.Close();
@@ -315,6 +347,7 @@ public sealed class MainWindowSearchTests
     private sealed class ControlledWatchers : ILibraryWatcherFactory
     {
         private readonly ConcurrentDictionary<string, Watcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
+        public string[] ActiveRoots => _watchers.Where(pair => !pair.Value.IsDisposed).Select(pair => pair.Key).ToArray();
         public IDisposable Watch(string root, bool includeSubdirectories, Action<LibraryWatchEvent> onChange, Action<Exception> onError)
         {
             var watcher = new Watcher(onChange);

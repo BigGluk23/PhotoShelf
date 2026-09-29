@@ -69,6 +69,10 @@ public partial class MainWindow
             var rules = _folderInclusion.Snapshot();
             var browse = _viewMode == LibraryViewMode.Folder ? _activeFolder : null;
             var libraryRoots = LibraryFolderScope.IncludedRoots(_watchedFolders, rules);
+            var reconciliationTargets = requestedRoots is null ? null : LibraryFolderScope.ReconciliationTargets(requestedRoots, libraryRoots)
+                .Where(path => rules.MayContainIncluded(path) && !PhotoScanner.IsIgnoredPath(path, _includeSystemFolders) &&
+                    !path.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+                        .Any(part => part.StartsWith(".photoshelf-", StringComparison.OrdinalIgnoreCase))).ToArray();
             var roots = libraryRoots.ToList();
             if (browse is not null) roots.Add(browse);
             roots = roots.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToList();
@@ -110,11 +114,11 @@ public partial class MainWindow
                         !libraryRoots.Any(parent => LibraryCatalogSynchronizer.IsUnder(root, parent))).ToArray());
                 if (_monitorRulesKey.Length > 0 && _monitorRulesKey != rulesKey) _libraryMonitor.RequestReconciliation();
                 if (requestedRoots is null) await _libraryMonitor.ConfigureAsync(configuration);
-                else reconciliation = (await _libraryMonitor.ConfigureAndReconcileAsync(configuration, requestedRoots, requestToken)).Completion;
+                else reconciliation = (await _libraryMonitor.ConfigureAndReconcileAsync(configuration, reconciliationTargets!, requestToken)).Completion;
                 _monitorRulesKey = rulesKey;
                 _monitorConfigurationKey = key;
             }
-            else if (requestedRoots is not null) reconciliation = _libraryMonitor.ReconcileAsync(requestedRoots, requestToken);
+            else if (requestedRoots is not null) reconciliation = _libraryMonitor.ReconcileAsync(reconciliationTargets!, requestToken);
             if (_monitorPaused && !_backgroundProcessingPaused && !_searchStopped)
             {
                 await _libraryMonitor.ResumeAsync(reconcileAllRoots: requestedRoots is null);

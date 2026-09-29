@@ -8,6 +8,32 @@ public sealed class LibraryFolderScopeTests
     private static string Root => Path.Combine(Path.GetTempPath(), "photoshelf-scope");
 
     [Fact]
+    public void BroadRequestTargetsOnlyIncludedChildrenOfExcludedDrive()
+    {
+        var photos = Path.Combine(Root, "photos");
+        var videos = Path.Combine(Root, "videos");
+        var elsewhere = Root + "-other";
+        var included = LibraryFolderScope.IncludedRoots([Root, elsewhere], new([Root], [photos, videos]));
+        Assert.Equal([photos, videos], LibraryFolderScope.ReconciliationTargets([Root], included));
+    }
+
+    [Fact]
+    public void NarrowRequestsStayNarrowAndOverlappingRequestsAreDeduplicated()
+    {
+        var photos = Path.Combine(Root, "photos");
+        var nested = Path.Combine(photos, "nested");
+        Assert.Equal([photos], LibraryFolderScope.ReconciliationTargets([photos, nested, photos + Path.DirectorySeparatorChar], [Root]));
+    }
+
+    [Fact]
+    public void CompletelyExcludedAndSiblingPrefixRequestsDoNotScanOtherLibraryScopes()
+    {
+        Assert.Empty(LibraryFolderScope.ReconciliationTargets([Root], []));
+        Assert.Empty(LibraryFolderScope.ReconciliationTargets([Root], [Root + "-other"]));
+        Assert.Empty(LibraryFolderScope.ReconciliationTargets([Root + "-other"], [Root]));
+    }
+
+    [Fact]
     public void ExcludedAncestorWatchesOnlyExplicitlyIncludedChildren()
     {
         var child = Path.Combine(Root, "photos");
