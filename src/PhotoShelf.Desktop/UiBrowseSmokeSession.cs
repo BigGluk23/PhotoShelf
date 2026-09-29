@@ -28,6 +28,12 @@ internal sealed class UiBrowseSmokeSession
     private bool _monitorObserved, _checkboxVerified, _directVerified, _recursiveVerified, _rapidVerified, _hashesVerified, _freshDiscoveryVerified;
     private double _firstPreviewMilliseconds;
     private double _firstDiscoveryMilliseconds;
+    private const int SearchSortFixtureCount = 96;
+    private readonly List<SearchSortFixture> _searchSortFixtures = [];
+    private readonly List<object> _searchSortCases = [];
+    private string? _expectedPublicationSearch;
+    private int _wrongSearchPublications, _searchSortAnchorChecks, _searchSortSelectionChecks, _searchSortHashesChecked;
+    private bool _searchSortVerified, _searchSortHashesVerified, _searchSortRapidVerified, _searchSortDecoderVerified;
 
     public async Task SeedCatalogAsync()
     {
@@ -164,6 +170,8 @@ internal sealed class UiBrowseSmokeSession
         _rapidVerified = true;
         await VerifyNoiseStabilityAsync(window, "direct-photo", _pictures, 1);
 
+        await VerifySearchSortAsync(window);
+
         _phase = "original-byte-verification";
         await Task.Run(() =>
         {
@@ -180,6 +188,123 @@ internal sealed class UiBrowseSmokeSession
         _closeRequested = true;
         window.Close();
     }
+
+    private async Task VerifySearchSortAsync(MainWindow window)
+    {
+        _phase = "search-sort-fixture";
+        var folder = Path.Combine(_mediaRoot, "SearchSort");
+        await Task.Run(() =>
+        {
+            Require(!Directory.Exists(folder), "Search/sort fixture directory already exists.");
+            Directory.CreateDirectory(folder);
+            for (var index = 0; index < SearchSortFixtureCount; index++)
+            {
+                var name = (index % 2 == 0 ? "p01-alpha-" : "p01-beta-") + index.ToString("D3") + ".png";
+                var path = Path.Combine(folder, name);
+                WritePng(path);
+                // Twelve distinct local dates in one month, eight equal ticks each.
+                // Path-ASC tie breaking must stay the same in both date directions.
+                File.SetLastWriteTime(path, new DateTime(2024, 3, 1 + index / 8, 12, 0, 0, DateTimeKind.Local));
+                _searchSortFixtures.Add(new(path, File.GetLastWriteTime(path), File.GetLastWriteTimeUtc(path),
+                    SHA256.HashData(File.ReadAllBytes(path))));
+            }
+        });
+        Require(_searchSortFixtures.Count == SearchSortFixtureCount && _searchSortFixtures.GroupBy(item => item.FileDate.Ticks).All(group => group.Count() == 8),
+            "Search/sort fixture lost its equal-date tie cases.");
+        window.BrowseSmokeSelectFolder(folder);
+        await SettleAsync(window, folder, SearchSortFixtureCount, false);
+        Require(window.BrowseSmokeNewestFirst, "Isolated search/sort fixture must start in the default descending date mode.");
+        await VerifySearchSortOrderAsync(window, folder, "", true, "all-desc");
+        await VerifySortReversalAsync(window, folder, "", false, "all-asc");
+        await VerifySortReversalAsync(window, folder, "", true, "all-desc-restored");
+
+        _phase = "search-alpha-desc";
+        window.BrowseSmokeSearch("p01-alpha");
+        await VerifySearchSortOrderAsync(window, folder, "p01-alpha", true, "search-desc");
+        await VerifySortReversalAsync(window, folder, "p01-alpha", false, "search-asc");
+        await VerifySortReversalAsync(window, folder, "p01-alpha", true, "search-desc-restored");
+
+        _phase = "rapid-search-supersession";
+        _expectedPublicationSearch = "p01-alpha";
+        var publications = _rowPublications;
+        // All three TextChanged events use the real production path. The obsolete
+        // requests must never publish after the final input, including its debounce.
+        window.BrowseSmokeSearch("");
+        window.BrowseSmokeSearch("p01-beta");
+        window.BrowseSmokeSearch("p01-alpha");
+        await VerifySearchSortOrderAsync(window, folder, "p01-alpha", true, "rapid-final-search");
+        Require(_wrongSearchPublications == 0 && _rowPublications > publications, "A superseded search published rows or the final search never published.");
+        _expectedPublicationSearch = null;
+        _searchSortRapidVerified = true;
+
+        _phase = "search-sort-original-byte-verification";
+        await Task.Run(() =>
+        {
+            foreach (var item in _searchSortFixtures)
+            {
+                Require(File.Exists(item.Path) && item.Sha256.SequenceEqual(SHA256.HashData(File.ReadAllBytes(item.Path))) &&
+                    File.GetLastWriteTimeUtc(item.Path) == item.ModifiedUtc, "Search/sort changed a synthetic original's bytes or modification time.");
+                _searchSortHashesChecked++;
+            }
+        });
+        _searchSortHashesVerified = _searchSortHashesChecked == SearchSortFixtureCount;
+        Require(_searchSortCases.Count == 7 && _searchSortSelectionChecks == 4 && _searchSortAnchorChecks == 4 &&
+            _searchSortDecoderVerified && _searchSortHashesVerified && window.BrowseSmokeMonitoringEnabled,
+            "Search/sort regression did not complete every required check with production monitoring enabled.");
+        _searchSortVerified = true;
+    }
+
+    private async Task VerifySortReversalAsync(MainWindow window, string folder, string search, bool newestFirst, string scenario)
+    {
+        _phase = scenario;
+        var items = window.BrowseSmokeSmallFixtureItems();
+        Require(items.Length >= 48 && window.BrowseSmokeNewestFirst != newestFirst, "Sort reversal needs the complete small fixture in the opposite direction.");
+        window.BrowseSmokeScrollToItem(items.Length / 2);
+        await window.Dispatcher.InvokeAsync(window.UpdateLayout, DispatcherPriority.ApplicationIdle);
+        var anchor = window.BrowseSmokeAnchor;
+        Require(anchor.Index > 0 && anchor.Path is not null, "Sort regression did not establish a noninitial viewport anchor.");
+        var selected = window.BrowseSmokeSelectVisiblePhoto(anchor.Path!);
+        await UntilAsync(() => Task.FromResult(window.BrowseSmokeDecodedPixels(selected.Path)), "Selected synthetic PNG did not decode before sorting.");
+        window.BrowseSmokeReverseDateSort();
+        await VerifySearchSortOrderAsync(window, folder, search, newestFirst, scenario);
+        Require(window.BrowseSmokeSelectionRetained(selected), "Date reversal changed the selected PhotoItem identity or lost its selection.");
+        _searchSortSelectionChecks++;
+        // Reversing a date order can move the anchor within its photo row. Only
+        // containment in the top visible row is required, never first-item equality.
+        Require(window.BrowseSmokeTopRowPaths.Contains(anchor.Path!, StringComparer.OrdinalIgnoreCase),
+            "Date reversal did not preserve the old path in the top visible photo row.");
+        _searchSortAnchorChecks++;
+        await UntilAsync(() => Task.FromResult(window.BrowseSmokeDecodedPixels(selected.Path)), "Selected synthetic PNG did not decode after sorting.");
+    }
+
+    private async Task VerifySearchSortOrderAsync(MainWindow window, string folder, string search, bool newestFirst, string scenario)
+    {
+        _phase = scenario;
+        // Oracle uses fixture file dates and normalized paths, never a second call
+        // to the SQL query under test. Literal substring semantics stay explicit.
+        var filtered = _searchSortFixtures.Where(item => NormalizeSmokePath(item.Path).Contains(search.ToUpperInvariant(), StringComparison.Ordinal));
+        var expected = (newestFirst ? filtered.OrderByDescending(item => item.FileDate.Ticks) : filtered.OrderBy(item => item.FileDate.Ticks))
+            .ThenBy(item => NormalizeSmokePath(item.Path), StringComparer.Ordinal).Select(item => item.Path).ToArray();
+        await UntilAsync(() => Task.FromResult(window.BrowseSmokePublishedSearch == search && window.BrowseSmokeNewestFirst == newestFirst &&
+            string.Equals(window.BrowseSmokePublishedFolder, folder, StringComparison.OrdinalIgnoreCase)), "Search/date mode did not publish the final query.");
+        await SettleAsync(window, folder, expected.Length, false);
+        await UntilAsync(() => Task.FromResult(window.BrowseSmokeSmallFixtureItems().Length == expected.Length), "Small search/sort fixture pages did not finish loading.");
+        var actual = window.BrowseSmokeSmallFixtureItems();
+        Require(window.BrowseSmokePublishedSearch == search && window.BrowseSmokeNewestFirst == newestFirst && window.BrowseSmokeMonitoringEnabled,
+            "Search/date query changed while validating its settled view, or monitoring was paused.");
+        Require(actual.Select(item => item.Path).SequenceEqual(expected, StringComparer.OrdinalIgnoreCase) &&
+            actual.Select(item => item.ViewIndex).SequenceEqual(Enumerable.Range(0, expected.Length).Select(index => (long)index)),
+            "Search/sort result is incomplete, duplicated, or ordered differently from fixture dates and path-ASC ties.");
+        var visible = window.BrowseSmokeTopRowPaths.FirstOrDefault();
+        Require(visible is not null && expected.Contains(visible, StringComparer.OrdinalIgnoreCase), "Search/sort has no expected file in the visible row.");
+        await UntilAsync(() => Task.FromResult(window.BrowseSmokeDecodedPixels(visible!)), "Search/sort visible PNG did not decode.");
+        _searchSortDecoderVerified = true;
+        _searchSortCases.Add(new { scenario, search, newestFirst, expectedCount = expected.Length, actualCount = actual.Length,
+            fullOrderVerified = true, equalDateTiesVerified = true, decodedVisiblePng = true, monitoringEnabled = true });
+    }
+
+    private static string NormalizeSmokePath(string path) => path.Replace('/', '\\').ToUpperInvariant();
+    private sealed record SearchSortFixture(string Path, DateTime FileDate, DateTime ModifiedUtc, byte[] Sha256);
 
     private async Task VerifyNoiseStabilityAsync(MainWindow window, string phase, string folder, int count)
     {
@@ -243,6 +368,8 @@ internal sealed class UiBrowseSmokeSession
         _rowPublications++;
         if (_expectedPublicationFolder is not null && sender is MainWindow window && window.PhotoRows is VirtualPhotoRows &&
             !string.Equals(window.BrowseSmokePublishedFolder, _expectedPublicationFolder, StringComparison.OrdinalIgnoreCase)) _wrongFolderPublications++;
+        if (_expectedPublicationSearch is not null && sender is MainWindow searchWindow && searchWindow.PhotoRows is VirtualPhotoRows &&
+            !string.Equals(searchWindow.BrowseSmokePublishedSearch, _expectedPublicationSearch, StringComparison.Ordinal)) _wrongSearchPublications++;
     }
     private void OnEmptyChanged(object sender, DependencyPropertyChangedEventArgs args) => _emptyTransitions++;
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
@@ -266,6 +393,11 @@ internal sealed class UiBrowseSmokeSession
         recursiveCountVerified = _recursiveVerified, checkboxVerified = _checkboxVerified, rapidSelectionVerified = _rapidVerified,
         wrongFolderPublications = _wrongFolderPublications, rowPublications = _rowPublications, emptyTransitions = _emptyTransitions,
         stability = _stability, originalHashesVerified = _hashesVerified, originalsChecked = _originalHashes.Count,
+        searchSort = new { passed = _searchSortVerified, fixtureCount = _searchSortFixtures.Count, hashesChecked = _searchSortHashesChecked,
+            originalHashesVerified = _searchSortHashesVerified, modificationTimesVerified = _searchSortHashesVerified,
+            selectionChecks = _searchSortSelectionChecks, anchorChecks = _searchSortAnchorChecks,
+            rapidSearchVerified = _searchSortRapidVerified, wrongSearchPublications = _wrongSearchPublications,
+            decodedPngVerified = _searchSortDecoderVerified, cases = _searchSortCases },
         decoderReadersDrained = _readersDrained, catalogWritersDrained = _writersDrained, gracefulExit = GracefulExit,
         elapsedMs = _elapsed.Elapsed.TotalMilliseconds, errorCount = ErrorReporter.ErrorCount, exitCode,
         scope = "Actual production handlers, WPF decoded PNG, SQLite, metadata and filesystem monitoring; synthetic files only. Video count, not video decoding. CPU is observational; no physical input/DPI matrix."

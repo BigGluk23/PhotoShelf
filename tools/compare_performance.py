@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -17,6 +18,63 @@ def summarize(values):
     center = statistics.median(values)
     return {"n": len(values), "p50": center, "p95": percentile(values, .95),
             "max": max(values), "mad": statistics.median(abs(x - center) for x in values)}
+
+
+def validate_catalog_integrity(report):
+    integrity = report.get("catalogDataIntegrity", {})
+    before, after = integrity.get("before"), integrity.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict) or integrity.get("unchanged") is not True:
+        raise ValueError("Missing or failed catalog media-row integrity check.")
+    for snapshot in (before, after):
+        digest = snapshot.get("sha256")
+        if snapshot.get("rowCount") != report["count"] or not isinstance(digest, str) or not re.fullmatch(r"[0-9A-Fa-f]{64}", digest):
+            raise ValueError("Invalid catalog media-row integrity snapshot.")
+    # The fixture paths differ per process: compare each catalog only with its own pre-workload snapshot.
+    if before["sha256"].lower() != after["sha256"].lower():
+        raise ValueError("Catalog media-row integrity changed during the UI query workload.")
+
+
+def projection_diagnostics(reports, metric_names):
+    stages = {"PreparationMs", "DebounceMs", "GroupsMs", "AnchorMs", "PrimeMs", "PublishMs", "TotalMs"}
+    scenarios = {name.removesuffix(".first_data_page") for name in metric_names if name.endswith(".first_data_page")}
+    grouped, availability = defaultdict(list), defaultdict(set)
+    for report in reports:
+        samples = report.get("projectionTimings")
+        if not isinstance(samples, list):
+            raise ValueError("Missing projection diagnostics availability record.")
+        expected = {(scenario, iteration) for scenario in scenarios for iteration in range(report["repetitions"])}
+        seen, operation_ids = set(), set()
+        for sample in samples:
+            key = (sample.get("scenario"), sample.get("iteration"))
+            if key not in expected or key in seen or type(sample.get("available")) is not bool:
+                raise ValueError("Invalid or repeated projection diagnostic sample.")
+            seen.add(key)
+            available = sample["available"]
+            availability[report["label"]].add(available)
+            if not available:
+                if any(sample.get(name) is not None for name in ("operationId", "outcome", "durations")):
+                    raise ValueError("Unavailable projection diagnostics contain invented stage data.")
+                continue
+            operation_id, durations = sample.get("operationId"), sample.get("durations")
+            if type(operation_id) is not int or operation_id <= 0 or operation_id in operation_ids or sample.get("outcome") != "published":
+                raise ValueError("Projection diagnostics did not identify a unique published operation.")
+            operation_ids.add(operation_id)
+            if not isinstance(durations, dict) or set(durations) != stages:
+                raise ValueError("Incomplete projection stage diagnostics.")
+            for stage, value in durations.items():
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("Invalid projection stage duration.")
+                grouped[(report["label"], key[0], stage)].append(value)
+        if seen != expected:
+            raise ValueError("Projection diagnostic samples are incomplete.")
+    result = {"scope": "Internal projection stages after the primary timers stop; diagnostic only, excluded from comparisons and gates."}
+    for label in ("baseline", "current"):
+        if len(availability[label]) != 1:
+            raise ValueError("Projection diagnostics availability changed within one revision.")
+        result[label] = {"available": True in availability[label], "stages": [
+            {"scenario": scenario, "stage": stage, "milliseconds": summarize(values)}
+            for (side, scenario, stage), values in sorted(grouped.items()) if side == label]}
+    return result
 
 
 def compare(paths):
@@ -34,6 +92,7 @@ def compare(paths):
             raise ValueError("UI cancellation/supersession verification was incomplete.")
         if report["warmups"] < 2 or report["repetitions"] < 5:
             raise ValueError("Warmups and repeated samples are required.")
+        validate_catalog_integrity(report)
     if reports[0]["revision"] != reports[3]["revision"] or reports[1]["revision"] != reports[2]["revision"]:
         raise ValueError("Each side must use one exact revision.")
     metrics = []
@@ -50,6 +109,7 @@ def compare(paths):
         runs.append(groups)
     if not runs[0] or any(set(run) != set(runs[0]) for run in runs):
         raise ValueError("Metric sets differ between runs.")
+    diagnostics = projection_diagnostics(reports, runs[0])
     # SQL correctness is part of the comparison: no faster-but-different query result is accepted.
     for name in (n for n in runs[0] if n.startswith("sql.")):
         fingerprints = {s["fingerprint"] for r in reports for s in r["samples"] if s["name"] == name}
@@ -81,11 +141,15 @@ def compare(paths):
             "baselineRevision": reference["revision"], "currentRevision": reports[1]["revision"],
             "count": reference["count"], "machine": reference["machine"], "scope": reference["scope"],
             "runOrder": [r["label"] for r in reports], "metrics": metrics, "memoryPeaks": memory,
+            "catalogDataIntegrity": {"allRunsUnchanged": True, "table": "desktop_media_items", "rowsPerSnapshot": reference["count"], "snapshotCount": 8},
+            "projectionDiagnostics": diagnostics,
             "limitations": ["Same host and same job; hosted-runner CPU/storage interference can still occur.",
                             "Warm query/UI projection workload; no cold storage, thumbnail decode, ingestion, hardware input or manual UX claim.",
                             "100 ms acknowledgement / 500 ms first page are p95 targets, reported honestly rather than advertised guarantees.",
                             "Regression gate compares medians with 30% relative, 20 ms SQL / 50 ms UI absolute, 6 MAD noise allowances and both process medians.",
-                            "Memory is sampled process/cache memory, not a continuous maximum or a declared whole-process budget."]}
+                            "Memory is sampled process/cache memory, not a continuous maximum or a declared whole-process budget.",
+                            "Internal stage diagnostics are unavailable in the unmodified baseline and do not affect comparable samples, goals or regression gates.",
+                            "Media-row fingerprints prove unchanged synthetic catalog data during UI queries; settings/caches and original media file bytes are outside this check."]}
 
 
 def markdown(result):
@@ -102,10 +166,22 @@ def markdown(result):
             verdict += f"; p95 goal {metric['goalP95Ms']} ms: {'met' if metric['goalMet'] else 'not met'}"
         change = f"{delta:+.1f}%" if delta is not None else "n/a"
         lines.append(f"| {metric['name']} | {before['p50']:.2f} / {before['p95']:.2f} | {after['p50']:.2f} / {after['p95']:.2f} | {change} | {verdict} |")
-    lines += ["", "SQL result fingerprints matched across all four processes. Five superseded UI projections were canceled and the final search verified in every process.", "",
+    lines += ["", "SQL result fingerprints matched across all four processes. Five superseded UI projections were canceled and the final search verified in every process.",
+              "All media-table columns and row counts matched before/after the UI workload in each process; streaming SHA-256 scans ran outside timing samples. Settings/caches are excluded, and no original media files are used.", "",
               "| Sampled peak | Before | After |", "|---|---:|---:|"]
     for key in ("workingSetBytes", "privateBytes", "managedBytes"):
         lines.append(f"| {key} | {result['memoryPeaks']['baseline'][key] / 1048576:.1f} MiB | {result['memoryPeaks']['current'][key] / 1048576:.1f} MiB |")
+    lines += ["", "Internal projection diagnostics (separate from the comparison and its gates):", ""]
+    for label in ("baseline", "current"):
+        diagnostic = result["projectionDiagnostics"][label]
+        if not diagnostic["available"]:
+            lines.append(f"{label}: unavailable in this source revision; no reconstructed timings.")
+            continue
+        lines += [f"{label} only:", "", "| Scenario | Stage | p50 / p95, ms |", "|---|---|---:|"]
+        for stage in diagnostic["stages"]:
+            value = stage["milliseconds"]
+            lines.append(f"| {stage['scenario']} | {stage['stage']} | {value['p50']:.2f} / {value['p95']:.2f} |")
+        lines.append("")
     lines += ["", "Limits:", ""] + ["- " + s for s in result["limitations"]]
     lines += ["", "Machine:", "", "```json", json.dumps(result["machine"], indent=2), "```", ""]
     return "\n".join(lines)

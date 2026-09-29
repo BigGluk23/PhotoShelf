@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Baseline = 'eb832ee4a37802c9d25ce03359a550c9725371b3',
+    [string]$Baseline = 'cb6d716b66511c47a24ff6b1b8f10ac9ca84768a',
     [switch]$Million,
     [ValidateRange(5, 50)][int]$Repetitions = 15,
     [string]$DotNet = 'dotnet',

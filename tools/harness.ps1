@@ -162,8 +162,38 @@ try {
             throw 'Filesystem noise reset/flashed the grid or monitoring failed to settle.'
         }
     }
+    $searchSort = $browseSmoke.searchSort
+    if ($searchSort.passed -ne $true -or $searchSort.originalHashesVerified -ne $true -or
+        $searchSort.modificationTimesVerified -ne $true -or $searchSort.rapidSearchVerified -ne $true -or
+        $searchSort.decodedPngVerified -ne $true -or $searchSort.fixtureCount -ne 96 -or
+        $searchSort.hashesChecked -ne 96 -or $searchSort.selectionChecks -ne 4 -or
+        $searchSort.anchorChecks -ne 4 -or $searchSort.wrongSearchPublications -ne 0 -or @($searchSort.cases).Count -ne 7) {
+        throw 'Search/sort smoke did not preserve its results, selection, anchor, decoded previews and all 96 originals.'
+    }
+    $expectedSearchCases = @{
+        'all-desc' = @('', $true, 96)
+        'all-asc' = @('', $false, 96)
+        'all-desc-restored' = @('', $true, 96)
+        'search-desc' = @('p01-alpha', $true, 48)
+        'search-asc' = @('p01-alpha', $false, 48)
+        'search-desc-restored' = @('p01-alpha', $true, 48)
+        'rapid-final-search' = @('p01-alpha', $true, 48)
+    }
+    foreach ($case in $searchSort.cases) {
+        if (-not $expectedSearchCases.ContainsKey([string]$case.scenario)) { throw 'Unexpected/repeated search/sort scenario.' }
+        $expected = $expectedSearchCases[[string]$case.scenario]
+        if ($case.search -ne $expected[0] -or $case.newestFirst -ne $expected[1] -or
+            $case.expectedCount -ne $expected[2] -or $case.actualCount -ne $expected[2] -or
+            $case.fullOrderVerified -ne $true -or $case.equalDateTiesVerified -ne $true -or
+            $case.decodedVisiblePng -ne $true -or $case.monitoringEnabled -ne $true) {
+            throw 'Search/sort smoke changed result order/count or failed to decode with monitoring enabled.'
+        }
+        $expectedSearchCases.Remove([string]$case.scenario)
+    }
+    if ($expectedSearchCases.Count -ne 0) { throw 'Missing search/sort smoke scenarios.' }
     $result.browseSmokeVerified = $true
-    Write-Output 'OK production browse smoke: real isolated watcher, direct/fresh decoded PNG, nested video count, tree checkbox, cancellation, stable empty/nonempty views, unchanged originals, graceful close.'
+    $result.searchSortSmokeVerified = $true
+    Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'
     $archive = Join-Path $artifactRoot ($packageName + '.zip')
     Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $archive -CompressionLevel Optimal
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

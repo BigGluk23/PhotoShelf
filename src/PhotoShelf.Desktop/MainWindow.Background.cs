@@ -38,6 +38,8 @@ public partial class MainWindow
     private long _catalogCount;
     private CatalogViewQuery? _currentQuery;
     private string _viewIdentity = "";
+    private long _projectionOperationId;
+    private CatalogProjectionTiming? _lastProjectionTiming;
 
     private CatalogViewQuery CreateQuery() => new()
     {
@@ -123,6 +125,9 @@ public partial class MainWindow
         var token = operation.Token;
         var revision = _backgroundRefresh.Revision;
         var timer = System.Diagnostics.Stopwatch.StartNew();
+        var operationId = ++_projectionOperationId;
+        double debounceMs = 0, groupsMs = 0, anchorMs = 0, primeMs = 0, publishMs = 0;
+        var outcome = "cancelled";
         var query = CreateQuery();
         var identity = $"{query.Folder}|{query.ViewMode}|{query.SearchText}|{query.ShowVideos}|{query.IncludeSubfolders}|{query.MissingCaptureDateOnly}";
         var preserve = identity == _viewIdentity;
@@ -144,10 +149,14 @@ public partial class MainWindow
         StatusText.Text = "Обновляю вид…";
         CatalogProgressBar.Visibility = Visibility.Visible;
         CatalogProgressBar.IsIndeterminate = true;
+        var preparationMs = timer.Elapsed.TotalMilliseconds;
+        var phase = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             await Task.Delay(60, token);
+            debounceMs = phase.Elapsed.TotalMilliseconds; phase.Restart();
             var groups = await _desktopCatalogStore.QueryGroupsAsync(query, token);
+            groupsMs = phase.Elapsed.TotalMilliseconds; phase.Restart();
             // A relevant change can still be outside active search/type filters. Keep
             // the existing empty surface instead of publishing another empty ItemsSource.
             if (background && preserve && old is { ItemCount: 0 } && groups.Count == 0)
@@ -155,20 +164,23 @@ public partial class MainWindow
                 token.ThrowIfCancellationRequested();
                 _backgroundRefresh.Published(revision);
                 StatusText.Text = $"В виде: 0 · Каталог: {_catalogCount:N0}";
+                outcome = "unchanged";
                 return true;
             }
             var anchorIndex = anchor.Index;
             if (anchor.Path is not null)
                 anchorIndex = await _desktopCatalogStore.IndexOfAsync(query, anchor.Path, token) ?? anchorIndex;
             token.ThrowIfCancellationRequested();
+            anchorMs = phase.Elapsed.TotalMilliseconds; phase.Restart();
             var rows = pending = new VirtualPhotoRows(_desktopCatalogStore, query, groups, _columns, TileImageHeight + 60,
                 _collapsedDateGroups, (saved, index) => CreateVisibleItem(saved, index, retained), token);
             rows.LoadFailed += message => { if (ReferenceEquals(PhotoRows, rows)) StatusText.Text = $"Страница не загружена: {message}"; };
             await rows.PrimeAsync(anchorIndex);
             token.ThrowIfCancellationRequested();
+            primeMs = phase.Elapsed.TotalMilliseconds; phase.Restart();
             // Do not undo a scroll made while the background query was preparing.
             // The explicit update button remains available for this pending revision.
-            if (background && preserve && GetGridAnchor() != anchor) { _projectionDeferredForScroll = true; return false; }
+            if (background && preserve && GetGridAnchor() != anchor) { _projectionDeferredForScroll = true; outcome = "deferred"; return false; }
             old?.Dispose(); PhotoRows = rows; pending = null; _currentQuery = query; _viewIdentity = identity;
             OnPropertyChanged(nameof(PhotoRows));
             if (preserve && anchorIndex > 0 && rows.Count > 0)
@@ -182,11 +194,14 @@ public partial class MainWindow
             _backgroundRefresh.Published(revision);
             StatusText.Text = $"В виде: {rows.ItemCount:N0} · Каталог: {_catalogCount:N0}";
             PerformanceMetrics.Record("catalog.first_page", timer.Elapsed.TotalMilliseconds, rows.ItemCount);
+            publishMs = phase.Elapsed.TotalMilliseconds;
+            outcome = "published";
             return true;
         }
         catch (OperationCanceledException) { return false; }
         catch (Exception ex)
         {
+            outcome = "failed";
             if (ReferenceEquals(_projectionCancellation, operation)) StatusText.Text = $"Не удалось обновить вид: {ex.Message}";
             return false;
         }
@@ -195,6 +210,18 @@ public partial class MainWindow
             pending?.Dispose();
             if (ReferenceEquals(_projectionCancellation, operation))
             {
+                // An older cancelled request cannot replace diagnostics for the latest view.
+                _lastProjectionTiming = new(operationId, outcome, preparationMs, debounceMs,
+                    groupsMs, anchorMs, primeMs, publishMs, timer.Elapsed.TotalMilliseconds);
+                if (outcome == "published")
+                {
+                    PerformanceMetrics.Record("catalog.projection.preparation", preparationMs);
+                    PerformanceMetrics.Record("catalog.projection.debounce", debounceMs);
+                    PerformanceMetrics.Record("catalog.projection.groups", groupsMs);
+                    PerformanceMetrics.Record("catalog.projection.anchor", anchorMs);
+                    PerformanceMetrics.Record("catalog.projection.prime", primeMs);
+                    PerformanceMetrics.Record("catalog.projection.publish", publishMs);
+                }
                 _projectionCancellation = null; _isProjecting = false; _projectionPreservesView = false;
                 CatalogProgressBar.Visibility = _isCatalogLoading ? Visibility.Visible : Visibility.Collapsed;
                 RefreshEmptyState();

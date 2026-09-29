@@ -1,5 +1,8 @@
 using System.ComponentModel;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -23,6 +26,7 @@ internal static class Program
     private static readonly List<Sample> Samples = [];
     private static readonly List<MemorySample> Memory = [];
     private static readonly List<object> Supersessions = [];
+    private static readonly List<ProjectionTimingSample> ProjectionTimings = [];
     private static string _mediaRoot = "";
     private static int _count;
     private static int _repetitions;
@@ -46,6 +50,7 @@ internal static class Program
         typeof(ErrorReporter).GetProperty("AutomatedCheck", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, true);
         string? failure = null;
         var exitCode = 1;
+        CatalogSnapshot? catalogBefore = null, catalogAfter = null;
         try
         {
             var store = new SqliteDesktopCatalogStore();
@@ -67,7 +72,13 @@ internal static class Program
                     // Identical controlled profile: wait for real readers to stop, not just request cancellation.
                     await QuiesceAsync(window);
                     await WaitForIdleAsync(window);
+                    catalogBefore = await SnapshotCatalogAsync();
                     await MeasureUiAsync(window);
+                    await QuiesceAsync(window);
+                    await WaitForIdleAsync(window);
+                    catalogAfter = await SnapshotCatalogAsync();
+                    if (catalogBefore != catalogAfter || catalogBefore.RowCount != _count)
+                        throw new InvalidDataException("UI query workload changed catalog media rows.");
                     if ((int)typeof(ErrorReporter).GetProperty("ErrorCount", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)! != 0)
                         throw new InvalidOperationException("Application wrote an error report during the benchmark.");
                     var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -115,7 +126,11 @@ internal static class Program
                 logicalProcessors = Environment.ProcessorCount, totalAvailableMemoryBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
                 runnerImage = Environment.GetEnvironmentVariable("ImageVersion"), runnerOs = Environment.GetEnvironmentVariable("RUNNER_OS"),
                 dpi = "WPF default", viewport = "1280x800 device independent pixels" },
-            confirmedSupersessions = _cancellations, supersessions = Supersessions, samples = Samples, memory = Memory
+            confirmedSupersessions = _cancellations, supersessions = Supersessions, samples = Samples, memory = Memory,
+            projectionTimings = ProjectionTimings,
+            catalogDataIntegrity = new { before = catalogBefore, after = catalogAfter,
+                unchanged = catalogBefore is not null && catalogBefore == catalogAfter,
+                scope = "All desktop_media_items columns ordered by asset_id, before/after UI workload; settings and caches excluded; outside timing samples" }
         };
         JsonSerializer.Serialize(report, result, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
         report.Flush(true);
@@ -187,6 +202,21 @@ internal static class Program
                 if (groups.Sum(x => x.Count) != _count) throw new InvalidDataException("Group count mismatch.");
                 return string.Join(";", groups.Select(x => $"{x.Key}:{x.Count}"));
             });
+        await RepeatAsync("sql.groups.search", async () =>
+        {
+            var groups = await store.QueryGroupsAsync(query with { SearchText = "needle_" });
+            if (groups.Sum(x => x.Count) != (_count + 96) / 97) throw new InvalidDataException("Search group count mismatch.");
+            return string.Join(";", groups.Select(x => $"{x.Key}:{x.Count}"));
+        });
+        // Query probes isolate anchor lookup cost; they do not pretend to reconstruct a baseline UI phase.
+        var anchor = Path.Combine(_mediaRoot, "bucket00", "needle_00000000.jpg");
+        foreach (var capture in new[] { false, true })
+            await RepeatAsync(capture ? "sql.index_of.capture" : "sql.index_of.file", async () =>
+            {
+                var index = await store.IndexOfAsync(query with { UseCaptureDate = capture }, anchor);
+                if (index is null || index < 0 || index >= _count) throw new InvalidDataException("Anchor lookup failed.");
+                return index.Value.ToString(CultureInfo.InvariantCulture);
+            });
     }
 
     private static async Task RepeatAsync(string name, Func<Task<string>> operation)
@@ -205,8 +235,12 @@ internal static class Program
         var sort = (Button)window.FindName("DateSortButton");
         await MeasureActionAsync(window, "ui.date", () => date.SelectedIndex = date.SelectedIndex == 0 ? 1 : 0,
             q => q.UseCaptureDate == (date.SelectedIndex == 0));
-        await MeasureActionAsync(window, "ui.sort", () => sort.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)),
-            _ => true);
+        var expectedNewestFirst = Get<CatalogViewQuery>(window, "_currentQuery").NewestFirst;
+        await MeasureActionAsync(window, "ui.sort", () =>
+        {
+            expectedNewestFirst = !Get<CatalogViewQuery>(window, "_currentQuery").NewestFirst;
+            sort.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        }, query => query.NewestFirst == expectedNewestFirst);
         await MeasureActionAsync(window, "ui.search", () => search.Text = search.Text == "needle_" ? "synthetic_" : "needle_",
             q => q.SearchText == search.Text);
         search.Text = ""; await WaitForIdleAsync(window);
@@ -277,6 +311,9 @@ internal static class Program
                     Samples.Add(new(name + ".layout", i, layout, fingerprint));
                     SnapshotMemory(window, name);
                 }
+                // Main timings are already captured. Baseline has no stage hook, and remains untouched.
+                await WaitForIdleAsync(window);
+                if (i >= 0) ProjectionTimings.Add(ReadProjectionTiming(window, name, i));
             }
             finally { window.PropertyChanged -= Observe; }
         }
@@ -304,6 +341,72 @@ internal static class Program
             rows?.CachedPageCount ?? 0, rows?.CachedRowCount ?? 0, rows?.PendingPageCount ?? 0));
     }
 
+    private static ProjectionTimingSample ReadProjectionTiming(MainWindow window, string scenario, int iteration)
+    {
+        var field = typeof(MainWindow).GetField("_lastProjectionTiming", PrivateInstance);
+        if (field is null) return new(scenario, iteration, false, null, null, null);
+        var value = field.GetValue(window) ?? throw new InvalidOperationException("Projection stage hook exists but has no completed operation.");
+        object Read(string property) => value.GetType().GetProperty(property)?.GetValue(value)
+            ?? throw new InvalidOperationException($"Projection stage hook is missing {property}.");
+        var durations = new Dictionary<string, double>();
+        foreach (var name in new[] { "PreparationMs", "DebounceMs", "GroupsMs", "AnchorMs", "PrimeMs", "PublishMs", "TotalMs" })
+        {
+            var duration = Convert.ToDouble(Read(name), CultureInfo.InvariantCulture);
+            if (!double.IsFinite(duration) || duration < 0) throw new InvalidDataException($"Invalid projection timing {name}.");
+            durations.Add(name, duration);
+        }
+        return new(scenario, iteration, true, Convert.ToInt64(Read("OperationId"), CultureInfo.InvariantCulture),
+            (string)Read("Outcome"), durations);
+    }
+
+    private static Task<CatalogSnapshot> SnapshotCatalogAsync() => Task.Run(async () =>
+    {
+        await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        { DataSource = Path.Combine(LocalCatalogStore.CatalogDirectory, "catalog-v2.sqlite"), Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+        await connection.OpenAsync(); await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM desktop_media_items ORDER BY asset_id;"; command.CommandTimeout = 120;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = ArrayPool<byte>.Shared.Rent(4096); long count = 0;
+        try
+        {
+            await using var reader = await command.ExecuteReaderAsync();
+            for (var column = 0; column < reader.FieldCount; column++) AppendCatalogValue(hash, reader.GetName(column), buffer);
+            while (await reader.ReadAsync())
+            {
+                count++;
+                for (var column = 0; column < reader.FieldCount; column++)
+                {
+                    var value = reader.GetValue(column);
+                    var text = value switch
+                    {
+                        DBNull => null,
+                        string s => "text:" + s,
+                        long n => "integer:" + n.ToString(CultureInfo.InvariantCulture),
+                        double d => "real:" + d.ToString("R", CultureInfo.InvariantCulture),
+                        _ => throw new InvalidDataException("Unsupported media-row value in read-only fingerprint.")
+                    };
+                    AppendCatalogValue(hash, text, buffer);
+                }
+            }
+            return new CatalogSnapshot(count, Convert.ToHexString(hash.GetHashAndReset()));
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+    });
+
+    private static void AppendCatalogValue(IncrementalHash hash, string? value, byte[] buffer)
+    {
+        var size = value is null ? -1 : Encoding.UTF8.GetByteCount(value);
+        Span<byte> prefix = stackalloc byte[4]; BinaryPrimitives.WriteInt32LittleEndian(prefix, size); hash.AppendData(prefix);
+        if (value is null) return;
+        var rented = size > buffer.Length ? ArrayPool<byte>.Shared.Rent(size) : null;
+        try
+        {
+            var target = rented ?? buffer; var written = Encoding.UTF8.GetBytes(value.AsSpan(), target);
+            hash.AppendData(target.AsSpan(0, written));
+        }
+        finally { if (rented is not null) ArrayPool<byte>.Shared.Return(rented, clearArray: true); }
+    }
+
     private static string Fingerprint(IEnumerable<string> paths) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
         string.Join("\n", paths.Select(x => Path.GetRelativePath(_mediaRoot, x))))));
     private static T Get<T>(object target, string name) => (T)(typeof(MainWindow).GetField(name, PrivateInstance)
@@ -311,5 +414,8 @@ internal static class Program
     private static object? Invoke(object target, string name, params object?[] args) =>
         (typeof(MainWindow).GetMethod(name, PrivateInstance) ?? throw new MissingMethodException(typeof(MainWindow).FullName, name)).Invoke(target, args);
     private sealed record Sample(string Name, int Iteration, double Milliseconds, string Fingerprint);
+    private sealed record CatalogSnapshot(long RowCount, string Sha256);
+    private sealed record ProjectionTimingSample(string Scenario, int Iteration, bool Available, long? OperationId,
+        string? Outcome, IReadOnlyDictionary<string, double>? Durations);
     private sealed record MemorySample(string Phase, long WorkingSetBytes, long PrivateBytes, long ManagedBytes, int CachedPages, int CachedRows, int PendingPages);
 }

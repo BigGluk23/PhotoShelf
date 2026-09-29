@@ -87,6 +87,79 @@ public partial class MainWindow
     internal bool BrowseSmokeWritersDrained => _closeReady && _scanTask.IsCompleted && _browseTask.IsCompleted && _metadataTask.IsCompleted;
     internal string[] BrowseSmokeLoadedPaths => (PhotoRows as VirtualPhotoRows)?.LoadedItems.Select(x => x.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
 
+    internal string? BrowseSmokePublishedSearch => _currentQuery?.SearchText;
+    internal bool BrowseSmokeNewestFirst => _currentQuery?.NewestFirst == true;
+    internal bool BrowseSmokeMonitoringEnabled => BrowseSmokeMonitorReady && !_monitorPaused;
+    internal void BrowseSmokeSearch(string text) => SearchBox.Text = text;
+    internal void BrowseSmokeReverseDateSort() => DateSortButton.RaiseEvent(
+        new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent, DateSortButton));
+
+    // Exhaustive inspection is deliberately limited to this tiny owned fixture.
+    // The production grid and catalog never materialize a whole personal library.
+    internal PhotoItem[] BrowseSmokeSmallFixtureItems()
+    {
+        if (!LocalCatalogStore.IsIsolatedSmokeCatalog || _browseSmokeRoot is null ||
+            !string.Equals(_currentQuery?.Folder, Path.Combine(_browseSmokeRoot, "SearchSort"), StringComparison.OrdinalIgnoreCase) ||
+            PhotoRows is not VirtualPhotoRows rows || rows.ItemCount > 96 || rows.Count > 128)
+            throw new InvalidOperationException("Exhaustive browse smoke inspection requires its small owned search/sort fixture.");
+        for (var row = 0; row < rows.Count; row++) _ = rows[row];
+        return rows.LoadedItems.OrderBy(item => item.ViewIndex).ToArray();
+    }
+
+    internal void BrowseSmokeScrollToItem(long index)
+    {
+        if (PhotoRows is not VirtualPhotoRows rows || index < 0 || index >= rows.ItemCount)
+            throw new InvalidOperationException("Browse smoke scroll target is outside the current view.");
+        var row = rows.RowForItem(index);
+        PhotoGrid.ScrollIntoView(rows[row]);
+        if (FindVisualChild<ScrollViewer>(PhotoGrid) is not { } scroll)
+            throw new InvalidOperationException("Browse smoke grid has no ScrollViewer.");
+        scroll.ScrollToVerticalOffset(row);
+    }
+
+    internal (long Index, string? Path) BrowseSmokeAnchor
+    {
+        get { var anchor = GetGridAnchor(); return (anchor.Index, anchor.Path); }
+    }
+
+    internal string[] BrowseSmokeTopRowPaths
+    {
+        get
+        {
+            if (PhotoRows is not VirtualPhotoRows { Count: > 0 } rows || FindVisualChild<ScrollViewer>(PhotoGrid) is not { } scroll)
+                return [];
+            var index = Math.Clamp((int)scroll.VerticalOffset, 0, rows.Count - 1);
+            if (rows[index] is PhotoRow { IsHeader: true } && index + 1 < rows.Count) index++;
+            return (rows[index] as PhotoRow)?.Items.Select(item => item.Path).ToArray() ?? [];
+        }
+    }
+
+    internal PhotoItem BrowseSmokeSelectVisiblePhoto(string path)
+    {
+        if (System.Windows.Input.Keyboard.Modifiers != System.Windows.Input.ModifierKeys.None)
+            throw new InvalidOperationException("Browse smoke selection requires no physical modifier keys.");
+        System.Windows.Controls.Border? FindTile(DependencyObject parent)
+        {
+            if (parent is System.Windows.Controls.Border { ContextMenu: not null, IsVisible: true, DataContext: PhotoItem item } tile &&
+                string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase)) return tile;
+            for (var index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
+                if (FindTile(VisualTreeHelper.GetChild(parent, index)) is { } found) return found;
+            return null;
+        }
+        var target = FindTile(PhotoGrid) ?? throw new InvalidOperationException("Browse smoke photo tile has not been realized.");
+        // A routed event on the actual rendered tile exercises the normal handler.
+        // This is synthesized WPF input, not a physical mouse automation claim.
+        target.RaiseEvent(new System.Windows.Input.MouseButtonEventArgs(System.Windows.Input.Mouse.PrimaryDevice,
+            Environment.TickCount, System.Windows.Input.MouseButton.Left) { RoutedEvent = UIElement.MouseLeftButtonDownEvent });
+        var selected = (PhotoItem)target.DataContext;
+        if (!BrowseSmokeSelectionRetained(selected)) throw new InvalidOperationException("Production photo selection did not select its tile.");
+        return selected;
+    }
+
+    internal bool BrowseSmokeSelectionRetained(PhotoItem item) => item.IsSelected && _selection.Count == 1 &&
+        ReferenceEquals(_selection.Find(item.Path), item) && ReferenceEquals(_selectedPhoto, item) &&
+        (PhotoRows as VirtualPhotoRows)?.LoadedItems.Any(candidate => ReferenceEquals(candidate, item)) == true;
+
     internal bool BrowseSmokeDecodedPixels(string path)
     {
         bool Find(DependencyObject parent)
