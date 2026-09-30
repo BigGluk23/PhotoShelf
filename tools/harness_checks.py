@@ -66,7 +66,9 @@ def repository():
     for part in ("src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj", "tests/PhotoShelf.Desktop.Tests/PhotoShelf.Desktop.Tests.csproj"):
         if ET.parse(ROOT / part).getroot().findtext(".//TargetFramework") != f"net{major}.0-windows":
             raise ValueError(f"WPF target framework mismatch: {part}")
-    label = "Ultra v" + version.removesuffix("-ultra")
+    numeric = version.removesuffix("-ultra")
+    # UI branding may omit only the zero patch; protocol/package identities retain all three components.
+    label = "Ultra v" + (numeric[:-2] if numeric.endswith(".0") else numeric)
     code = (ROOT / "src/PhotoShelf.Desktop/MainWindow.xaml.cs").read_text(encoding="utf-8")
     if f'VersionLabel = "{label}"' not in code:
         raise ValueError("MainWindow.VersionLabel differs from Directory.Build.props.")

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact stable tag matching Directory.Build.props (for example v1.10.14-ultra)
+        description: Exact stable tag matching Directory.Build.props (for example v1.11.0-ultra)
         type: string
         required: true
       ci_run_id:
@@ -99,7 +99,9 @@ jobs:
         run: |
           set -euo pipefail
           # Signing is finished; this step never receives the signing secret.
-          gh release create "$UPDATE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "PhotoShelf Ultra ${UPDATE_TAG%-ultra}" --generate-notes
+          release_label="${UPDATE_TAG%-ultra}"
+          release_label="${release_label%.0}"
+          gh release create "$UPDATE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "PhotoShelf Ultra $release_label" --generate-notes
           gh release upload "$UPDATE_TAG" release-work/signed/* --repo "$GITHUB_REPOSITORY"
           gh release download "$UPDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-work/read-back
           python - <<'PY'

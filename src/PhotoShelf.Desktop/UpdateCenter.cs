@@ -36,6 +36,7 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public string CurrentVersion { get; }
+    public string CurrentVersionText => DisplayVersion(CurrentVersion);
     public bool AutoCheck => _preferences.AutoCheck;
     public bool IsChecking => _checking;
     public bool IsDownloading => _downloading;
@@ -46,7 +47,7 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
     public bool CanInstall => _staged is not null && !IsBusy && !_disposed;
     public bool HasUpdate => _available is not null;
     public bool OfferVisible => _offer && HasUpdate;
-    public string AvailableText => _available is null ? "" : $"Доступна PhotoShelf Ultra {_available.Version}";
+    public string AvailableText => _available is null ? "" : $"Доступна PhotoShelf Ultra {DisplayVersion(_available.Version)}";
     public string DownloadSizeText => _available is null ? "" : $"Размер загрузки: {_available.Manifest.PackageBytes / 1048576d:N1} МБ";
     public string LastCheckedText => _preferences.LastSuccessfulCheck is { } date
         ? $"Последняя успешная проверка: {date.ToLocalTime():g}" : "Последняя успешная проверка: —";
@@ -54,6 +55,10 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
     public double Progress => _progress;
     public string? ReleaseNotesUrl => _available?.Manifest.ReleaseNotesUrl;
     public StagedUpdate? PreparedUpdate => _staged;
+
+    private static string DisplayVersion(string value) =>
+        UpdateVersion.TryParse(value, out var version) && version.Build == 0
+            ? $"{version.Major}.{version.Minor}" : value;
 
     public Task InitializeAsync() => _initialization ??= InitializeCoreAsync();
     private async Task InitializeCoreAsync()

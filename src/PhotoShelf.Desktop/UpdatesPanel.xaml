@@ -4,7 +4,7 @@
  <UserControl.Resources><BooleanToVisibilityConverter x:Key="UpdateBoolVisibility" /></UserControl.Resources>
  <StackPanel>
   <TextBlock Text="Обновления программы" FontSize="16" FontWeight="SemiBold" />
-  <TextBlock Margin="0,8,0,0" Text="{Binding CurrentVersion, StringFormat=Текущая версия: PhotoShelf Ultra {0}}" />
+  <TextBlock Margin="0,8,0,0" Text="{Binding CurrentVersionText, StringFormat=Текущая версия: PhotoShelf Ultra {0}}" />
   <CheckBox x:Name="AutoUpdateCheckBox" Margin="0,12,0,0" Content="Проверять обновления при запуске"
    IsChecked="{Binding AutoCheck, Mode=OneWay}" IsEnabled="{Binding IsInitialized}" Click="OnAutoCheckClicked" />
   <TextBlock Margin="0,6,0,0" Text="Скачивание и установка выполняются только по вашему согласию." TextWrapping="Wrap" Foreground="#FF77706A" />

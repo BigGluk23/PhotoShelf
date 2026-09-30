@@ -35,20 +35,20 @@ Example manifest shape (hash values below are illustrative, not a release):
 ```json
 {
   "protocolVersion": 1,
-  "version": "1.10.14",
+  "version": "1.11.0",
   "runtime": "win-x64",
-  "packageUrl": "https://github.com/BigGluk23/PhotoShelf/releases/download/v1.10.14-ultra/PhotoShelf-v1.10.14-ultra-win-x64.zip",
+  "packageUrl": "https://github.com/BigGluk23/PhotoShelf/releases/download/v1.11.0-ultra/PhotoShelf-v1.11.0-ultra-win-x64.zip",
   "packageSha256": "<64 lowercase hex characters>",
   "packageManifestSha256": "<SHA256 of exact package-manifest.json bytes>",
   "packageBytes": 123456789,
   "unpackedBytes": 234567890,
   "minCatalogSchema": 5,
   "maxCatalogSchema": 5,
-  "releaseNotesUrl": "https://github.com/BigGluk23/PhotoShelf/releases/tag/v1.10.14-ultra"
+  "releaseNotesUrl": "https://github.com/BigGluk23/PhotoShelf/releases/tag/v1.11.0-ultra"
 }
 ```
 
-The visible Ultra suffix is product branding. Signed `version` has three canonical numeric components; tags/package inventory keep `-ultra`. Hashes and sizes refer to the already tested final ZIP and its actual contents, including the inner package inventory. The inventory hash binds later extracted-file validation to the signature without trusting an unsigned replacement manifest. Maximum compressed size: 2 GiB; unpacked: 4 GiB; files: 1024. Catalog schema range is deliberately fixed to 5 in the initial release policy; do not widen it without migration and rollback tests.
+The visible Ultra suffix is product branding. The application/release title displays **PhotoShelf Ultra v1.11** for technical version `1.11.0-ultra`; only a zero patch is omitted from display. Signed `version` always has three canonical numeric components; tags/package inventory keep `-ultra`. Hashes and sizes refer to the already tested final ZIP and its actual contents, including the inner package inventory. The inventory hash binds later extracted-file validation to the signature without trusting an unsigned replacement manifest. Maximum compressed size: 2 GiB; unpacked: 4 GiB; files: 1024. Catalog schema range is deliberately fixed to 5 in the initial release policy; do not widen it without migration and rollback tests.
 
 Signing metadata does not authorize modifying media or restoring an old SQLite snapshot. An updater rollback must respect current catalog compatibility and leave journals and originals intact. Compatible user-provided LGPL decoder replacements are a runtime policy distinct from validation of the original distributed package.
 

@@ -85,6 +85,29 @@ class RepositoryGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RUNNING source heading"):
             self.validate()
 
+    def set_version_labels(self, technical, visible):
+        self.write("Directory.Build.props", f"<Project><PropertyGroup><Version>{technical}-ultra</Version><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
+        self.write("README.md", f"# PhotoShelf Ultra v{visible}\n")
+        self.write("src/PhotoShelf.Desktop/MainWindow.xaml.cs", f'private const string VersionLabel = "Ultra v{visible}";')
+        self.write("src/PhotoShelf.Desktop/MainWindow.xaml", f'<Window xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"><TextBlock x:Name="AppTitleText" Text="PhotoShelf Ultra v{visible}"/></Window>')
+
+    def test_zero_patch_uses_canonical_short_display_without_changing_technical_version(self):
+        self.set_version_labels("1.11.0", "1.11")
+        self.validate()
+        self.assertEqual("1.11.0-ultra", ET.parse(self.root / "Directory.Build.props").getroot().findtext(".//Version"))
+        self.set_version_labels("1.11.0", "1.11.0")
+        with self.assertRaisesRegex(ValueError, "VersionLabel"):
+            self.validate()
+
+    def test_nonzero_patch_must_remain_visible_including_patch_ending_in_zero(self):
+        for technical in ("1.11.1", "1.11.10"):
+            with self.subTest(technical=technical):
+                self.set_version_labels(technical, technical)
+                self.validate()
+                self.set_version_labels(technical, "1.11")
+                with self.assertRaisesRegex(ValueError, "VersionLabel"):
+                    self.validate()
+
 
 class ReportGateTests(unittest.TestCase):
     def setUp(self):
