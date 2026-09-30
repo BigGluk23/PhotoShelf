@@ -448,6 +448,9 @@ internal static class Program
     {
         if (OwnedProcesses.Any(owned => owned.Id == process.Id)) return;
         Require(IsOwnedExecutable(path), "Discovered process is not owned by this fixture.");
+        // Enumerated Process objects have no retained native handle. Keep it while the process
+        // is alive so Windows can provide its exit code after it closes; HasExited alone cannot.
+        Require(!process.SafeHandle.IsInvalid, "Cannot retain the owned process handle for exit verification.");
         OwnedProcesses.Add(process);
         ProcessEvidence.Add(new(process.Id, process.StartTime.ToUniversalTime(), path));
     }
