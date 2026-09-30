@@ -16,6 +16,8 @@ The tag must be new and greater than every existing published stable PhotoShelf 
 
 Windows packaging publishes `PhotoShelf.Updater.exe` separately with its own locked publish graph, then copies only this self-contained helper into the Desktop package. This avoids overwriting Desktop dependencies. The extracted helper runs `--self-test` with a 15-second watchdog; this is a read-only CLI startup check, not proof of a complete Windows update/recovery cycle. Package inventory verification runs again after all smoke checks.
 
+For cross-host lockfile maintenance, pass `-p:RuntimeIdentifier=win-x64` explicitly together with `-p:SelfContained=true -p:PublishSingleFile=true -p:PhotoShelfPublish=true` to `dotnet restore --force-evaluate`. The restore CLI `-r` option alone adds to the RID list and can retain the host RID for self-contained projects. Verify the result with the actual locked `dotnet publish -r win-x64` command; never disable locked restore in CI to bypass a mismatch.
+
 ## Trust material
 
 The public RSA key is `src/PhotoShelf.Application/Updates/TrustedUpdateKey.pem`, embedded in the application. The corresponding PEM private key belongs only in the repository Actions secret `PHOTOSHELF_UPDATE_SIGNING_KEY`. Configure that secret separately with the repository owner's authorization. No private key belongs in Git, CI artifacts, release assets, application settings or logs.
