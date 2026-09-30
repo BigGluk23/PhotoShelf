@@ -16,7 +16,7 @@
   <TextBlock Margin="0,12,0,0" Text="{Binding AvailableText}" FontWeight="SemiBold" TextWrapping="Wrap" />
   <TextBlock Margin="0,4,0,0" Text="{Binding DownloadSizeText}" Foreground="#FF77706A" />
   <ProgressBar Margin="0,10,0,0" Height="5" IsIndeterminate="True" Visibility="{Binding IsChecking, Converter={StaticResource UpdateBoolVisibility}}" />
-  <ProgressBar Margin="0,10,0,0" Height="5" Minimum="0" Maximum="100" Value="{Binding Progress}" Visibility="{Binding IsDownloading, Converter={StaticResource UpdateBoolVisibility}}" />
+  <ProgressBar Margin="0,10,0,0" Height="5" Minimum="0" Maximum="100" Value="{Binding Progress, Mode=OneWay}" Visibility="{Binding IsDownloading, Converter={StaticResource UpdateBoolVisibility}}" />
   <TextBlock Margin="0,10,0,0" Text="{Binding StatusText}" TextWrapping="Wrap" />
   <WrapPanel Margin="0,12,0,0" Visibility="{Binding HasUpdate, Converter={StaticResource UpdateBoolVisibility}}">
    <Button Content="Скачать обновление" IsEnabled="{Binding CanDownload}" Click="OnDownloadClicked" Padding="12,6" Margin="0,0,8,6" />
