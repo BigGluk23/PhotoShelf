@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>PhotoShelf.UpdateLifecycleHarness</AssemblyName>
+    <RootNamespace>PhotoShelf.UpdateLifecycleHarness</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/PhotoShelf.Application/PhotoShelf.Application.csproj" />
+    <ProjectReference Include="../../src/PhotoShelf.Infrastructure.Sqlite/PhotoShelf.Infrastructure.Sqlite.csproj" />
+  </ItemGroup>
+</Project>

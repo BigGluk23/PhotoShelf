@@ -1,0 +1,19 @@
+# Real WPF updater transition on a disposable Windows runner
+
+`tools/test-wpf-update-lifecycle.ps1 -ReportDirectory <owned-results>` copies tracked source to an owned temporary directory, embeds an ephemeral **public test key** there and publishes the real Desktop and Updater projects at technical versions `1.11.0` and `1.11.1`. The private test key stays in the PowerShell process's RSA object and is never exported. The production checkout, public key and version are unchanged; test binaries never enter release artifacts.
+
+The driver does not inject a trust key, profile path, installation consent or test mode into a production executable. Both application starts use the normal zero-argument entrypoint. It atomically claims an initially absent `%LOCALAPPDATA%/PhotoShelf` on a disposable Windows GitHub Actions runner. Existing Local/Roaming PhotoShelf data or running PhotoShelf processes cause refusal. The owned test profile is retained, including on failure; no profile/media/catalog cleanup or rollback occurs.
+
+It seeds a real SQLite catalog through `SqliteDesktopCatalogStore`, valid synthetic PNGs, an opaque synthetic MP4 byte fixture, persisted view settings, a genuine completed `FileMoveService` journal and a fully validated signed prepared update. Startup network checks and background scanning/indexing are disabled in the synthetic profile.
+
+External UI Automation performs the real Settings → Update and restart click. Assertions require:
+
+- The old real WPF window displays the synthetic catalog before consent; a prepared stage creates no install request by itself.
+- The old process actually exits; the real helper runs from the old application directory and activates a separate verified program directory.
+- The new real WPF process reports ready after catalog startup/first projection. Its executable file version, signed active pointer and receipt identify `1.11.1`; the hardcoded main-window title alone is not version evidence.
+- Search/view settings, every media-row column, SQLite integrity, originals' SHA-256/size/mtime, and completed journal bytes survive.
+- A subsequent normal launch of the old executable redirects to a fresh new-version process and closes gracefully.
+
+The bounded report is `updater-desktop-e2e.json` with scope `production-desktop-update-lifecycle-with-test-trust`. This proves real WPF/process integration from the tested sources under compile-time test trust, **not a transition between exact released production-key binaries**. Deterministic before/after-activation process-kill scenarios are reported separately by `updater-e2e.json`. These tests do not simulate hardware failure, power loss, personal libraries, video playback or decoder fidelity.
+
+The driver has an external 10-minute watchdog, including synchronous UI Automation calls; each scenario wait also has a deadline. Builds remain bounded by the enclosing Windows CI job. On failure the driver may terminate only processes whose executable paths belong to its owned source/profile directories. It retains the synthetic profile, journal and media for diagnosis. Do not run it on a personal Windows profile by bypassing its runner checks.

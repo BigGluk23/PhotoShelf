@@ -8,32 +8,42 @@ on:
         type: string
         required: true
       ci_run_id:
-        description: Completed successful Windows CI run at this exact main SHA (including performance)
+        description: Successful exact-SHA Windows CI with updater lifecycle and performance evidence
         type: string
         required: true
       publish:
-        description: Publish after uploading and verifying all assets (false creates a draft only)
+        description: Publish after owner approval and asset verification (false creates a draft only)
         type: boolean
         default: false
 
+# Validation gets no write token and never receives the private signing key.
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
   group: photoshelf-stable-release
   cancel-in-progress: false
 
+env:
+  UPDATE_TAG: ${{ inputs.tag }}
+  CI_RUN_ID: ${{ inputs.ci_run_id }}
+  PUBLISH_UPDATE: ${{ inputs.publish }}
+
 jobs:
-  release:
+  validate:
     if: github.ref == 'refs/heads/main' && github.repository == 'BigGluk23/PhotoShelf'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      environment_id: ${{ steps.protection.outputs.environment_id }}
+      archive_sha256: ${{ steps.candidate.outputs.archive_sha256 }}
+      manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
-      UPDATE_TAG: ${{ inputs.tag }}
-      CI_RUN_ID: ${{ inputs.ci_run_id }}
-      PUBLISH_UPDATE: ${{ inputs.publish }}
+      # This job deliberately has no environment. GitHub evaluates only presence,
+      # without injecting secret bytes. Any repository/org fallback blocks release.
+      NON_ENV_SIGNING_SECRET_PRESENT: ${{ secrets.PHOTOSHELF_UPDATE_SIGNING_KEY != '' }}
     steps:
       - name: Check out this exact main source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +54,29 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
+      - name: Require live owner protection before queuing a secret-bearing job
+        id: protection
+        shell: bash
+        env:
+          RELEASE_ACTOR: ${{ github.actor }}
+          RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work
+          gh api "repos/$GITHUB_REPOSITORY/environments/release" > release-work/environment.json
+          gh api "repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies?per_page=100" > release-work/branches.json
+          python tools/release_security.py --environment release-work/environment.json --branches release-work/branches.json \
+            --non-environment-secret-present "$NON_ENV_SIGNING_SECRET_PRESENT" --actor "$RELEASE_ACTOR" \
+            --triggering-actor "$RELEASE_TRIGGERING_ACTOR" --run-attempt "$GITHUB_RUN_ATTEMPT" | tee release-work/security.json
+          python - <<'PY'
+          import json, os
+          security = json.load(open('release-work/security.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"environment_id={security['environmentId']}\n")
+          if not security['administratorBypassVerifiedByApi']:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('Owner check required in Settings: administrator bypass must be disabled. This REST response does not expose that setting.\n\n')
+          PY
       - name: Validate source identity and successful exact-SHA gates
         shell: bash
         run: |
@@ -53,7 +86,6 @@ jobs:
           [[ "$UPDATE_TAG" == "v$version" ]]
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
           echo "UPDATE_VERSION=$version" >> "$GITHUB_ENV"
-          mkdir -p release-work
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" > release-work/run.json
           attempt="$(python -c 'import json; print(int(json.load(open("release-work/run.json"))["run_attempt"]))')"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$attempt/jobs?per_page=100" > release-work/jobs.json
@@ -79,20 +111,165 @@ jobs:
           gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "PhotoShelf-win-x64-$GITHUB_SHA" --dir release-work/package
           gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "windows-test-results-$GITHUB_SHA" --dir release-work/windows
           python -B tools/test_update_release.py
-      - name: Validate ZIP and sign exact update manifest bytes
+      - name: Validate the exact candidate and both Windows update lifecycle reports
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          def one(root, name):
+              found = list(pathlib.Path(root).rglob(name))
+              assert len(found) == 1, 'Missing or ambiguous Windows evidence/package'
+              return found[0]
+          archive = one('release-work/package', '*.zip')
+          subprocess.run(['python', 'tools/update_release.py', 'validate', '--archive', str(archive),
+              '--ci-summary', str(one('release-work/windows', 'harness-summary.json')),
+              '--process-report', str(one('release-work/windows', 'updater-e2e.json')),
+              '--desktop-report', str(one('release-work/windows', 'updater-desktop-e2e.json')),
+              '--version', os.environ['UPDATE_VERSION'], '--commit', os.environ['GITHUB_SHA'],
+              '--tag', os.environ['UPDATE_TAG'], '--output', 'release-work/candidate'], check=True)
+          encoded = pathlib.Path('release-work/candidate/photoshelf-update.json').read_bytes()
+          manifest = json.loads(encoded)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"archive_sha256={manifest['packageSha256']}\nmanifest_sha256={hashlib.sha256(encoded).hexdigest()}\n")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"Ready for BigGluk23 approval: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
+              summary.write('Exact Windows CI and performance gates passed. Both process-fixture and real Desktop test-trust lifecycle reports passed. Production signing and publication have not run.\n')
+          PY
+
+  sign_publish:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.repository == 'BigGluk23/PhotoShelf'
+    # GitHub must release this job only after independent BigGluk23 approval.
+    # The validation job above cannot auto-create an unprotected missing environment.
+    environment:
+      name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_ENVIRONMENT_ID: ${{ needs.validate.outputs.environment_id }}
+      EXPECTED_ARCHIVE_SHA256: ${{ needs.validate.outputs.archive_sha256 }}
+      EXPECTED_MANIFEST_SHA256: ${{ needs.validate.outputs.manifest_sha256 }}
+    steps:
+      - name: Check out this exact main source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up release validator
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Recheck live protection and actual owner approval before using any secret
+        shell: bash
+        env:
+          RELEASE_ACTOR: ${{ github.actor }}
+          RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work
+          gh api "repos/$GITHUB_REPOSITORY/environments/release" > release-work/environment.json
+          gh api "repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies?per_page=100" > release-work/branches.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" > release-work/approvals.json
+          # The successful job without environment already proved no repository/org secret fallback.
+          python tools/release_security.py --environment release-work/environment.json --branches release-work/branches.json \
+            --non-environment-secret-present false --actor "$RELEASE_ACTOR" --triggering-actor "$RELEASE_TRIGGERING_ACTOR" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --expected-environment-id "$EXPECTED_ENVIRONMENT_ID" \
+            --approvals release-work/approvals.json
+      - name: Validate source identity and successful exact-SHA gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CI_RUN_ID" =~ ^[0-9]+$ ]]
+          version="$(python tools/harness_checks.py version)"
+          [[ "$UPDATE_TAG" == "v$version" ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          echo "UPDATE_VERSION=$version" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" > release-work/run.json
+          attempt="$(python -c 'import json; print(int(json.load(open("release-work/run.json"))["run_attempt"]))')"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$attempt/jobs?per_page=100" > release-work/jobs.json
+          python tools/update_release.py gate --run release-work/run.json --jobs release-work/jobs.json --commit "$GITHUB_SHA"
+          # A pre-existing tag could point to different bytes. Never reuse or move it.
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$UPDATE_TAG" > release-work/tags.json
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > release-work/releases.json
+          python - <<'PY'
+          import json, os, re
+          tag = os.environ['UPDATE_TAG']
+          assert not any(item['ref'] == 'refs/tags/' + tag for item in json.load(open('release-work/tags.json'))), 'Release tag already exists'
+          numeric = tuple(map(int, tag[1:].removesuffix('-ultra').split('.')))
+          for page in json.load(open('release-work/releases.json')):
+              for release in page:
+                  assert release['tag_name'] != tag, 'Release already exists; never overwrite release assets'
+                  if not release['draft'] and not release['prerelease'] and re.fullmatch(r'v\d+\.\d+\.\d+-ultra', release['tag_name']):
+                      assert tuple(map(int, release['tag_name'][1:].removesuffix('-ultra').split('.'))) < numeric, 'Stable release must advance the version'
+          PY
+      - name: Download the tested archive and its Windows evidence without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "PhotoShelf-win-x64-$GITHUB_SHA" --dir release-work/package
+          gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "windows-test-results-$GITHUB_SHA" --dir release-work/windows
+          python -B tools/test_update_release.py
+      - name: Validate the exact candidate and both Windows update lifecycle reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          def one(root, name):
+              found = list(pathlib.Path(root).rglob(name))
+              assert len(found) == 1, 'Missing or ambiguous Windows evidence/package'
+              return found[0]
+          archive = one('release-work/package', '*.zip')
+          subprocess.run(['python', 'tools/update_release.py', 'validate', '--archive', str(archive),
+              '--ci-summary', str(one('release-work/windows', 'harness-summary.json')),
+              '--process-report', str(one('release-work/windows', 'updater-e2e.json')),
+              '--desktop-report', str(one('release-work/windows', 'updater-desktop-e2e.json')),
+              '--version', os.environ['UPDATE_VERSION'], '--commit', os.environ['GITHUB_SHA'],
+              '--tag', os.environ['UPDATE_TAG'], '--output', 'release-work/candidate'], check=True)
+          encoded = pathlib.Path('release-work/candidate/photoshelf-update.json').read_bytes()
+          manifest = json.loads(encoded)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"archive_sha256={manifest['packageSha256']}\nmanifest_sha256={hashlib.sha256(encoded).hexdigest()}\n")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"Ready for BigGluk23 approval: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
+              summary.write('Exact Windows CI and performance gates passed. Both process-fixture and real Desktop test-trust lifecycle reports passed. Production signing and publication have not run.\n')
+          PY
+      - name: Match this fresh download to the candidate approved by the owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          encoded = pathlib.Path('release-work/candidate/photoshelf-update.json').read_bytes()
+          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Candidate changed after approval'
+          assert json.loads(encoded)['packageSha256'] == os.environ['EXPECTED_ARCHIVE_SHA256'], 'Archive changed after approval'
+          PY
+      - name: Sign the approved exact package with the protected environment key
         shell: bash
         env:
           PHOTOSHELF_UPDATE_SIGNING_KEY: ${{ secrets.PHOTOSHELF_UPDATE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, pathlib, subprocess
-          archives = list(pathlib.Path('release-work/package').rglob('*.zip'))
-          reports = list(pathlib.Path('release-work/windows').rglob('harness-summary.json'))
-          assert len(archives) == len(reports) == 1, 'Expected one exact Windows archive/report'
-          subprocess.run(['python', 'tools/update_release.py', 'prepare', '--archive', str(archives[0]), '--ci-summary', str(reports[0]),
+          import hashlib, os, pathlib, subprocess
+          def one(root, name):
+              found = list(pathlib.Path(root).rglob(name))
+              assert len(found) == 1, 'Missing or ambiguous Windows evidence/package'
+              return str(found[0])
+          subprocess.run(['python', 'tools/update_release.py', 'prepare',
+              '--archive', one('release-work/package', '*.zip'), '--ci-summary', one('release-work/windows', 'harness-summary.json'),
+              '--process-report', one('release-work/windows', 'updater-e2e.json'),
+              '--desktop-report', one('release-work/windows', 'updater-desktop-e2e.json'),
               '--version', os.environ['UPDATE_VERSION'], '--commit', os.environ['GITHUB_SHA'], '--tag', os.environ['UPDATE_TAG'],
               '--public-key', 'src/PhotoShelf.Application/Updates/TrustedUpdateKey.pem', '--output', 'release-work/signed'], check=True)
+          encoded = pathlib.Path('release-work/signed/photoshelf-update.json').read_bytes()
+          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Signed candidate differs from approval'
           PY
       - name: Create draft, upload, read back and optionally publish
         shell: bash

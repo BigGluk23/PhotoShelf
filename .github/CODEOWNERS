@@ -1,0 +1,3 @@
+# The owner reviews code that can become a signed update, including this file.
+# Enforcement requires the main ruleset in docs/release-protection-setup.md.
+* @BigGluk23

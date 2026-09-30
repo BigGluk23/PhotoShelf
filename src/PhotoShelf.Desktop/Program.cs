@@ -21,14 +21,8 @@ public static class Program
         {
             try
             {
-                var active = ActiveInstallationResolver.Resolve(new UpdateInstallationPaths(), UpdateTrust.PublicKeyPem);
-                if (active is not null && UpdateVersion.IsNewer(active.Version, MainWindow.RunningUpdateVersion))
-                {
-                    using var process = Process.Start(new ProcessStartInfo(active.ExecutablePath)
-                    { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(active.ExecutablePath)! })
-                        ?? throw new IOException("Не удалось запустить установленную версию PhotoShelf.");
-                    return 0;
-                }
+                if (UpdateLaunchRedirector.TryLaunchNewer(new UpdateInstallationPaths(), UpdateTrust.PublicKeyPem,
+                        MainWindow.RunningUpdateVersion)) return 0;
             }
             catch (Exception exception)
             {

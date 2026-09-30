@@ -241,6 +241,31 @@ try {
     $result.browseSmokeVerified = $true
     $result.searchSortSmokeVerified = $true
     Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'
+    # Real Windows process fault boundaries and the actual WPF consent/shutdown/
+    # helper/new-version chain are distinct evidence. Both use disposable test trust
+    # and synthetic data; neither uploads a private key or touches a real library.
+    & (Join-Path $repoRoot 'scripts/verify-update-lifecycle.ps1') -ResultsDirectory $results `
+        -Commit $result.commit -Version $result.version -DotNet $DotNet
+    $processReport = Join-Path $results 'updater-e2e.json'
+    $result.updaterProcessLifecycleVerified = $true
+    $result.updaterProcessLifecycleReportSha256 = (Get-FileHash -LiteralPath $processReport -Algorithm SHA256).Hash.ToLowerInvariant()
+    & (Join-Path $repoRoot 'tools/test-wpf-update-lifecycle.ps1') -ReportDirectory $results -DotNet $DotNet -Python $Python
+    $desktopReport = Join-Path $results 'updater-desktop-e2e.json'
+    $desktopEvidence = Get-Content -LiteralPath $desktopReport -Raw | ConvertFrom-Json
+    if ($desktopEvidence.status -ne 'passed' -or $desktopEvidence.schema -ne 1 -or
+        $desktopEvidence.commit -ne $result.commit -or $desktopEvidence.version -ne $result.version -or
+        $desktopEvidence.platform -ne 'windows' -or
+        $desktopEvidence.scope -ne 'production-desktop-update-lifecycle-with-test-trust') {
+        throw 'The actual WPF updater lifecycle did not produce successful exact-source evidence.'
+    }
+    $result.updaterDesktopLifecycleVerified = $true
+    $result.updaterDesktopLifecycleReportSha256 = (Get-FileHash -LiteralPath $desktopReport -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Share the release validator's strict required-scenario/boolean checks so a
+    # successful script exit or incomplete report can never satisfy this CI gate.
+    $lifecycleSummary = Join-Path $results 'updater-lifecycle-summary.json'
+    $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $lifecycleSummary -Encoding utf8
+    Invoke-Checked $Python @('-c', 'import sys; sys.path.insert(0,"tools"); import update_release as u; u.verify_lifecycle_evidence(u.read_json(sys.argv[1]), u.read_lifecycle_report(sys.argv[2]), u.read_lifecycle_report(sys.argv[3]), sys.argv[4], sys.argv[5])',
+        $lifecycleSummary, $processReport, $desktopReport, $result.version, $result.commit)
     # Smoke must not mutate the installation, and the published ZIP must be the exact
     # archive whose extracted bytes were tested. Catalog/log writes stay in owned TEMP.
     Invoke-Checked $Python @('tools/package_checks.py', 'verify', $extracted, '--version', $result.version, '--commit', $result.commit)

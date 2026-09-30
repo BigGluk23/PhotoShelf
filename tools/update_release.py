@@ -20,6 +20,12 @@ MAX_UNPACKED_BYTES = 4 * 1024 ** 3
 MANIFEST_NAME = "photoshelf-update.json"
 SIGNATURE_NAME = "photoshelf-update.sig"
 REQUIRED_JOBS = {"windows", "Same-host baseline/current performance"}
+PROCESS_SCENARIOS = {"explicit-consent-and-parent-drain", "verified-two-version-install-and-health",
+                     "old-shortcut-launches-active-version", "used-request-replay-rejected", "downgrade-rejected",
+                     "helper-kill-before-activation", "helper-kill-after-activation"}
+DESKTOP_ASSERTIONS = {"normalOldEntrypoint", "realInstallButton", "oldProcessExited", "helperLaunched",
+                      "newProcessLaunched", "startupReadyReceipt", "viewRestored", "syntheticCatalogPreserved",
+                      "syntheticOriginalsPreserved", "journalsPreserved", "oldShortcutRedirects", "noApplicationErrors"}
 
 
 def release_identity(version, commit, tag):
@@ -113,8 +119,43 @@ def validate_archive(archive, version, commit):
     return unpacked, inventory_digest
 
 
-def prepare_manifest(archive, version, commit, tag, ci_summary):
+def verify_lifecycle_evidence(ci_summary, process_bytes, desktop_bytes, version, commit):
+    reports = []
+    for raw, field, scope in (
+            (process_bytes, "updaterProcessLifecycle", "production-updater-process-lifecycle-with-fixture-applications"),
+            (desktop_bytes, "updaterDesktopLifecycle", "production-desktop-update-lifecycle-with-test-trust")):
+        if (not isinstance(raw, bytes) or not 0 < len(raw) <= 512 * 1024 or
+                ci_summary.get(field + "Verified") is not True or
+                ci_summary.get(field + "ReportSha256") != hashlib.sha256(raw).hexdigest()):
+            raise ValueError("Missing or mismatched Windows updater lifecycle evidence")
+        report = json.loads(raw)
+        if (report.get("schema") != 1 or report.get("status") != "passed" or report.get("commit") != commit or
+                report.get("version") != version or report.get("platform") != "windows" or report.get("scope") != scope or
+                not isinstance(report.get("limitations"), list) or not report["limitations"]):
+            raise ValueError("Windows updater lifecycle evidence has the wrong source, platform or scope")
+        reports.append(report)
+    process, desktop = reports
+    scenarios = process.get("scenarios")
+    if (not isinstance(scenarios, list) or len(scenarios) != len(PROCESS_SCENARIOS) or
+            {scenario.get("name") for scenario in scenarios} != PROCESS_SCENARIOS or
+            any(scenario.get("status") != "passed" for scenario in scenarios) or
+            process.get("originalHashesPreserved") is not True or process.get("sqliteIntegrityPassed") is not True):
+        raise ValueError("Windows updater process safety scenarios did not all pass")
+    assertions = desktop.get("assertions")
+    if (not isinstance(assertions, dict) or not DESKTOP_ASSERTIONS.issubset(assertions) or
+            any(assertions[name] is not True for name in DESKTOP_ASSERTIONS) or
+            desktop.get("sourcePublicKeySubstituted") is not True):
+        raise ValueError("The real Desktop update lifecycle did not pass every required assertion")
+    versions = desktop.get("testVersions")
+    if (not isinstance(versions, list) or len(versions) != 2 or
+            any(not isinstance(item, str) or not re.fullmatch(r"\d+\.\d+\.\d+", item) for item in versions) or
+            tuple(map(int, versions[0].split("."))) >= tuple(map(int, versions[1].split(".")))):
+        raise ValueError("Desktop lifecycle must exercise two distinct increasing test versions")
+
+
+def prepare_manifest(archive, version, commit, tag, ci_summary, process_bytes, desktop_bytes):
     numeric = release_identity(version, commit, tag)
+    verify_lifecycle_evidence(ci_summary, process_bytes, desktop_bytes, version, commit)
     archive = Path(archive)
     if archive.name != f"PhotoShelf-v{version}-win-x64.zip":
         raise ValueError("Unexpected package filename")
@@ -159,6 +200,13 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def read_lifecycle_report(path):
+    path = Path(path)
+    if not 0 < path.stat().st_size <= 512 * 1024:
+        raise ValueError("Windows lifecycle report exceeds supported bounds")
+    return path.read_bytes()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -166,28 +214,35 @@ def main():
     gate.add_argument("--run", type=Path, required=True)
     gate.add_argument("--jobs", type=Path, required=True)
     gate.add_argument("--commit", required=True)
-    prepare = commands.add_parser("prepare")
-    for name in ("archive", "ci-summary", "public-key", "output"):
-        prepare.add_argument("--" + name, type=Path, required=True)
-    for name in ("version", "commit", "tag"):
-        prepare.add_argument("--" + name, required=True)
+    for command in ("validate", "prepare"):
+        prepare = commands.add_parser(command)
+        for name in ("archive", "ci-summary", "process-report", "desktop-report", "output"):
+            prepare.add_argument("--" + name, type=Path, required=True)
+        if command == "prepare":
+            prepare.add_argument("--public-key", type=Path, required=True)
+        for name in ("version", "commit", "tag"):
+            prepare.add_argument("--" + name, required=True)
     args = parser.parse_args()
     try:
         if args.command == "gate":
             verified = verify_ci(read_json(args.run), read_json(args.jobs), args.commit)
             print(f"OK completed Windows/performance run {verified['runId']}, attempt {verified['runAttempt']}, {args.commit}")
         else:
-            manifest = prepare_manifest(args.archive, args.version, args.commit, args.tag, read_json(args.ci_summary))
+            manifest = prepare_manifest(args.archive, args.version, args.commit, args.tag, read_json(args.ci_summary),
+                                        read_lifecycle_report(args.process_report), read_lifecycle_report(args.desktop_report))
             args.output.mkdir(parents=True, exist_ok=False)
             manifest_path = args.output / MANIFEST_NAME
             manifest_path.write_bytes(manifest)
+            if args.command == "validate":
+                print(f"OK unsigned release candidate and Windows lifecycle evidence: {args.tag}, {args.commit}")
+                return 0
             sign_manifest(manifest_path, args.output / SIGNATURE_NAME, args.public_key)
             shutil.copyfile(args.archive, args.output / args.archive.name)
             if sha256(args.output / args.archive.name) != json.loads(manifest)["packageSha256"]:
                 raise ValueError("Package changed while preparing release assets")
             print(f"OK signed release assets: {args.tag}, {args.commit}")
         return 0
-    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, subprocess.TimeoutExpired):
+    except (ValueError, OSError, KeyError, TypeError, AttributeError, zipfile.BadZipFile, subprocess.TimeoutExpired):
         # Avoid echoing subprocess/secret contents, even if an invalid key was supplied.
         print("FAILED update release validation/signing; no release was published")
         return 1
