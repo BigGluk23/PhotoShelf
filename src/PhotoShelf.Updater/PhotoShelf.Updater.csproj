@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>PhotoShelf.Updater</AssemblyName>
+    <RootNamespace>PhotoShelf.Updater</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../PhotoShelf.Application/PhotoShelf.Application.csproj" />
+  </ItemGroup>
+</Project>

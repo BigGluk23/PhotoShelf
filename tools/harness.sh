@@ -18,6 +18,7 @@ for argument in "$@"; do
 done
 "$python_cmd" -B tools/test_harness_checks.py
 "$python_cmd" -B tools/test_package_checks.py
+"$python_cmd" -B tools/test_update_release.py
 "$python_cmd" tools/harness_checks.py repository
 if "$checks_only"; then
   echo 'OK repository checks only; no build, tests, or Windows runtime verification requested.'

@@ -10,7 +10,7 @@ MANIFEST = "package-manifest.json"
 MAX_FILES = 1024
 MAX_MANIFEST_BYTES = 256 * 1024
 REQUIRED = {
-    "PhotoShelf.exe", "RUNNING.txt", "codecs/heif/PhotoShelf.HeifWorker.exe",
+    "PhotoShelf.exe", "PhotoShelf.Updater.exe", "RUNNING.txt", "codecs/heif/PhotoShelf.HeifWorker.exe",
     "codecs/heif/heif.dll", "codecs/heif/libde265.dll", "codecs/heif/VERSION.txt",
     "codecs/heif/sources/sources.json",
 }

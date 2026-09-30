@@ -130,8 +130,9 @@ public partial class MainWindow
         var outcome = "cancelled";
         var query = CreateQuery();
         var identity = $"{query.Folder}|{query.ViewMode}|{query.SearchText}|{query.ShowVideos}|{query.IncludeSubfolders}|{query.MissingCaptureDateOnly}";
+        var resumeAnchor = _updateResumeAnchor;
         var preserve = identity == _viewIdentity;
-        var anchor = preserve ? GetGridAnchor() : new GridAnchor(0, null);
+        var anchor = resumeAnchor ?? (preserve ? GetGridAnchor() : new GridAnchor(0, null));
         var old = PhotoRows as VirtualPhotoRows;
         // The cache is bounded by VirtualPhotoRows. Never materialize the whole catalog.
         var retained = preserve ? old?.LoadedItems.DistinctBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
@@ -183,7 +184,7 @@ public partial class MainWindow
             if (background && preserve && GetGridAnchor() != anchor) { _projectionDeferredForScroll = true; outcome = "deferred"; return false; }
             old?.Dispose(); PhotoRows = rows; pending = null; _currentQuery = query; _viewIdentity = identity;
             OnPropertyChanged(nameof(PhotoRows));
-            if (preserve && anchorIndex > 0 && rows.Count > 0)
+            if ((preserve || resumeAnchor is not null) && anchorIndex > 0 && rows.Count > 0)
             {
                 var row = rows[rows.RowForItem(Math.Min(anchorIndex, rows.ItemCount - 1))];
                 PhotoGrid.ScrollIntoView(row);
@@ -191,6 +192,7 @@ public partial class MainWindow
                 if (FindVisualChild<System.Windows.Controls.ScrollViewer>(PhotoGrid) is { } scroll)
                     scroll.ScrollToVerticalOffset(rows.RowForItem(Math.Min(anchorIndex, rows.ItemCount - 1)));
             }
+            _updateResumeAnchor = null;
             _backgroundRefresh.Published(revision);
             StatusText.Text = $"В виде: {rows.ItemCount:N0} · Каталог: {_catalogCount:N0}";
             PerformanceMetrics.Record("catalog.first_page", timer.Elapsed.TotalMilliseconds, rows.ItemCount);
@@ -393,6 +395,7 @@ public partial class MainWindow
         IsEnabled = false;
         var enabledOwnedWindows = OwnedWindows.Cast<Window>().Where(window => window.IsEnabled).ToArray();
         foreach (var window in enabledOwnedWindows) window.IsEnabled = false;
+        ShowUpdateShutdown();
         _fileOperationCancellation?.Cancel(); _duplicateCancellation?.Cancel();
         try
         {
@@ -400,7 +403,29 @@ public partial class MainWindow
             if (_activeDuplicateReview is { } review) { review.StopOperation(); await review.PendingOperation; }
             await _fileOperationTask;
             if (_catalogLoaded) await PersistStateAsync(CaptureState(), CancellationToken.None, 0);
-            if (_libraryMonitor is not null) await _libraryMonitor.DisposeAsync();
+            if (_updateToInstall is not null && _cancelUpdateInstall)
+            {
+                _updateToInstall = null; _closing = false; IsEnabled = true;
+                foreach (var window in enabledOwnedWindows.Where(window => window.IsLoaded)) window.IsEnabled = true;
+                QueueLibraryMonitoring();
+                if (!_hasPendingRecovery) StartMetadataIndexing(false);
+                return;
+            }
+            if (_libraryMonitor is not null)
+            {
+                await _libraryMonitor.DisposeAsync();
+                _libraryMonitor = null;
+                _monitorConfigurationKey = "";
+            }
+            if (_updateToInstall is not null && !_cancelUpdateInstall) await LaunchConsentedUpdaterAsync();
+            if (_updateToInstall is not null && _cancelUpdateInstall)
+            {
+                _updateToInstall = null; _closing = false; IsEnabled = true;
+                foreach (var window in enabledOwnedWindows.Where(window => window.IsLoaded)) window.IsEnabled = true;
+                QueueLibraryMonitoring();
+                if (!_hasPendingRecovery) StartMetadataIndexing(false);
+                return;
+            }
             _closeReady = true; Close();
         }
         catch (Exception ex)
@@ -411,10 +436,14 @@ public partial class MainWindow
                 System.Windows.Application.Current.Shutdown(1);
                 return;
             }
+            _updateToInstall = null;
             _closing = false;
             IsEnabled = true;
             foreach (var window in enabledOwnedWindows.Where(window => window.IsLoaded)) window.IsEnabled = true;
-            System.Windows.MessageBox.Show($"Не удалось завершить сохранение: {ex.Message}\nОкно оставлено открытым.", "PhotoShelf");
+            QueueLibraryMonitoring();
+            if (!_hasPendingRecovery) StartMetadataIndexing(false);
+            System.Windows.MessageBox.Show($"Не удалось завершить сохранение или подготовку обновления: {ex.Message}\nОкно оставлено открытым.", "PhotoShelf");
         }
+        finally { _updateClosingWindow?.Finish(); _updateClosingWindow = null; }
     }
 }

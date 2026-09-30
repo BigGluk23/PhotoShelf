@@ -2,5 +2,6 @@
   <ItemGroup>
     <ProjectReference Include="..\PhotoShelf.Domain\PhotoShelf.Domain.csproj" />
   </ItemGroup>
+  <ItemGroup><EmbeddedResource Include="Updates/TrustedUpdateKey.pem" LogicalName="PhotoShelf.UpdateSigningPublicKey" /></ItemGroup>
 </Project>
 

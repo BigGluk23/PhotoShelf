@@ -8,9 +8,11 @@ namespace PhotoShelf.Desktop;
 
 public partial class SettingsWindow : Window
 {
-    public SettingsWindow(bool showVideos, bool includeSystemFolders)
+    public SettingsWindow(bool showVideos, bool includeSystemFolders, UpdateCenter? updates = null)
     {
         InitializeComponent();
+        UpdatesSection.DataContext = updates;
+        UpdatesSection.Visibility = updates is null ? Visibility.Collapsed : Visibility.Visible;
         ShowVideosCheckBox.IsChecked = showVideos;
         IncludeSystemFoldersCheckBox.IsChecked = includeSystemFolders;
         CatalogPathBox.Text = LocalCatalogStore.CatalogDirectory;
@@ -30,6 +32,7 @@ public partial class SettingsWindow : Window
     {
         try
         {
+            if (UpdatesSection.DataContext is UpdateCenter updates) await updates.InitializeAsync();
             var state = await new SqliteDesktopCatalogStore().LoadAsync(includeItems: false);
             if (IsLoaded) QuarantinePathBox.Text = state.QuarantineDirectory ?? "Папка ещё не выбрана";
         }

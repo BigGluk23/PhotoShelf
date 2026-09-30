@@ -18,6 +18,7 @@
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="48" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -31,7 +32,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Image Width="30" Height="30" Source="pack://application:,,,/PhotoShelf;component/Assets/giraffe-icon.png" />
-                        <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v0.10.13" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        <TextBlock x:Name="AppTitleText" Margin="9,0,0,0" Text="PhotoShelf Ultra v1.10.14" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Column="1" MaxWidth="560" Height="32" Background="White" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="4" HorizontalAlignment="Stretch">
                     <Grid>
@@ -51,7 +52,17 @@
             </Grid>
         </Border>
 
-        <Grid Grid.Row="1">
+        <Border x:Name="UpdateOfferBanner" Grid.Row="1" Background="#FFFFF0D8" Padding="16,7" Visibility="Collapsed">
+            <DockPanel LastChildFill="True">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Content="Обновления…" Click="OnUpdatesClicked" Padding="10,3" Margin="10,0,8,0" />
+                    <Button Content="Позже" Click="OnUpdateLaterClicked" Padding="10,3" />
+                </StackPanel>
+                <TextBlock x:Name="UpdateOfferText" VerticalAlignment="Center" TextWrapping="Wrap" />
+            </DockPanel>
+        </Border>
+
+        <Grid Grid.Row="2">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="250" />
                 <ColumnDefinition Width="5" />
@@ -308,7 +319,7 @@
             </Border>
         </Grid>
 
-        <Border Grid.Row="2" Background="{StaticResource PanelDarkBrush}">
+        <Border Grid.Row="3" Background="{StaticResource PanelDarkBrush}">
             <Grid Margin="10,4">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />

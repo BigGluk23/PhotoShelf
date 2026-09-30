@@ -1,7 +1,15 @@
 # PhotoShelf: передача разработки
 
-Текущая версия: **PhotoShelf Ultra v0.10.13** (`0.10.13-ultra`). Windows x64, C#/.NET 10/WPF.
+Текущая версия: **PhotoShelf Ultra v1.10.14** (`1.10.14-ultra`). Windows x64, C#/.NET 10/WPF.
 Источник истины — https://github.com/BigGluk23/PhotoShelf, ветка `main`. Продолжение: `git pull --ff-only` и чтение `AGENTS.md`. Не переносите старый ZIP поверх checkout: архивы до v0.10.2 сохраняются отдельно как исторические поставки.
+
+## Обновления из интерфейса v1.10.14
+
+Application/Updates проверяет только стабильный public GitHub Release и подписанный manifest. Проверка отделена от explicit DownloadAndStage; Desktop/UpdateCenter отделяет скачивание от установки. Settings opt-out сохраняется в Local/updates/preferences-v1.json, повреждение настроек отключает автоматические запросы. Сетевые сбои любых проверок бесшумны. Описание сохранённой загрузки читается ограниченно, полная проверка выполняется перед установкой.
+
+PhotoShelf.Updater принимает только свежий однократный запрос из owned updates/requests с привязкой версии и SHA. Ждёт PID+starttime без kill, проверяет stage, копирует в новую program/versions/<id>/app, выполняет isolated startup и атомарно публикует program/active-v1.json. Program.Main направляет старые ярлыки в явно активированную более новую версию. Никогда не восстанавливать старую БД ради отката EXE. После активации/реального старта автоматического rollback нет.
+
+Ключ подписи private не должен попадать в Git/логи/артефакты. В коде только TrustedUpdateKey.pem. Подключение PHOTOSHELF_UPDATE_SIGNING_KEY требует отдельного явного согласия; до него release workflow блокирует подпись. Workflow update-release запускается вручную после обоих exact-SHA CI gates, по умолчанию создаёт draft. Не выдавать локальную cross-сборку за Windows runtime. Текущие результаты: docs/v1.10.14-in-app-updates.md.
 
 ## Безопасное обновление v0.10.13
 

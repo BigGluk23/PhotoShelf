@@ -1,0 +1,29 @@
+<UserControl x:Class="PhotoShelf.Desktop.UpdatesPanel"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+ <UserControl.Resources><BooleanToVisibilityConverter x:Key="UpdateBoolVisibility" /></UserControl.Resources>
+ <StackPanel>
+  <TextBlock Text="Обновления программы" FontSize="16" FontWeight="SemiBold" />
+  <TextBlock Margin="0,8,0,0" Text="{Binding CurrentVersion, StringFormat=Текущая версия: PhotoShelf Ultra {0}}" />
+  <CheckBox x:Name="AutoUpdateCheckBox" Margin="0,12,0,0" Content="Проверять обновления при запуске"
+   IsChecked="{Binding AutoCheck, Mode=OneWay}" IsEnabled="{Binding IsInitialized}" Click="OnAutoCheckClicked" />
+  <TextBlock Margin="0,6,0,0" Text="Скачивание и установка выполняются только по вашему согласию." TextWrapping="Wrap" Foreground="#FF77706A" />
+  <WrapPanel Margin="0,12,0,0">
+   <Button x:Name="CheckUpdatesButton" Content="Проверить обновления" IsEnabled="{Binding CanCheck}" Click="OnCheckClicked" Padding="12,6" Margin="0,0,8,6" />
+   <Button Content="Что нового на GitHub" IsEnabled="{Binding HasUpdate}" Click="OnNotesClicked" Padding="12,6" Margin="0,0,8,6" />
+  </WrapPanel>
+  <TextBlock Text="{Binding LastCheckedText}" Foreground="#FF77706A" TextWrapping="Wrap" />
+  <TextBlock Margin="0,12,0,0" Text="{Binding AvailableText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+  <TextBlock Margin="0,4,0,0" Text="{Binding DownloadSizeText}" Foreground="#FF77706A" />
+  <ProgressBar Margin="0,10,0,0" Height="5" IsIndeterminate="True" Visibility="{Binding IsChecking, Converter={StaticResource UpdateBoolVisibility}}" />
+  <ProgressBar Margin="0,10,0,0" Height="5" Minimum="0" Maximum="100" Value="{Binding Progress}" Visibility="{Binding IsDownloading, Converter={StaticResource UpdateBoolVisibility}}" />
+  <TextBlock Margin="0,10,0,0" Text="{Binding StatusText}" TextWrapping="Wrap" />
+  <WrapPanel Margin="0,12,0,0" Visibility="{Binding HasUpdate, Converter={StaticResource UpdateBoolVisibility}}">
+   <Button Content="Скачать обновление" IsEnabled="{Binding CanDownload}" Click="OnDownloadClicked" Padding="12,6" Margin="0,0,8,6" />
+   <Button Content="Отменить загрузку" Visibility="{Binding IsDownloading, Converter={StaticResource UpdateBoolVisibility}}" Click="OnCancelDownloadClicked" Padding="12,6" Margin="0,0,8,6" />
+   <Button Content="Обновить и перезапустить" IsEnabled="{Binding CanInstall}" Click="OnInstallClicked" Padding="12,6" Margin="0,0,8,6" />
+   <Button Content="Позже" Click="OnLaterClicked" Padding="12,6" Margin="0,0,8,6" />
+   <Button Content="Пропустить эту версию" Click="OnSkipClicked" Padding="12,6" Margin="0,0,8,6" />
+  </WrapPanel>
+ </StackPanel>
+</UserControl>

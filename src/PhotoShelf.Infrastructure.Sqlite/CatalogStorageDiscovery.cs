@@ -77,7 +77,8 @@ internal static class CatalogStorageFiles
 
     internal static bool IsRetainedAuxiliaryEntry(string name) => name is
         "writer.lock" or "startup.lock" or "startup-v1.lock" or "storage-generations" or "storage-selection-v1.json" or
-        "backups" or "diagnostics" or "logs" or "thumb-cache-v1" or "thumb-cache-v2" or "duplicate-searches" ||
+        "backups" or "diagnostics" or "logs" or "thumb-cache-v1" or "thumb-cache-v2" or "duplicate-searches" or
+        "updates" or "program" ||
         name.StartsWith("storage-selection-v1.json.pending-", StringComparison.Ordinal);
 
     internal static CatalogStorageSelection ReadSelection(string localDirectory)

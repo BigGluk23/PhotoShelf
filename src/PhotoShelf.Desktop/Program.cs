@@ -4,6 +4,9 @@ using System.Windows;
 using System.Windows.Media.Imaging;
 using PhotoShelf.Application.Diagnostics;
 using PhotoShelf.Infrastructure.Sqlite;
+using System.Diagnostics;
+using PhotoShelf.Application.Updates;
+using PhotoShelf.Application.Updates.Installation;
 
 namespace PhotoShelf.Desktop;
 
@@ -12,6 +15,27 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // Old shortcuts keep opening the version explicitly activated by the updater.
+        // Diagnostic entry points always remain isolated and never follow a user's installation.
+        if (args.Length == 0)
+        {
+            try
+            {
+                var active = ActiveInstallationResolver.Resolve(new UpdateInstallationPaths(), UpdateTrust.PublicKeyPem);
+                if (active is not null && UpdateVersion.IsNewer(active.Version, MainWindow.RunningUpdateVersion))
+                {
+                    using var process = Process.Start(new ProcessStartInfo(active.ExecutablePath)
+                    { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(active.ExecutablePath)! })
+                        ?? throw new IOException("Не удалось запустить установленную версию PhotoShelf.");
+                    return 0;
+                }
+            }
+            catch (Exception exception)
+            {
+                ErrorReporter.Show(exception, "Не удалось проверить установленное обновление. Каталог не был открыт");
+                return 1;
+            }
+        }
         StartupCheckArguments options;
         FileStream? report = null;
         try

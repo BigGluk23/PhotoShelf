@@ -38,6 +38,11 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing required"):
             self.verify()
 
+    def test_missing_updater_blocks_verification(self):
+        (self.root / "PhotoShelf.Updater.exe").unlink()
+        with self.assertRaisesRegex(ValueError, "Missing required"):
+            self.verify()
+
     def test_changed_bytes_and_stale_overlay_files_are_rejected(self):
         path = self.root / "PhotoShelf.exe"
         original = path.read_bytes()

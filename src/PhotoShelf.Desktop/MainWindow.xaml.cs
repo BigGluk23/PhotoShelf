@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v0.10.13";
+    private const string VersionLabel = "Ultra v1.10.14";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -179,7 +179,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnSettingsClicked(object sender, RoutedEventArgs e)
     {
-        var dialog = new SettingsWindow(ShowVideos, _includeSystemFolders)
+        var dialog = new SettingsWindow(ShowVideos, _includeSystemFolders, EnsureUpdateCenter())
         {
             Owner = this
         };
@@ -204,6 +204,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _isInitializing = false;
         PerformanceMetrics.Start(Dispatcher);
         StartSavedCatalogLoading();
+        _ = StartUpdateCheckAsync();
     }
 
     private void OnCancelDuplicatesClicked(object sender, RoutedEventArgs e)
@@ -721,6 +722,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     protected override void OnClosed(EventArgs e)
     {
+        _updates?.Dispose();
+        _updateHttp?.Dispose();
         _lifetime.Cancel();
         (PhotoRows as VirtualPhotoRows)?.Dispose();
         PerformanceMetrics.Stop();
@@ -958,6 +961,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task LoadSavedCatalogAsync()
     {
+        await RestoreUpdateResumeAsync();
         await _desktopCatalogStore.InitializeAsync(_lifetime.Token);
         await _metadataIndexStore.InitializeAsync(_lifetime.Token);
         await _duplicateHashStore.InitializeAsync(_lifetime.Token);
@@ -996,6 +1000,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadSavedCatalogAsync();
             MarkInitialCatalogReady();
+            _ = ReportUpdatedStartupReadyAsync();
             // Atomically register the selected folder before the coordinator can
             // start an initial pass; foreground browse precedes queued library work.
             if (_viewMode == LibraryViewMode.Folder && _activeFolder is not null) _ = BrowseFolderAsync(_activeFolder);

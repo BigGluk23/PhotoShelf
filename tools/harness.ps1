@@ -32,6 +32,7 @@ try {
     $env:DOTNET_NOLOGO = '1'
     Invoke-Checked $Python @('-B', 'tools/test_harness_checks.py')
     Invoke-Checked $Python @('-B', 'tools/test_package_checks.py')
+    Invoke-Checked $Python @('-B', 'tools/test_update_release.py')
     Invoke-Checked $Python @('tools/harness_checks.py', 'repository')
     $result.commit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Git revision.' }
@@ -77,6 +78,23 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not record resolved publish dependency inventory.' }
     & $DotNet list src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj package --vulnerable --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'publish-dependency-audit.json') -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw 'Could not check publish dependency advisories.' }
+    # Keep the helper's publish graph/output separate: publishing it over Desktop
+    # would overwrite dependencies or accidentally include stale build products.
+    $updaterPublish = Join-Path $artifactRoot 'updater-publish'
+    Invoke-Checked $DotNet @('publish', 'src/PhotoShelf.Updater/PhotoShelf.Updater.csproj', '-c', 'Release', '-r', 'win-x64',
+        '--self-contained', 'true', '-m:1', '-nr:false', '-p:UseSharedCompilation=false', '-p:PublishSingleFile=true',
+        '-p:PhotoShelfPublish=true', '-p:RestoreLockedMode=true',
+        '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:EnableCompressionInSingleFile=true', '-p:DebugType=None', '-o', $updaterPublish)
+    $updaterExe = Join-Path $updaterPublish 'PhotoShelf.Updater.exe'
+    if (-not (Test-Path -LiteralPath $updaterExe -PathType Leaf)) { throw 'Publish did not produce PhotoShelf.Updater.exe.' }
+    if (@(Get-ChildItem -LiteralPath $updaterPublish -File | Where-Object { $_.Name -ne 'PhotoShelf.Updater.exe' }).Count -ne 0) {
+        throw 'Updater is not a self-contained single executable; copying only EXE would make an incomplete package.'
+    }
+    Copy-Item -LiteralPath $updaterExe -Destination (Join-Path $publish 'PhotoShelf.Updater.exe')
+    & $DotNet list src/PhotoShelf.Updater/PhotoShelf.Updater.csproj package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'updater-publish-dependencies.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not record updater publish dependency inventory.' }
+    & $DotNet list src/PhotoShelf.Updater/PhotoShelf.Updater.csproj package --vulnerable --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'updater-publish-dependency-audit.json') -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Could not check updater publish dependency advisories.' }
     # Validate what the user downloads: generate the versioned instructions/inventory,
     # archive once, extract into a new directory, then run every EXE smoke from there.
     Invoke-Checked $Python @('tools/package_checks.py', 'create', $publish, '--version', $result.version, '--commit', $result.commit)
@@ -89,6 +107,18 @@ try {
         '--report', (Join-Path $results 'package-verification.json'))
     $exe = Join-Path $extracted 'PhotoShelf.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Publish did not produce PhotoShelf.exe.' }
+    # Read-only CLI self-test; never installs an update or opens a real catalog.
+    $updaterSmoke = Start-Process -FilePath (Join-Path $extracted 'PhotoShelf.Updater.exe') -ArgumentList @('--self-test') -PassThru
+    try {
+        if (-not $updaterSmoke.WaitForExit(15000)) {
+            $updaterSmoke.Kill()
+            $updaterSmoke.WaitForExit()
+            throw 'Packaged updater self-test timed out.'
+        }
+        if ($updaterSmoke.ExitCode -ne 0) { throw 'Packaged updater self-test failed.' }
+    }
+    finally { $updaterSmoke.Dispose() }
+    $result.updaterSelfTestVerified = $true
     & (Join-Path $repoRoot 'scripts/test-startup-package.ps1') -ExePath $exe -ReportDirectory $results
 
     # This flag creates its own fresh temporary catalog and never reads the user's settings/library.
