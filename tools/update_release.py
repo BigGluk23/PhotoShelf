@@ -25,7 +25,9 @@ PROCESS_SCENARIOS = {"explicit-consent-and-parent-drain", "verified-two-version-
                      "helper-kill-before-activation", "helper-kill-after-activation"}
 DESKTOP_ASSERTIONS = {"normalOldEntrypoint", "realInstallButton", "oldProcessExited", "helperLaunched",
                       "newProcessLaunched", "startupReadyReceipt", "viewRestored", "syntheticCatalogPreserved",
-                      "syntheticOriginalsPreserved", "journalsPreserved", "oldShortcutRedirects", "noApplicationErrors"}
+                      "syntheticOriginalsPreserved", "journalsPreserved", "oldShortcutRedirects", "noApplicationErrors",
+                      "repeatedLaunchBeforePointerBlocked", "repeatedLaunchAfterPointerBlocked",
+                      "repeatedLaunchBeforeHealthBlocked"}
 
 
 def release_identity(version, commit, tag):
@@ -144,7 +146,8 @@ def verify_lifecycle_evidence(ci_summary, process_bytes, desktop_bytes, version,
     assertions = desktop.get("assertions")
     if (not isinstance(assertions, dict) or not DESKTOP_ASSERTIONS.issubset(assertions) or
             any(assertions[name] is not True for name in DESKTOP_ASSERTIONS) or
-            desktop.get("sourcePublicKeySubstituted") is not True):
+            desktop.get("sourcePublicKeySubstituted") is not True or
+            desktop.get("sourceFaultCheckpointsInserted") is not True):
         raise ValueError("The real Desktop update lifecycle did not pass every required assertion")
     versions = desktop.get("testVersions")
     if (not isinstance(versions, list) or len(versions) != 2 or

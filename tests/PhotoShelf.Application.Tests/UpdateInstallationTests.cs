@@ -270,9 +270,10 @@ public sealed class UpdateInstallationTests : IDisposable
         Assert.True(File.Exists(old.ExecutablePath));
         var nextStage = await CreateStageAsync("0.10.16");
         var nextRequest = await UpdateInstallRequest.CreateFileAsync(nextStage, Paths, "0.10.15");
-        var next = new UpdateInstaller(Paths, PublicKey, "0.10.15", new FakeProcesses(Paths),
+        var nextHost = new FakeProcesses(Paths);
+        var next = new UpdateInstaller(Paths, PublicKey, "0.10.15", nextHost,
             new UpdateInstallationOptions { StartupHealthTimeout = TimeSpan.Zero });
-        var result = await next.InstallAsync(nextRequest);
+        var result = await InstallWithHandoffAsync(next, nextHost, nextRequest);
         Assert.False(result.StartupReady);
         Assert.Equal("0.10.16", ActiveInstallationResolver.Resolve(Paths, PublicKey)!.Version);
     }
@@ -285,7 +286,9 @@ public sealed class UpdateInstallationTests : IDisposable
         var requestPath = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
         var installer = Installer(new FakeProcesses(Paths, reportReady: true));
         await installer.InstallAsync(requestPath);
-        await Assert.ThrowsAsync<IOException>(() => installer.InstallAsync(requestPath));
+        // A replay has no new parent handoff: the helper must reject its durable claim directly.
+        await Assert.ThrowsAsync<IOException>(() => new UpdateInstaller(Paths, PublicKey, "0.10.14",
+            new FakeProcesses(Paths)).InstallAsync(requestPath));
         var request = JsonSerializer.Deserialize<UpdateInstallRequest>(await File.ReadAllTextAsync(requestPath), JsonOptions)!;
         var expired = request with { RequestId = Guid.NewGuid().ToString("N"), ConsentedAtUtc = DateTimeOffset.UtcNow.AddHours(-1) };
         var expiredPath = Path.Combine(Paths.RequestsRoot, expired.RequestId + ".json");
@@ -326,8 +329,341 @@ public sealed class UpdateInstallationTests : IDisposable
     public void HelperCliRejectsAmbiguousOrUnconsentedCommands(params string[] arguments) =>
         Assert.Throws<ArgumentException>(() => UpdateHelperArguments.Parse(arguments));
 
-    private UpdateInstaller Installer(FakeProcesses host, UpdateInstallationOptions? options = null) =>
-        new(Paths, PublicKey, "0.10.14-ultra", host, options ?? new() { StartupHealthTimeout = TimeSpan.Zero });
+    [Fact]
+    public async Task NormalStartupLeaseIsExclusiveAndAnUnownedRetainedLockFileNeverBlocksRecovery()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var first = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath);
+        Assert.NotNull(first);
+        try { Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath)); }
+        finally { first.Dispose(); first.Dispose(); }
+        Assert.True(File.Exists(Paths.InstallationLockPath));
+        using var recovered = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath);
+        Assert.NotNull(recovered);
+    }
+
+    [Fact]
+    public async Task InstallerReservesNormalStartupBeforeParentExitAndKeepsItReservedThroughActivation()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var evidence = await SeedUserEvidenceAsync();
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        var checkpoints = new List<string>();
+        var host = new FakeProcesses(Paths, reportReady: true);
+        var options = new UpdateInstallationOptions
+        {
+            StartupHealthTimeout = TimeSpan.Zero,
+            Checkpoint = step =>
+            {
+                if (step is not ("startup-reserved" or "handoff-accepted" or "parent-exited" or "before-pointer-publish" or "pointer-published")) return;
+                checkpoints.Add(step);
+                using var admission = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath);
+                Assert.Null(admission);
+                if (step == "startup-reserved") Assert.Empty(host.Events);
+            }
+        };
+        var result = await Installer(host, options).InstallAsync(request);
+        Assert.True(result.StartupReady);
+        Assert.Equal(new[] { "startup-reserved", "handoff-accepted", "parent-exited", "before-pointer-publish", "pointer-published" }, checkpoints);
+        using var unlocked = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", result.Target.ExecutablePath);
+        Assert.NotNull(unlocked);
+        await AssertEvidenceUnchangedAsync(evidence);
+    }
+
+    [Fact]
+    public async Task MissingParentAcceptanceTimesOutWithoutWaitingForExitOrActivatingAndCannotBeAcceptedLate()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var evidence = await SeedUserEvidenceAsync();
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        var host = new FakeProcesses(Paths);
+        var installer = new UpdateInstaller(Paths, PublicKey, "0.10.14", host,
+            new() { HandoffTimeout = TimeSpan.FromMilliseconds(80) });
+        await Assert.ThrowsAsync<TimeoutException>(() => installer.InstallAsync(request));
+        Assert.Empty(host.Events);
+        Assert.Equal(old, ActiveInstallationResolver.Resolve(Paths, PublicKey));
+        using var helper = Process.GetCurrentProcess();
+        await Assert.ThrowsAsync<InvalidDataException>(() => UpdateInstallationHandoff.AcceptWhenReadyAsync(request,
+            Paths, helper.Id, helper.StartTime.ToUniversalTime().Ticks, TimeSpan.FromSeconds(1)));
+        await Assert.ThrowsAsync<IOException>(() => installer.InstallAsync(request));
+        Assert.False(File.Exists(Path.Combine(Paths.OperationsRoot, Path.GetFileNameWithoutExtension(request), "parent-accepted.json")));
+        using var recovered = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath);
+        Assert.NotNull(recovered);
+        await AssertEvidenceUnchangedAsync(evidence);
+    }
+
+    [Fact]
+    public async Task HandoffRejectsWrongHelperIdentityAndCancellationNeverWritesAcceptance()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        using var cancellation = new CancellationTokenSource();
+        var installer = new UpdateInstaller(Paths, PublicKey, "0.10.14", new FakeProcesses(Paths),
+            new() { HandoffTimeout = TimeSpan.FromSeconds(2) });
+        var installation = installer.InstallAsync(request, cancellation.Token);
+        var ready = Path.Combine(Paths.OperationsRoot, Path.GetFileNameWithoutExtension(request), "helper-ready.json");
+        try
+        {
+            using var helper = Process.GetCurrentProcess();
+            await Assert.ThrowsAsync<IOException>(() => UpdateInstallationHandoff.AcceptWhenReadyAsync(request, Paths,
+                helper.Id, helper.StartTime.ToUniversalTime().Ticks - 1, TimeSpan.FromSeconds(1)));
+            using var parentCancellation = new CancellationTokenSource(); parentCancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => UpdateInstallationHandoff.AcceptWhenReadyAsync(request,
+                Paths, helper.Id, helper.StartTime.ToUniversalTime().Ticks, TimeSpan.FromSeconds(1), parentCancellation.Token));
+            Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(ready)!, "parent-accepted.json")));
+        }
+        finally
+        {
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => installation);
+        }
+        Assert.Equal(old, ActiveInstallationResolver.Resolve(Paths, PublicKey));
+    }
+
+    [Fact]
+    public async Task OnlyBoundSignedSuccessorCanStartWhileHelperWaitsForHealthAndStaleContextCannotBypassAnotherLease()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        UpdateApplicationLaunch? captured = null;
+        var host = new FakeProcesses(Paths, reportReady: true)
+        {
+            AfterLaunch = launch =>
+            {
+                captured = launch;
+                WithLaunchEnvironment(launch, () =>
+                {
+                    using (var allowed = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath))
+                        Assert.NotNull(allowed); // No health deadlock although the helper still owns installation.lock.
+                    var operation = Path.Combine(Paths.OperationsRoot, launch.RequestId!);
+                    var records = new[] { "helper-ready.json", "parent-accepted.json", "helper-consumed.json", "parent-committed.json" }
+                        .ToDictionary(name => Path.Combine(operation, name), name => File.ReadAllBytes(Path.Combine(operation, name)));
+                    var originalReady = records[Path.Combine(operation, "helper-ready.json")];
+                    try
+                    {
+                        // Even mutually matching ready/ACK cannot authorize another signed package
+                        // or a recycled helper identity. Both records remain structurally valid.
+                        var altered = System.Text.Json.Nodes.JsonNode.Parse(originalReady)!.AsObject();
+                        altered["expectedPackageSha256"] = new string('0', 64);
+                        foreach (var path in records.Keys) File.WriteAllText(path, altered.ToJsonString());
+                        Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath));
+                        altered = System.Text.Json.Nodes.JsonNode.Parse(originalReady)!.AsObject();
+                        altered["helperStartTimeUtcTicks"] = altered["helperStartTimeUtcTicks"]!.GetValue<long>() - 1;
+                        foreach (var path in records.Keys) File.WriteAllText(path, altered.ToJsonString());
+                        Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath));
+                    }
+                    finally
+                    {
+                        foreach (var (path, bytes) in records) File.WriteAllBytes(path, bytes);
+                    }
+                    Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.14", old.ExecutablePath));
+                    Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", old.ExecutablePath));
+                    Environment.SetEnvironmentVariable(UpdateStartupHealth.InstallationVariable, Guid.NewGuid().ToString("N"));
+                    Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath));
+                    Environment.SetEnvironmentVariable(UpdateStartupHealth.InstallationVariable, launch.InstallationId);
+                    Environment.SetEnvironmentVariable(UpdateStartupHealth.RequestVariable, Guid.NewGuid().ToString("N"));
+                    Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath));
+                });
+            }
+        };
+        var result = await Installer(host).InstallAsync(request);
+        Assert.True(result.StartupReady);
+        Assert.NotNull(captured);
+        using var normalLease = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", result.Target.ExecutablePath);
+        Assert.NotNull(normalLease);
+        WithLaunchEnvironment(captured, () =>
+            Assert.Null(UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", result.Target.ExecutablePath)));
+    }
+
+    [Fact]
+    public async Task AdmittedSuccessorKeepsEntryReservedAfterHelperTimeoutUntilItClaimsTheCatalog()
+    {
+        await SeedActiveAsync("0.10.14");
+        var evidence = await SeedUserEvidenceAsync();
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        UpdateStartupLease? admittedSuccessor = null;
+        var host = new FakeProcesses(Paths)
+        {
+            AfterLaunch = launch => WithLaunchEnvironment(launch, () =>
+            {
+                admittedSuccessor = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", launch.ExecutablePath);
+                Assert.NotNull(admittedSuccessor);
+                // The successor is now suspended before acquiring the catalog single-writer mutex.
+            })
+        };
+        try
+        {
+            var result = await Installer(host).InstallAsync(request);
+            Assert.False(result.StartupReady); // Helper health timed out; all its handles are now released.
+            using var restarted = UpdateStartupLease.TryAcquire(Paths, PublicKey, "0.10.15", result.Target.ExecutablePath);
+            Assert.Null(restarted);
+            var nextStage = await CreateStageAsync("0.10.16");
+            var blockedRequest = await UpdateInstallRequest.CreateFileAsync(nextStage, Paths, "0.10.15");
+            var nextHost = new FakeProcesses(Paths, reportReady: true);
+            var nextInstaller = new UpdateInstaller(Paths, PublicKey, "0.10.15", nextHost,
+                new() { StartupHealthTimeout = TimeSpan.Zero });
+            await Assert.ThrowsAsync<IOException>(() => nextInstaller.InstallAsync(blockedRequest));
+            Assert.Empty(nextHost.Events);
+            Assert.Equal(result.Target, ActiveInstallationResolver.Resolve(Paths, PublicKey));
+            await AssertEvidenceUnchangedAsync(evidence);
+
+            // App releases entry only after it owns its single-writer mutex, or on failed startup.
+            admittedSuccessor!.Dispose(); admittedSuccessor = null;
+            var retryRequest = await UpdateInstallRequest.CreateFileAsync(nextStage, Paths, "0.10.15");
+            var next = await InstallWithHandoffAsync(nextInstaller, nextHost, retryRequest);
+            Assert.True(next.StartupReady);
+            Assert.Equal("0.10.16", next.Target.Version);
+            await AssertEvidenceUnchangedAsync(evidence);
+        }
+        finally { admittedSuccessor?.Dispose(); }
+    }
+
+    [Fact]
+    public async Task HelperAlreadyTimedOutCannotMakeParentCommitWhileItsFailureHandlerStillOwnsLocks()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var evidence = await SeedUserEvidenceAsync();
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseFailure = new ManualResetEventSlim();
+        var installer = new UpdateInstaller(Paths, PublicKey, "0.10.14", new FakeProcesses(Paths), new()
+        {
+            HandoffTimeout = TimeSpan.FromMilliseconds(40),
+            Progress = new SynchronousProgress(state =>
+            {
+                if (state != "installation-stopped") return;
+                failed.TrySetResult();
+                if (!releaseFailure.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Test failure gate timed out.");
+            })
+        });
+        var installation = installer.InstallAsync(request);
+        try
+        {
+            await failed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            using var helper = Process.GetCurrentProcess();
+            await Assert.ThrowsAsync<TimeoutException>(() => UpdateInstallationHandoff.AcceptWhenReadyAsync(request, Paths,
+                helper.Id, helper.StartTime.ToUniversalTime().Ticks, TimeSpan.FromMilliseconds(150)));
+            var operation = Path.Combine(Paths.OperationsRoot, Path.GetFileNameWithoutExtension(request));
+            Assert.True(File.Exists(Path.Combine(operation, "parent-accepted.json"))); // Only provisional.
+            Assert.False(File.Exists(Path.Combine(operation, "helper-consumed.json")));
+            Assert.False(File.Exists(Path.Combine(operation, "parent-committed.json")));
+        }
+        finally { releaseFailure.Set(); }
+        await Assert.ThrowsAsync<TimeoutException>(() => installation);
+        Assert.Equal(old, ActiveInstallationResolver.Resolve(Paths, PublicKey));
+        await AssertEvidenceUnchangedAsync(evidence);
+    }
+
+    [Fact]
+    public async Task LaterOrdinaryParentExitWithoutFinalCommitCannotInstallEvenIfHelperConsumedProvisionalAcceptance()
+    {
+        var old = await SeedActiveAsync("0.10.14");
+        var evidence = await SeedUserEvidenceAsync();
+        var stage = await CreateStageAsync("0.10.15");
+        var request = await UpdateInstallRequest.CreateFileAsync(stage, Paths, "0.10.14");
+        var parentExit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var host = new FakeProcesses(Paths) { BeforeParentExit = () => parentExit.Task };
+        using var cancellation = new CancellationTokenSource();
+        var installation = new UpdateInstaller(Paths, PublicKey, "0.10.14", host,
+            new() { HandoffTimeout = TimeSpan.FromSeconds(3) }).InstallAsync(request, cancellation.Token);
+        var operation = Path.Combine(Paths.OperationsRoot, Path.GetFileNameWithoutExtension(request));
+        try
+        {
+            var ready = Path.Combine(operation, "helper-ready.json");
+            await WaitForTestFileAsync(ready);
+            // Fault input: the parent published its provisional offer but never completed the API.
+            // This intentionally omits the final commit; successful tests always use the public API.
+            var pending = Path.Combine(operation, "fixture-parent-accepted.pending");
+            await File.WriteAllBytesAsync(pending, await File.ReadAllBytesAsync(ready));
+            File.Move(pending, Path.Combine(operation, "parent-accepted.json"));
+            await WaitForTestFileAsync(Path.Combine(operation, "helper-consumed.json"));
+            Assert.False(File.Exists(Path.Combine(operation, "parent-committed.json")));
+            parentExit.TrySetResult(); // An unrelated later ordinary close is not installation consent.
+            await Assert.ThrowsAsync<InvalidDataException>(() => installation);
+            Assert.Equal(new[] { "parent-exited" }, host.Events);
+            Assert.Equal(old, ActiveInstallationResolver.Resolve(Paths, PublicKey));
+            await AssertEvidenceUnchangedAsync(evidence);
+        }
+        finally
+        {
+            cancellation.Cancel(); parentExit.TrySetCanceled();
+            try { await installation; } catch (Exception) { }
+        }
+    }
+
+    private static async Task WaitForTestFileAsync(string path)
+    {
+        var timer = Stopwatch.StartNew();
+        while (!File.Exists(path))
+        {
+            if (timer.Elapsed > TimeSpan.FromSeconds(3)) throw new TimeoutException("The synthetic fixture did not reach its checkpoint.");
+            await Task.Delay(10);
+        }
+    }
+
+    private sealed class SynchronousProgress(Action<string> report) : IProgress<string>
+    { public void Report(string value) => report(value); }
+
+    private static void WithLaunchEnvironment(UpdateApplicationLaunch launch, Action action)
+    {
+        var previousRequest = Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable);
+        var previousInstallation = Environment.GetEnvironmentVariable(UpdateStartupHealth.InstallationVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(UpdateStartupHealth.RequestVariable, launch.RequestId);
+            Environment.SetEnvironmentVariable(UpdateStartupHealth.InstallationVariable, launch.InstallationId);
+            action();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(UpdateStartupHealth.RequestVariable, previousRequest);
+            Environment.SetEnvironmentVariable(UpdateStartupHealth.InstallationVariable, previousInstallation);
+        }
+    }
+
+    private ConsentingTestParent Installer(FakeProcesses host, UpdateInstallationOptions? options = null) =>
+        new(this, new(Paths, PublicKey, "0.10.14-ultra", host, options ?? new() { StartupHealthTimeout = TimeSpan.Zero }), host);
+
+    // The fake process host changes only process effects. Tests perform the same explicit parent
+    // acknowledgement as Desktop, rather than disabling the production handoff requirement.
+    private async Task<UpdateInstallationResult> InstallWithHandoffAsync(UpdateInstaller installer, FakeProcesses host, string request,
+        CancellationToken token = default)
+    {
+        using var stopAcceptance = CancellationTokenSource.CreateLinkedTokenSource(token);
+        using var helper = Process.GetCurrentProcess();
+        var parentExit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.BeforeParentExit = () => parentExit.Task;
+        var installation = installer.InstallAsync(request, token);
+        var acceptance = UpdateInstallationHandoff.AcceptWhenReadyAsync(request, Paths, helper.Id,
+            helper.StartTime.ToUniversalTime().Ticks, TimeSpan.FromSeconds(5), stopAcceptance.Token);
+        try
+        {
+            if (await Task.WhenAny(installation, acceptance) == acceptance)
+            {
+                await acceptance;
+                parentExit.TrySetResult(); // Model real Desktop: actual exit follows final committed handoff.
+            }
+            return await installation;
+        }
+        finally
+        {
+            stopAcceptance.Cancel();
+            parentExit.TrySetCanceled();
+            try { await acceptance; } catch (Exception) { /* Observe the companion task; preserve the installer failure. */ }
+        }
+    }
+
+    private sealed class ConsentingTestParent(UpdateInstallationTests fixture, UpdateInstaller installer, FakeProcesses host)
+    {
+        public Task<UpdateInstallationResult> InstallAsync(string request, CancellationToken token = default) =>
+            fixture.InstallWithHandoffAsync(installer, host, request, token);
+    }
 
     private async Task<ActiveInstallationTarget> SeedActiveAsync(string version)
     {
@@ -421,8 +757,13 @@ public sealed class UpdateInstallationTests : IDisposable
         public Exception? LaunchFailure { get; init; }
         public Action<string>? AfterCheck { get; init; }
         public Action<UpdateApplicationLaunch>? AfterLaunch { get; init; }
-        public Task WaitForParentExitAsync(int processId, long startTimeUtcTicks, TimeSpan timeout, CancellationToken token)
-        { Events.Add("parent-exited"); if (ParentFailure is not null) throw ParentFailure; return Task.CompletedTask; }
+        public Func<Task>? BeforeParentExit { get; set; }
+        public async Task WaitForParentExitAsync(int processId, long startTimeUtcTicks, TimeSpan timeout, CancellationToken token)
+        {
+            Events.Add("parent-exited");
+            if (ParentFailure is not null) throw ParentFailure;
+            if (BeforeParentExit is not null) await BeforeParentExit().WaitAsync(token);
+        }
         public Task VerifyStartupAsync(string executable, string report, TimeSpan timeout, CancellationToken token)
         {
             Events.Add("isolated-check");

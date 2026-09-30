@@ -45,9 +45,10 @@ internal sealed class LifecycleRunner : IDisposable
             version = releaseVersion, platform = "windows", oldAssemblyVersion = runner._oldVersion, newAssemblyVersion = runner._newVersion,
             originalHashesPreserved = runner._hashesPreserved, sqliteIntegrityPassed = runner._sqliteIntact,
             productionComponents = new[] { "UpdateInstaller", "UpdateProcessHost", "UpdateInstallRequest", "UpdatePackageVerifier",
-                "UpdateManifestVerifier", "ActiveInstallationResolver", "UpdateLaunchRedirector", "UpdateStartupHealth" },
+                "UpdateManifestVerifier", "ActiveInstallationResolver", "UpdateLaunchRedirector", "UpdateStartupHealth",
+                "UpdateStartupLease", "UpdateInstallationHandoff" },
             fixtureComponents = new[] { "console parent/application/helper entry points", "resource-check child report", "synthetic SQLite schema",
-                "ephemeral signing key", "fixture-only root and fault checkpoints" },
+                "ephemeral signing key", "fixture-only root and fault checkpoints", "exclusive synthetic catalog writer lease" },
             scenarios = runner._scenarios, processes = runner._processEvidence, syntheticRoot = runner._root, error,
             limitations = new[] { "The console fixture does not prove the shipped WPF consent, shutdown or view restoration UI.",
                 "Both versioned fixture binaries use the current production installer source; this is not a test of a historical release binary.",
@@ -60,8 +61,8 @@ internal sealed class LifecycleRunner : IDisposable
     {
         var scenario = await CreateScenarioAsync("success");
         var (parent, requestPath) = await StartConsentedParentAsync(scenario);
-        using var helper = Start(scenario.ShortcutHelper, "--install", requestPath);
-        await AssertParentDrainAsync(scenario, parent, requestPath);
+        using var helper = StartConsentedHelper(scenario, requestPath);
+        await AssertParentDrainAsync(scenario, parent, helper, requestPath);
         await WaitExitAsync(helper, 0, TimeSpan.FromSeconds(90));
         var helperReport = ReadJson(HelperResultPath(scenario, requestPath, helper.Id));
         Require(helperReport.GetProperty("status").GetString() == "passed" && helperReport.GetProperty("startupReady").GetBoolean(),
@@ -111,12 +112,19 @@ internal sealed class LifecycleRunner : IDisposable
         var scenario = await CreateScenarioAsync(name);
         Program.WriteNewJson(Path.Combine(scenario.Control, "helper-pause.json"), new PauseControl(checkpoint));
         var (parent, request) = await StartConsentedParentAsync(scenario);
-        using var helper = Start(scenario.ShortcutHelper, "--install", request);
-        await AssertParentDrainAsync(scenario, parent, request, recordScenario: false);
+        using var helper = StartConsentedHelper(scenario, request);
+        await AssertParentDrainAsync(scenario, parent, helper, request, recordScenario: false);
         var id = Path.GetFileNameWithoutExtension(request);
         await Program.WaitForFileAsync(Path.Combine(scenario.Control, "checkpoint-" + id + "-" + checkpoint + ".json"), TimeSpan.FromSeconds(90));
         var atBoundary = Resolve(scenario);
         Require(atBoundary.Version == (activated ? _newVersion : _oldVersion), "The fault gate must be reached at the requested activation boundary.");
+        var rejectedShortcutLaunches = 0;
+        if (!activated)
+        {
+            // The parent already exited and the old pointer is still active. A normal shortcut
+            // must nevertheless remain outside the catalog while the installer owns admission.
+            rejectedShortcutLaunches = await AssertOrdinaryLaunchesBlockedAsync(scenario, helper);
+        }
         if (activated)
         {
             var candidateLaunch = await WaitForLaunchesAsync(scenario, 1);
@@ -142,6 +150,7 @@ internal sealed class LifecycleRunner : IDisposable
         AssertDataUnchanged(scenario);
         Add(name, new { checkpoint, killedProcessId = helper.Id, activeVersion = afterKill.Version,
             resumedAutomatically = false, candidateStartedBeforeInterruption = activated,
+            ordinaryShortcutLaunchesRejectedBeforePointer = rejectedShortcutLaunches,
             originalAndCatalogHashesPreserved = true, sqliteIntegrity = "ok" });
     }
 
@@ -161,9 +170,29 @@ internal sealed class LifecycleRunner : IDisposable
         return (parent, path);
     }
 
-    private async Task AssertParentDrainAsync(Scenario scenario, Process parent, string request, bool recordScenario = true)
+    private Process StartConsentedHelper(Scenario scenario, string request)
+    {
+        var helper = Start(scenario.ShortcutHelper, "--install", request);
+        Program.WriteNewJson(Path.Combine(scenario.Control, "helper-identity.json"),
+            new HelperIdentity(helper.Id, helper.StartTime.ToUniversalTime().Ticks));
+        return helper;
+    }
+
+    private async Task AssertParentDrainAsync(Scenario scenario, Process parent, Process helper, string request, bool recordScenario = true)
     {
         var id = Path.GetFileNameWithoutExtension(request);
+        var handoffReceipt = Path.Combine(scenario.Control, "parent-accepted-handoff.json");
+        await Program.WaitForFileAsync(handoffReceipt, TimeSpan.FromSeconds(30));
+        var accepted = ReadJson(handoffReceipt);
+        Require(accepted.GetProperty("processId").GetInt32() == parent.Id &&
+            accepted.GetProperty("helperProcessId").GetInt32() == helper.Id &&
+            accepted.GetProperty("startTimeUtcTicks").GetInt64() == helper.StartTime.ToUniversalTime().Ticks,
+            "Only the actual requesting parent may accept the exact started helper.");
+        var operation = Path.Combine(scenario.Paths.OperationsRoot, id);
+        var reservation = File.ReadAllBytes(Path.Combine(operation, "helper-ready.json"));
+        foreach (var record in new[] { "parent-accepted.json", "helper-consumed.json", "parent-committed.json" })
+            Require(reservation.SequenceEqual(File.ReadAllBytes(Path.Combine(operation, record))),
+                "The production handoff must retain the exact reservation through its final commit: " + record);
         var waiting = Path.Combine(scenario.Paths.OperationsRoot, id, "0001-waiting-for-parent.json");
         await Program.WaitForFileAsync(waiting, TimeSpan.FromSeconds(20));
         await Task.Delay(250);
@@ -179,7 +208,29 @@ internal sealed class LifecycleRunner : IDisposable
         Signal(scenario, "exit.signal");
         await WaitExitAsync(parent, 0, TimeSpan.FromSeconds(10));
         if (recordScenario) Add("explicit-consent-and-parent-drain", new { parentId = parent.Id, explicitConsent = true,
+            helperId = helper.Id, parentAcceptedReservedHelperBeforeDrain = true,
+            matchingReadyAcceptedConsumedCommittedRecords = true,
             heldWindowsFileLocks = true, actualExitRequired = true });
+    }
+
+    private async Task<int> AssertOrdinaryLaunchesBlockedAsync(Scenario scenario, Process helper)
+    {
+        var initialLaunches = Directory.GetFiles(scenario.Control, "launch-*.json").Length;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            Require(!helper.HasExited, "The installer must still own startup admission during repeated shortcut launches.");
+            using var shortcut = Start(scenario.ShortcutExe);
+            await WaitExitAsync(shortcut, Program.StartupBusyExitCode, TimeSpan.FromSeconds(20));
+            var busy = ReadJson(Path.Combine(scenario.Control, "startup-busy-" + shortcut.Id + ".json"));
+            Require(busy.GetProperty("processId").GetInt32() == shortcut.Id &&
+                busy.GetProperty("phase").GetString() == "startup-admission",
+                "Repeated shortcut launch must stop at startup admission before touching the catalog.");
+            Require(Directory.GetFiles(scenario.Control, "launch-*.json").Length == initialLaunches &&
+                Resolve(scenario) == scenario.Previous,
+                "Blocked launches must not start the old application or change the active pointer.");
+        }
+        AssertDataUnchanged(scenario);
+        return 3;
     }
 
     private async Task<Scenario> CreateScenarioAsync(string name)

@@ -18,6 +18,7 @@ public partial class MainWindow
     private StagedUpdate? _updateToInstall;
     private UpdateClosingWindow? _updateClosingWindow;
     private bool _cancelUpdateInstall;
+    private bool _updateHandoffCommitted;
     private GridAnchor? _updateResumeAnchor;
     private readonly UpdateInstallationPaths _updatePaths = new();
     internal static string RunningUpdateVersion => typeof(App).Assembly.GetName().Version is { } version
@@ -117,6 +118,15 @@ public partial class MainWindow
         var start = new ProcessStartInfo(helper) { UseShellExecute = false, WorkingDirectory = AppContext.BaseDirectory };
         start.ArgumentList.Add("--install"); start.ArgumentList.Add(request);
         using var process = await Task.Run(() => Process.Start(start)) ?? throw new IOException("Не удалось запустить компонент обновления.");
+        SetUpdateShutdownStage("Ожидаю готовности установщика. Защищаю библиотеку от повторного запуска…");
+        // Do not release the running app's single-writer mutex merely because Process.Start returned.
+        // The helper must first own startup admission, and the parent must explicitly accept handoff.
+        // Without that acknowledgement a delayed helper cannot install after an unrelated later close.
+        await Task.Run(() => UpdateInstallationHandoff.AcceptWhenReadyAsync(request, _updatePaths,
+            process.Id, process.StartTime.ToUniversalTime().Ticks, TimeSpan.FromSeconds(30)));
+        // Writers have drained and state is saved. Once the helper consumed the handoff and the
+        // parent committed this close, an exceptional close must not resume ordinary catalog work.
+        _updateHandoffCommitted = true;
     }
 
     private async Task SaveUpdateResumeAsync(string requestPath, string targetVersion)
