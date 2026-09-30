@@ -28,7 +28,8 @@ internal static class Program
     private static readonly List<Process> OwnedProcesses = [];
     private static readonly Dictionary<string, (string Hash, long Length, long Modified)> Originals = new(StringComparer.OrdinalIgnoreCase);
     private static string _phase = "initializing", _runRoot = "", _profile = "", _ownerId = "";
-    private static readonly List<object> ProcessEvidence = [];
+    private static readonly List<ProcessRecord> ProcessEvidence = [];
+    private sealed record ProcessRecord(int Id, DateTime StartedUtc, string Executable);
 
     [MTAThread]
     private static int Main(string[] args) => RunAsync(args).GetAwaiter().GetResult();
@@ -39,6 +40,7 @@ internal static class Program
         var reportPath = Path.Combine(Path.GetFullPath(args[1]), "updater-desktop-e2e.json");
         var status = "failed";
         string? error = null;
+        object? failureDiagnostics = null;
         var elapsed = Stopwatch.StartNew();
         try
         {
@@ -60,6 +62,14 @@ internal static class Program
             var fallbackBefore = ErrorSnapshot(fallbackErrors);
             ClaimEmptyProfile();
             var media = await SeedAsync(newPackage, key);
+            _phase = "release-seed-catalog-handles";
+            // Disposed provider connections stay open in this driver's default pool. The normal
+            // application's migration must acquire its source independently of the seed writer.
+            SqliteConnection.ClearAllPools();
+            using (var probe = new FileStream(Path.Combine(_profile, "catalog-v2.sqlite"), FileMode.Open,
+                FileAccess.Read, FileShare.None))
+                Require(probe.Length > 0, "Seed catalog is empty.");
+            Assertions["seedCatalogHandlesReleased"] = true;
             _phase = "normal-old-entrypoint";
             var old = StartOwned(oldExe);
             AutomationElement? oldWindow = null;
@@ -129,7 +139,9 @@ internal static class Program
             Require(!HasText(newWindow!, "other-photo.png"), "Restored search did not filter the successor's view.");
             var currentCatalog = new CatalogLocation().Discover().Selection?.DirectoryPath;
             Require(currentCatalog == catalog, "An application update switched away from the current catalog.");
-            var state = await new SqliteDesktopCatalogStore(catalog).LoadAsync(includeItems: false);
+            LocalCatalogState state;
+            try { state = await new SqliteDesktopCatalogStore(catalog).LoadAsync(includeItems: false); }
+            finally { SqliteConnection.ClearAllPools(); } // Do not retain observer handles across another application start.
             Require(state.BackgroundProcessingPaused && state.ActiveFolder == media && state.ViewMode == "Folder" &&
                 !state.IncludeSubfolders && !state.ShowVideos && !state.SortNewestFirst && state.DateGroupingMode == "FileDate",
                 "Persistent library view settings changed across update.");
@@ -178,6 +190,8 @@ internal static class Program
             error = exception.ToString();
             Console.Error.WriteLine($"WPF updater lifecycle failed in {_phase}: {exception.Message}");
             PreserveOwnedErrorLogs(Path.GetDirectoryName(reportPath)!);
+            try { failureDiagnostics = await CaptureFailureDiagnosticsAsync(); }
+            catch (Exception diagnosticError) { failureDiagnostics = new { error = diagnosticError.GetType().Name }; }
         }
         finally
         {
@@ -196,7 +210,7 @@ internal static class Program
                 scope = "production-desktop-update-lifecycle-with-test-trust", sourcePublicKeySubstituted = true,
                 testVersions = new[] { "1.11.0", "1.11.1" }, assertions = Assertions, phase = _phase,
                 elapsedSeconds = elapsed.Elapsed.TotalSeconds, processes = ProcessEvidence,
-                ownedProfile = _profile, ownedFixtures = _runRoot, error,
+                ownedProfile = _profile, ownedFixtures = _runRoot, error, failureDiagnostics,
                 limitations = new[]
                 {
                     "Real Desktop and Updater source builds use an ephemeral compile-time test public key and two technical versions; these are not release artifacts.",
@@ -326,6 +340,58 @@ internal static class Program
         catch (Exception) { /* Failure diagnostics must not replace the original error or modify a profile. */ }
     }
 
+    private static async Task<object> CaptureFailureDiagnosticsAsync()
+    {
+        // Collect only the fixture processes already established by the ownership checks. Never
+        // enumerate unrelated window text or read a catalog while diagnosing a failed startup.
+        var processes = new List<object>();
+        var liveOwnedIds = new List<int>();
+        foreach (var record in ProcessEvidence.Take(16))
+        {
+            try
+            {
+                var process = OwnedProcesses.First(candidate => candidate.Id == record.Id);
+                var exited = process.HasExited;
+                var actual = exited ? null : process.MainModule?.FileName;
+                if (!exited && IsOwnedExecutable(actual) && process.StartTime.ToUniversalTime() == record.StartedUtc)
+                    liveOwnedIds.Add(record.Id);
+                processes.Add(new { record.Id, expectedExecutable = record.Executable, observedModulePath = actual,
+                    exited, exitCode = exited ? (int?)process.ExitCode : null });
+            }
+            catch (Exception exception) { processes.Add(new { record.Id, expectedExecutable = record.Executable, error = exception.GetType().Name }); }
+        }
+        object windows;
+        try
+        {
+            // UI Automation makes synchronous cross-process calls: a hung window must not delay
+            // the failure report. The worker reads only and is abandoned after this deadline.
+            windows = await Task.Run(() => SnapshotOwnedWindows(liveOwnedIds.ToArray())).WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        catch (Exception exception) { windows = new { error = exception.GetType().Name }; }
+        var marker = Path.Combine(_profile, "updates", "wpf-lifecycle-owner.txt");
+        var profileOwned = _profile.Length > 0 && File.Exists(marker) && File.ReadAllText(marker) == _ownerId;
+        return new { processes, windows, profileOwned,
+            seedDatabaseExists = profileOwned && File.Exists(Path.Combine(_profile, "catalog-v2.sqlite")),
+            storageSelectorExists = profileOwned && File.Exists(Path.Combine(_profile, "storage-selection-v1.json")) };
+    }
+
+    private static object SnapshotOwnedWindows(int[] processIds)
+    {
+        var windows = new List<object>();
+        foreach (var pid in processIds)
+            foreach (AutomationElement window in AutomationElement.RootElement.FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ProcessIdProperty, pid)).Cast<AutomationElement>().Take(6))
+            {
+                var current = window.Current;
+                windows.Add(new { pid, name = Clip(current.Name, 256),
+                    automationId = Clip(current.AutomationId, 128),
+                    current.IsEnabled, current.IsOffscreen });
+            }
+        return windows;
+    }
+
+    private static string Clip(string value, int limit) => value.Length <= limit ? value : value[..limit];
+
     private static (string Path, long Length, long Modified)[] ErrorSnapshot(string path) => !Directory.Exists(path) ? [] :
         Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)
             .Select(file => (file, new FileInfo(file).Length, File.GetLastWriteTimeUtc(file).Ticks)).ToArray();
@@ -362,7 +428,7 @@ internal static class Program
         if (OwnedProcesses.Any(owned => owned.Id == process.Id)) return;
         Require(IsOwnedExecutable(path), "Discovered process is not owned by this fixture.");
         OwnedProcesses.Add(process);
-        ProcessEvidence.Add(new { id = process.Id, startedUtc = process.StartTime.ToUniversalTime(), executable = path });
+        ProcessEvidence.Add(new(process.Id, process.StartTime.ToUniversalTime(), path));
     }
     private static bool IsOwnedExecutable(string? path) => path is not null &&
         (path.StartsWith(_runRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
