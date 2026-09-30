@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
@@ -82,10 +83,14 @@ internal static class Program
             var search = FindById(oldWindow!, "SearchBox");
             ((ValuePattern)search.GetCurrentPattern(ValuePattern.Pattern)).SetValue("preserved-photo");
             await UntilAsync(() => HasText(oldWindow!, "preserved-photo.png") && !HasText(oldWindow!, "other-photo.png"), "Search did not settle before update.");
+            _phase = "open-old-settings";
             InvokeButton(oldWindow!, "Настройки");
             AutomationElement? settings = null;
-            await UntilAsync(() => (settings = FindWindow(old.Id, "Настройки PhotoShelf")) is not null &&
-                Button(settings, "Обновить и перезапустить") is { Current.IsEnabled: true }, "Prepared signed release was not offered for explicit installation.");
+            await UntilAsync(() => (settings = FindWindow(old.Id, "Настройки PhotoShelf")) is not null,
+                "Owned Settings window did not open after its real button was invoked.");
+            _phase = "wait-prepared-update-offer";
+            await UntilAsync(() => Button(settings!, "Обновить и перезапустить") is { Current.IsEnabled: true },
+                "Prepared signed release was not offered for explicit installation.");
             var automatic = FindById(settings!, "AutoUpdateCheckBox");
             Require(((TogglePattern)automatic.GetCurrentPattern(TogglePattern.Pattern)).Current.ToggleState == ToggleState.Off,
                 "Automatic network checking was unexpectedly enabled.");
@@ -361,13 +366,14 @@ internal static class Program
             catch (Exception exception) { processes.Add(new { record.Id, expectedExecutable = record.Executable, error = exception.GetType().Name }); }
         }
         object windows;
+        var uiNodes = new ConcurrentQueue<object>();
         try
         {
             // UI Automation makes synchronous cross-process calls: a hung window must not delay
             // the failure report. The worker reads only and is abandoned after this deadline.
-            windows = await Task.Run(() => SnapshotOwnedWindows(liveOwnedIds.ToArray())).WaitAsync(TimeSpan.FromSeconds(3));
+            windows = await Task.Run(() => SnapshotOwnedWindows(liveOwnedIds.ToArray(), uiNodes)).WaitAsync(TimeSpan.FromSeconds(3));
         }
-        catch (Exception exception) { windows = new { error = exception.GetType().Name }; }
+        catch (Exception exception) { windows = new { error = exception.GetType().Name, nodes = uiNodes.ToArray(), truncated = true }; }
         var marker = Path.Combine(_profile, "updates", "wpf-lifecycle-owner.txt");
         var profileOwned = _profile.Length > 0 && File.Exists(marker) && File.ReadAllText(marker) == _ownerId;
         return new { processes, windows, profileOwned,
@@ -375,19 +381,34 @@ internal static class Program
             storageSelectorExists = profileOwned && File.Exists(Path.Combine(_profile, "storage-selection-v1.json")) };
     }
 
-    private static object SnapshotOwnedWindows(int[] processIds)
+    private static object SnapshotOwnedWindows(int[] processIds, ConcurrentQueue<object> nodes)
     {
-        var windows = new List<object>();
+        var pending = new Queue<(AutomationElement Element, int Depth, int? Parent)>();
         foreach (var pid in processIds)
             foreach (AutomationElement window in AutomationElement.RootElement.FindAll(TreeScope.Children,
                 new PropertyCondition(AutomationElement.ProcessIdProperty, pid)).Cast<AutomationElement>().Take(6))
+                pending.Enqueue((window, 0, null));
+        var walker = TreeWalker.ControlViewWalker;
+        var timer = Stopwatch.StartNew();
+        while (pending.Count > 0 && nodes.Count < 384 && timer.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            var (element, depth, parent) = pending.Dequeue();
+            try
             {
-                var current = window.Current;
-                windows.Add(new { pid, name = Clip(current.Name, 256),
-                    automationId = Clip(current.AutomationId, 128),
+                var current = element.Current;
+                if (!processIds.Contains(current.ProcessId)) continue;
+                var index = nodes.Count;
+                nodes.Enqueue(new { index, parent, depth, pid = current.ProcessId, name = Clip(current.Name, 512),
+                    automationId = Clip(current.AutomationId, 128), controlType = current.ControlType.ProgrammaticName,
                     current.IsEnabled, current.IsOffscreen });
+                if (depth >= 16) continue;
+                for (var child = walker.GetFirstChild(element); child is not null && nodes.Count + pending.Count < 384;
+                    child = walker.GetNextSibling(child))
+                    pending.Enqueue((child, depth + 1, index));
             }
-        return windows;
+            catch (Exception exception) { nodes.Enqueue(new { parent, depth, error = exception.GetType().Name }); }
+        }
+        return new { nodes = nodes.ToArray(), truncated = pending.Count > 0 };
     }
 
     private static string Clip(string value, int limit) => value.Length <= limit ? value : value[..limit];
@@ -438,8 +459,18 @@ internal static class Program
     private static AutomationElement? MainWindow(int pid) => AutomationElement.RootElement.FindAll(TreeScope.Children,
         new PropertyCondition(AutomationElement.ProcessIdProperty, pid)).Cast<AutomationElement>()
         .FirstOrDefault(window => window.Current.Name.StartsWith("PhotoShelf Ultra", StringComparison.Ordinal));
-    private static AutomationElement? FindWindow(int pid, string name) => AutomationElement.RootElement.FindFirst(TreeScope.Children,
-        new AndCondition(new PropertyCondition(AutomationElement.ProcessIdProperty, pid), new PropertyCondition(AutomationElement.NameProperty, name)));
+    private static AutomationElement? FindWindow(int pid, string name)
+    {
+        var condition = new AndCondition(new PropertyCondition(AutomationElement.ProcessIdProperty, pid),
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
+            new PropertyCondition(AutomationElement.NameProperty, name));
+        // WPF owned dialogs are children of their owner in UI Automation, not desktop siblings.
+        // Search only this process's application subtrees; never walk the full desktop subtree.
+        foreach (AutomationElement root in AutomationElement.RootElement.FindAll(TreeScope.Children,
+            new PropertyCondition(AutomationElement.ProcessIdProperty, pid)))
+            if (root.FindFirst(TreeScope.Subtree, condition) is { } window) return window;
+        return null;
+    }
     private static AutomationElement FindById(AutomationElement parent, string id) => parent.FindFirst(TreeScope.Descendants,
         new PropertyCondition(AutomationElement.AutomationIdProperty, id)) ?? throw new IOException("Missing automation target: " + id);
     private static AutomationElement? Button(AutomationElement parent, string name) => parent.FindFirst(TreeScope.Descendants,
