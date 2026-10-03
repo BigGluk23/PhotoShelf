@@ -1,20 +1,21 @@
-# Защита выпуска: действия владельца GitHub
+# Защита выпуска: состояние и аудит GitHub
 
 Эта инструкция не даёт разрешения на передачу ключа или публикацию релиза. До отдельного согласия владельца секрет подписи не загружается, release workflow не запускается. Обычный Windows CI использует одноразовые тестовые ключи.
 
-## Проверенное состояние 30 сентября 2026
+## Проверенное состояние 3 октября 2026
 
 - Репозиторий `BigGluk23/PhotoShelf` публичный; GitHub user ID владельца `205813777`.
 - У текущего аккаунта `Khrumium` есть `push`, но нет `admin` или `maintain`.
-- API вернул `main.protected=false`, `rulesets=[]`, `environments=[]`.
-- Попытка создать защищённое окружение вернула **HTTP 403: Must have admin rights to Repository**. Конфигурация ниже подготовлена, но серверная защита ещё не включена.
-- API текущего пользователя не вернул состояние 2FA. Это **не** означает, что 2FA выключена. 2FA владельца и других участников не проверена.
+- Активный ruleset `PhotoShelf reviewed main` (`24250308`) применяется ровно к `refs/heads/main`. `bypass_actors=[]`, `current_user_can_bypass=never`; запрещены удаление и non-fast-forward. Обязательны PR, одно одобрение CODEOWNERS, сброс старых approvals, одобрение последнего push другим участником, закрытие review threads и актуальные проверки `windows` и `Same-host baseline/current performance` от GitHub Actions (`integration_id=15368`).
+- Окружение `release` (`23118891621`) требует только reviewer `BigGluk23`, включает **Prevent self-review**, не разрешает administrator bypass и допускает ровно одну deployment policy: branch `main`; тегов и wildcard нет.
+- Environment secrets и variables пусты. `PHOTOSHELF_UPDATE_SIGNING_KEY` не загружен; release workflow, тег, GitHub Release и deployment не запускались.
+- В GitHub UI владельца подтверждено: 2FA включена, preferred method — authenticator app, состояние `Configured`. Recovery codes, пароль и OTP агент не читал и не сохранял. Состояние 2FA остальных участников публичный API не подтверждает.
 
-Не выдавать наличие YAML/CODEOWNERS за действующую защиту GitHub. После настройки требуется повторное чтение серверных правил.
+Не выдавать наличие YAML/CODEOWNERS за действующую защиту GitHub: источником истины остаются серверные ruleset и environment. Перед каждым выпуском перечитывать их и сохранять появившиеся более строгие ограничения.
 
-## 1. Защитить основную ветку
+## 1. Аудит основной ветки
 
-Владелец входит в [Settings → Rules](https://github.com/BigGluk23/PhotoShelf/settings/rules) и создаёт активный branch ruleset для `main`:
+В [Settings → Rules](https://github.com/BigGluk23/PhotoShelf/settings/rules) уже действует ruleset `24250308`. Он должен сохранять:
 
 - No bypass actors, включая администратора.
 - Запрет удаления и force push.
@@ -22,33 +23,28 @@
 - Старые одобрения сбрасываются после новых коммитов; последний push одобряет другой человек; обсуждения должны быть закрыты.
 - Обязательные проверки от GitHub Actions (`integration_id=15368`): `windows` и `Same-host baseline/current performance`, на актуальной базе main.
 
-Точная REST-конфигурация: `tools/release-main-ruleset.json`. Сначала перечитать текущие правила и сохранить более строгие ограничения, если они появились. **Не заменять чужой ruleset** этим файлом. Если подходящего правила нет, владелец может создать новое:
+Точная минимальная REST-конфигурация: `tools/release-main-ruleset.json`. Сначала перечитать текущие правила и сохранить более строгие ограничения, если они появились. **Не заменять действующий ruleset** этим файлом и не создавать второй дублирующий набор правил:
 
 ```bash
 gh api repos/BigGluk23/PhotoShelf/rulesets
-gh api --method POST repos/BigGluk23/PhotoShelf/rulesets \
-  --input tools/release-main-ruleset.json
+gh api repos/BigGluk23/PhotoShelf/rulesets/24250308
 gh api repos/BigGluk23/PhotoShelf/rules/branches/main
 ```
 
 `.github/CODEOWNERS` назначает владельца ревьюером всех изменений. Рабочая схема: отдельный участник (например Khrumium) создаёт PR, BigGluk23 проверяет и одобряет. Владелец не может одобрять собственный PR; для его собственных изменений потребуется заранее назначенный второй доверенный code owner. Не обходить правило снятием защиты.
 
-## 2. Защитить окружение release
+## 2. Аудит окружения release
 
-В [Settings → Environments](https://github.com/BigGluk23/PhotoShelf/settings/environments) создать **release**:
+В [Settings → Environments](https://github.com/BigGluk23/PhotoShelf/settings/environments) уже создано **release** (`23118891621`). Оно должно сохранять:
 
 - Required reviewer: **только BigGluk23**.
 - Включить **Prevent self-review**.
 - Выключить **Allow administrators to bypass configured protection rules**.
 - Deployment branches and tags: **Selected branches and tags**, ровно одно правило типа **Branch** с именем **main**. Не добавлять tag/wildcard.
 
-Первые две настройки и режим ветки представлены в `tools/release-environment.json`. Если окружение уже появилось, сначала прочитать его и сохранить существующие более строгие правила. Для нового окружения владелец может выполнить:
+Первые две настройки и режим ветки представлены в `tools/release-environment.json`. Перед изменением сначала прочитать окружение и сохранить существующие более строгие правила. Команды ниже предназначены для аудита; повторно создавать policy `main` нельзя:
 
 ```bash
-gh api --method PUT repos/BigGluk23/PhotoShelf/environments/release \
-  --input tools/release-environment.json
-gh api --method POST repos/BigGluk23/PhotoShelf/environments/release/deployment-branch-policies \
-  -f name=main -f type=branch
 gh api repos/BigGluk23/PhotoShelf/environments/release
 gh api repos/BigGluk23/PhotoShelf/environments/release/deployment-branch-policies
 ```
@@ -63,7 +59,7 @@ gh api repos/BigGluk23/PhotoShelf/environments/release/deployment-branch-policie
 
 Каждый участник с правом записи проверяет собственную [настройку 2FA](https://github.com/settings/security): предпочтительно passkey или аппаратный ключ, с резервным способом восстановления. Recovery codes и пароли не передавать агенту, в чат, Git или логи. Владелец проверяет актуальный список [Collaborators](https://github.com/BigGluk23/PhotoShelf/settings/access) и оставляет только необходимых участников.
 
-Публичный API не позволяет подтвердить личную 2FA всех участников. До подтверждения владельцем это остаётся явным непроверенным пунктом, а не успешной автоматической проверкой.
+2FA владельца подтверждена в его GitHub UI 30 сентября 2026. Публичный API не позволяет подтвердить личную 2FA всех остальных участников; каждый участник с write обязан проверить её самостоятельно. Это ограничение не подменяется состоянием 2FA владельца.
 
 ## 4. Ключ и восстановление
 
