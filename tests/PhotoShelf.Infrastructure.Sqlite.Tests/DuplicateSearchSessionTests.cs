@@ -138,6 +138,29 @@ public sealed class DuplicateSearchSessionTests : IDisposable
     }
 
     [Fact]
+    public async Task VisibleMultiSelectionIsAtomicAndCannotSelectKeeper()
+    {
+        await using var session = await DuplicateSearchSession.CreateAsync(_root);
+        var matches = new[] { Match(23, 1), Match(23, 2), Match(23, 3), Match(23, 4) };
+        await session.AddAsync(matches); await session.CompleteAsync(false);
+        var group = Assert.Single(await session.ReadGroupsAsync(0));
+        var extras = group.Items.Where(item => !item.Path.Equals(group.KeeperPath, StringComparison.OrdinalIgnoreCase))
+            .Select(item => item.Path).ToArray();
+
+        await session.SetItemsSelectedAsync(extras.Take(2).ToArray(), true);
+        Assert.Equal(2, (await session.ReadSelectionSummaryAsync()).SelectedFiles);
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            session.SetItemsSelectedAsync(new[] { extras[2], group.KeeperPath }, true));
+        var selected = await session.ReadQuarantineSelectionAsync();
+        Assert.Equal(2, selected.Count);
+        Assert.DoesNotContain(selected, item => item.Item.Path.Equals(extras[2], StringComparison.OrdinalIgnoreCase));
+
+        await session.SetItemsSelectedAsync(extras.Take(2).ToArray(), false);
+        Assert.Equal(0, (await session.ReadSelectionSummaryAsync()).SelectedFiles);
+    }
+
+    [Fact]
     public async Task PriorityFolderRuleAndBulkMarkApplyToTheWholeSnapshot()
     {
         await using var session = await DuplicateSearchSession.CreateAsync(_root);

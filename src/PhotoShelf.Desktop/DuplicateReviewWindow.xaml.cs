@@ -5,6 +5,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using PhotoShelf.Application.Files;
 using PhotoShelf.Infrastructure.Sqlite;
 using Forms = System.Windows.Forms;
@@ -68,7 +69,53 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
     private void OnGroupSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SelectedGroup = GroupList.SelectedItem as DuplicateGroupViewModel;
+        if (ItemList is not null) ItemList.SelectedItems.Clear();
         RefreshPaging();
+    }
+
+    private void OnCompareSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (CompareSelectedButton is not null)
+            CompareSelectedButton.IsEnabled = ItemList.SelectedItems.Count is >= 2 and <= 4;
+    }
+
+    private void OnCompareSelectedClicked(object sender, RoutedEventArgs e) => OpenSelectedComparison();
+
+    private void OpenSelectedComparison()
+    {
+        var photos = ItemList.SelectedItems.Cast<DuplicateItemViewModel>().Select(item => item.Photo).Take(5).ToArray();
+        if (photos.Length is < 2 or > 4)
+        {
+            StatusText.Text = "Для сравнения выделите от двух до четырёх файлов с Ctrl или Shift.";
+            return;
+        }
+        new PhotoCompareWindow(photos) { Owner = this }.ShowDialog();
+    }
+
+    private async void OnItemListPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            e.Handled = true; OpenSelectedComparison(); return;
+        }
+        if (_preparing || _moving || _editingSelection || _closingReview || _loadingPage) return;
+        var selected = ItemList.SelectedItems.Cast<DuplicateItemViewModel>().ToArray();
+        if (e.Key == Key.K && selected.Length == 1 && SelectedGroup is { } group)
+        {
+            e.Handled = true;
+            await RunSessionEditAsync(() => _session.SetKeeperAsync(group.Index, selected[0].Photo.Path, _pageCancellation.Token),
+                "Сохраняемая копия изменена для выбранной группы.");
+            return;
+        }
+        if (e.Key == Key.Space)
+        {
+            var extras = selected.Where(item => !item.IsKeep).ToArray();
+            if (extras.Length == 0) return;
+            e.Handled = true;
+            var mark = extras.Any(item => !item.IsSelected);
+            await RunSessionEditAsync(() => _session.SetItemsSelectedAsync(extras.Select(item => item.Photo.Path).ToArray(),
+                mark, _pageCancellation.Token), mark ? "Выбранные копии отмечены в карантин." : "С выбранных копий сняты отметки.");
+        }
     }
 
     private async void OnKeepItemClicked(object sender, RoutedEventArgs e)
@@ -137,6 +184,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
     private async Task RunSessionEditAsync(Func<Task> edit, string successText)
     {
         if (_preparing || _moving || _editingSelection || _closingReview || _loadingPage) return;
+        var selectedGroupId = SelectedGroup?.Index;
         _editingSelection = true; UpdateEditingEnabled();
         string? error = null;
         try { await edit(); }
@@ -144,7 +192,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
         catch (Exception ex) { error = $"Выбор не сохранён: {ex.Message}"; }
         finally { _editingSelection = false; UpdateEditingEnabled(); }
         if (!IsLoaded || _closingReview) return;
-        await LoadGroupsPageAsync(_groupOffset);
+        await LoadGroupsPageAsync(_groupOffset, selectedGroupId);
         if (error is not null) StatusText.Text = error;
         else StatusText.Text = successText;
     }
@@ -347,7 +395,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             page.TotalFiles, page.MemberOffset, page.KeeperPath, page.SelectedPaths);
     }
 
-    private async Task LoadGroupsPageAsync(long offset)
+    private async Task LoadGroupsPageAsync(long offset, long? preferredGroupId = null)
     {
         if (_loadingPage || _preparing || _moving || _editingSelection || _closingReview || offset < 0 || offset >= _session.GroupCount) return;
         _loadingPage = true; UpdateEditingEnabled();
@@ -357,7 +405,9 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             var models = await Task.Run(() => page.Select(CreateGroup).ToArray(), _pageCancellation.Token);
             if (_closingReview) return;
             _groupOffset = offset; Groups.Clear(); foreach (var model in models) { ObserveSelection(model); Groups.Add(model); }
-            GroupList.SelectedIndex = Groups.Count > 0 ? 0 : -1;
+            var preferred = preferredGroupId is null ? null : Groups.FirstOrDefault(group => group.Index == preferredGroupId);
+            GroupList.SelectedItem = preferred ?? Groups.FirstOrDefault();
+            if (GroupList.SelectedItem is not null) GroupList.ScrollIntoView(GroupList.SelectedItem);
             await RefreshSelectionSummaryAsync();
         }
         catch (OperationCanceledException) { }
