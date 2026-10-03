@@ -38,9 +38,10 @@ public partial class MainWindow
         try
         {
             var token = operation.Token;
-            var rules = _folderInclusion.Snapshot();
-            var scope = new PerceptualFingerprintScope(rules.IncludedFolders, rules.ExcludedFolders,
-                _includeSystemFolders, DateTime.UtcNow);
+            // The derived index covers the catalog, not only today's checked tree nodes. That
+            // keeps explicit "whole library" and later folder selections useful without a new
+            // decode pass. Search/review scope is still applied when a session is created.
+            var scope = new PerceptualFingerprintScope([], [], _includeSystemFolders, DateTime.UtcNow);
             activity.Value = new("индексирую визуальное сходство", Started: Stopwatch.GetTimestamp());
             await Task.Run(async () =>
             {

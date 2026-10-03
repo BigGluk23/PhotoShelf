@@ -27,6 +27,10 @@ public sealed record SavedPerceptualFingerprint(
     int DifferenceDistance = 0,
     int AverageDistance = 0);
 
+public sealed record ObservedPerceptualFingerprint(
+    SavedMediaItem Item,
+    PerceptualFingerprint Fingerprint);
+
 /// <summary>
 /// Data-access boundary for the derived visual-similarity index. The cache can be deleted and
 /// rebuilt; original media and authoritative catalog observations are never changed here.
@@ -211,6 +215,72 @@ public sealed class PerceptualFingerprintStore
         }
         return candidates;
     }, token);
+
+    /// <summary>
+    /// Reads only fingerprints that still belong to the supplied catalog observations. This is
+    /// the bridge between an arbitrary paged catalog view and a disk-backed similarity session;
+    /// stale derived rows are never allowed into a review snapshot.
+    /// </summary>
+    public Task<IReadOnlyList<ObservedPerceptualFingerprint>> ReadObservedBatchAsync(
+        IReadOnlyList<SavedMediaItem> expected, CancellationToken token = default) =>
+        Task.Run<IReadOnlyList<ObservedPerceptualFingerprint>>(async () =>
+        {
+            if (expected.Count > 128)
+                throw new ArgumentOutOfRangeException(nameof(expected), "Fingerprint reads are limited to 128 observations.");
+            if (expected.Count == 0) return Array.Empty<ObservedPerceptualFingerprint>();
+
+            await using var connection = await OpenAsync(token);
+            using var interrupt = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
+            await using var command = connection.CreateCommand();
+            var ids = new string[expected.Count];
+            for (var index = 0; index < expected.Count; index++)
+            {
+                ids[index] = $"$id{index}";
+                command.Parameters.AddWithValue(ids[index], expected[index].AssetId);
+            }
+            command.CommandText = $"""
+                SELECT i.asset_id,i.path,i.is_favorite,i.size_bytes,i.file_modified_utc_ticks,i.is_video,
+                    i.capture_date_ticks,i.metadata_indexed,i.is_hidden_or_system,i.file_local_ticks,
+                    i.metadata_status,i.metadata_attempted_ticks,i.metadata_retry_ticks,i.metadata_error_code,
+                    i.availability,i.availability_checked_ticks,i.availability_error_code,i.file_identity,i.observation_version,
+                    p.difference_hash,p.average_hash,p.pixel_width,p.pixel_height
+                FROM desktop_media_items AS i
+                JOIN perceptual_fingerprint_cache AS p ON p.asset_id=i.asset_id AND p.path_key=i.path_key
+                    AND p.size_bytes=i.size_bytes AND p.file_modified_utc_ticks=i.file_modified_utc_ticks
+                    AND p.observation_version=i.observation_version
+                WHERE i.asset_id IN ({string.Join(',', ids)}) AND i.is_quarantined=0 AND i.is_video=0
+                    AND p.algorithm_version=$algorithm AND p.status=$found
+                ORDER BY i.path_key;
+                """;
+            command.Parameters.AddWithValue("$algorithm", PerceptualFingerprint.CurrentAlgorithmVersion);
+            command.Parameters.AddWithValue("$found", (int)PerceptualFingerprintStatus.Found);
+
+            var byId = expected.ToDictionary(item => item.AssetId, StringComparer.Ordinal);
+            var result = new List<ObservedPerceptualFingerprint>(expected.Count);
+            try
+            {
+                await using var reader = await command.ExecuteReaderAsync(token);
+                while (await reader.ReadAsync(token))
+                {
+                    var item = ReadItem(reader);
+                    if (!byId.TryGetValue(item.AssetId, out var snapshot) ||
+                        snapshot.ObservationVersion != item.ObservationVersion ||
+                        snapshot.SizeBytes != item.SizeBytes ||
+                        snapshot.FileModifiedAt?.ToUniversalTime().Ticks != item.FileModifiedAt?.ToUniversalTime().Ticks)
+                        continue;
+                    var fingerprint = new PerceptualFingerprint(
+                        PerceptualFingerprint.CurrentAlgorithmVersion,
+                        unchecked((ulong)reader.GetInt64(19)), unchecked((ulong)reader.GetInt64(20)),
+                        reader.GetInt32(21), reader.GetInt32(22));
+                    result.Add(new(item, fingerprint));
+                }
+                return result;
+            }
+            catch (SqliteException) when (token.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(token);
+            }
+        }, token);
 
     private static string BuildFolderPredicate(PerceptualFingerprintScope scope, SqliteCommand command, CancellationToken token)
     {

@@ -172,13 +172,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void OnDuplicatesClicked(object sender, RoutedEventArgs e)
     {
-        var scope = await AskDuplicateScopeAsync();
-        if (scope is null)
+        var request = await AskDuplicateSearchAsync();
+        if (request is null)
         {
             return;
         }
 
-        await FindExactDuplicatesAsync(scope.Value);
+        if (request.Mode == DuplicateSearchMode.Similar)
+            await FindSimilarPhotosAsync(request.Scope);
+        else
+            await FindExactDuplicatesAsync(request.Scope);
     }
 
     private void OnSettingsClicked(object sender, RoutedEventArgs e)
@@ -1135,7 +1138,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Поиск дублей"); }
         finally { if (ReferenceEquals(_duplicateCancellation, operation)) _duplicateCancellation = null; SetDuplicateSearch(false, 0); }
     }
-    private async Task<DuplicateSearchScope?> AskDuplicateScopeAsync()
+    private async Task<DuplicateSearchRequest?> AskDuplicateSearchAsync()
     {
         if (!_catalogLoaded) return null;
         var all = await _desktopCatalogStore.CountAsync(new CatalogViewQuery { ShowVideos = ShowVideos, IncludeSystemFolders = _includeSystemFolders }, _lifetime.Token);
@@ -1145,7 +1148,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _viewMode == LibraryViewMode.Folder ? _activeFolder : null) { Owner = this };
         if (dialog.ShowDialog() != true) return null;
         _duplicateCompareFolderA = dialog.CompareFolderA; _duplicateCompareFolderB = dialog.CompareFolderB;
-        return dialog.SelectedScope;
+        return new(dialog.SelectedMode, dialog.SelectedScope);
     }
 
     private static bool IsUnderFolder(string path, string folder)

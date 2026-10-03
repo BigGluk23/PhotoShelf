@@ -79,6 +79,29 @@ public sealed class PerceptualFingerprintStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ObservedBatchReturnsOnlyCurrentMatchingSnapshots()
+    {
+        var catalog = new SqliteDesktopCatalogStore(_root);
+        await catalog.InitializeAsync();
+        var first = await SeedAsync(catalog, Item("a", Path.Combine(_root, "a.png")));
+        var second = await SeedAsync(catalog, Item("b", Path.Combine(_root, "b.png")));
+        var store = new PerceptualFingerprintStore(_root);
+        await store.InitializeAsync();
+        var fingerprint = new PerceptualFingerprint(1, 0x12, 0x34, 32, 24);
+        Assert.All(await store.SaveObservedBatchAsync([
+            new(first, PerceptualFingerprintReadResult.Found(fingerprint), DateTime.UtcNow),
+            new(second, PerceptualFingerprintReadResult.Found(fingerprint), DateTime.UtcNow)]), Assert.True);
+
+        var stale = Clone(second);
+        stale.ObservationVersion++;
+        var result = await store.ReadObservedBatchAsync([first, stale]);
+
+        var observed = Assert.Single(result);
+        Assert.Equal(first.AssetId, observed.Item.AssetId);
+        Assert.Equal(fingerprint, observed.Fingerprint);
+    }
+
+    [Fact]
     public async Task QueueHonorsFolderExceptionsAndSystemVisibility()
     {
         var catalog = new SqliteDesktopCatalogStore(_root);
