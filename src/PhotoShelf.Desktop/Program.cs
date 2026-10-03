@@ -15,21 +15,43 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        UpdateStartupLease? startupLease = null;
         // Old shortcuts keep opening the version explicitly activated by the updater.
         // Diagnostic entry points always remain isolated and never follow a user's installation.
         if (args.Length == 0)
         {
             try
             {
+                startupLease = UpdateStartupLease.TryAcquire(new UpdateInstallationPaths(), UpdateTrust.PublicKeyPem,
+                    MainWindow.RunningUpdateVersion, Environment.ProcessPath!);
+                if (startupLease is null)
+                {
+                    System.Windows.MessageBox.Show("PhotoShelf запускается или обновляется. Дождитесь завершения и повторите запуск.",
+                        "PhotoShelf", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return 0;
+                }
                 if (UpdateLaunchRedirector.TryLaunchNewer(new UpdateInstallationPaths(), UpdateTrust.PublicKeyPem,
-                        MainWindow.RunningUpdateVersion)) return 0;
+                        MainWindow.RunningUpdateVersion, startupLease))
+                {
+                    startupLease.Dispose();
+                    return 0;
+                }
             }
             catch (Exception exception)
             {
+                startupLease?.Dispose();
                 ErrorReporter.Show(exception, "Не удалось проверить установленное обновление. Каталог не был открыт");
                 return 1;
             }
         }
+        // Keep admission across pointer resolution and App's single-writer acquisition. An updater
+        // cannot start between a successful check and opening the catalog. App releases it once the
+        // single-writer mutex is held; retaining it for the application lifetime would block handoff.
+        using (startupLease) return RunApplication(args, startupLease);
+    }
+
+    private static int RunApplication(string[] args, UpdateStartupLease? startupLease)
+    {
         StartupCheckArguments options;
         FileStream? report = null;
         try
@@ -58,7 +80,7 @@ public static class Program
                     LocalCatalogStore.CreateIsolatedSmokeCatalog();
                     ErrorReporter.AutomatedCheck = true;
                 }
-                var app = new App(options.Kind == StartupCheckKind.Resources, uiSmoke, uiBrowseSmoke);
+                var app = new App(options.Kind == StartupCheckKind.Resources, uiSmoke, uiBrowseSmoke, startupLease);
                 // Includes merged theme dictionaries; failures here preceded OnStartup in the old entry point.
                 app.InitializeComponent();
                 if (options.Kind == StartupCheckKind.Resources)

@@ -13,6 +13,7 @@ internal static class Program
 {
     internal static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true };
     internal static string Version => typeof(Program).Assembly.GetName().Version!.ToString(3);
+    internal const int StartupBusyExitCode = 4;
 
     public static async Task<int> Main(string[] args)
     {
@@ -35,7 +36,13 @@ internal static class Program
             if (args is ["--fixture-parent", var stageDirectory]) return await RunParentAsync(config, stageDirectory);
             if (args is ["--install", var requestPath]) return await RunHelperAsync(config, requestPath);
             if (args.Length != 0) throw new ArgumentException("Invalid fixture arguments.");
-            if (UpdateLaunchRedirector.TryLaunchNewer(new(config.Root), config.PublicKey, Version)) return 0;
+            using var startup = UpdateStartupLease.TryAcquire(new(config.Root), config.PublicKey, Version, Environment.ProcessPath!);
+            if (startup is null) return ReportStartupBusy(config);
+            if (UpdateLaunchRedirector.TryLaunchNewer(new(config.Root), config.PublicKey, Version, startup)) return 0;
+            // Mirror the Desktop startup ordering: admission stays held through redirect and until
+            // exclusive catalog ownership. The writer lease remains owned until this process exits.
+            using var writer = AcquireWriterLease(config.Root);
+            startup.Dispose();
             return RunApplication(config);
         }
         catch (Exception exception)
@@ -58,6 +65,10 @@ internal static class Program
     {
         var control = Path.Combine(config.Root, "control");
         var paths = new UpdateInstallationPaths(config.Root);
+        using var startup = UpdateStartupLease.TryAcquire(paths, config.PublicKey, Version, Environment.ProcessPath!);
+        if (startup is null) return ReportStartupBusy(config);
+        using var writer = AcquireWriterLease(config.Root);
+        startup.Dispose();
         // The helper must wait for actual process exit, even after these handles are drained.
         var catalog = new FileStream(CatalogPath(config.Root), FileMode.Open, FileAccess.Read, FileShare.None);
         var original = new FileStream(MediaPath(config.Root), FileMode.Open, FileAccess.Read, FileShare.None);
@@ -68,6 +79,14 @@ internal static class Program
             var stage = await UpdatePackageVerifier.VerifyStagedAsync(stageDirectory, config.PublicKey);
             var request = await UpdateInstallRequest.CreateFileAsync(stage, paths, Version);
             WriteNewJson(Path.Combine(control, "request-ready.json"), new { path = request, processId = Environment.ProcessId });
+            var helperIdentityPath = Path.Combine(control, "helper-identity.json");
+            await WaitForFileAsync(helperIdentityPath, TimeSpan.FromSeconds(45));
+            var helper = JsonSerializer.Deserialize<HelperIdentity>(File.ReadAllText(helperIdentityPath), Json)
+                ?? throw new InvalidDataException("Missing fixture helper identity.");
+            await UpdateInstallationHandoff.AcceptWhenReadyAsync(request, paths, helper.ProcessId,
+                helper.StartTimeUtcTicks, TimeSpan.FromSeconds(30));
+            WriteNewJson(Path.Combine(control, "parent-accepted-handoff.json"), new
+            { processId = Environment.ProcessId, helperProcessId = helper.ProcessId, helper.StartTimeUtcTicks });
             await WaitForFileAsync(Path.Combine(control, "drain.signal"), TimeSpan.FromSeconds(45));
         }
         finally { catalog.Dispose(); original.Dispose(); }
@@ -102,7 +121,7 @@ internal static class Program
             }
             var options = new UpdateInstallationOptions
             {
-                ParentExitTimeout = TimeSpan.FromSeconds(45), StartupVerificationTimeout = TimeSpan.FromSeconds(30),
+                HandoffTimeout = TimeSpan.FromSeconds(45), ParentExitTimeout = TimeSpan.FromSeconds(45), StartupVerificationTimeout = TimeSpan.FromSeconds(30),
                 StartupHealthTimeout = TimeSpan.FromSeconds(10), Checkpoint = Checkpoint,
                 // Synchronous fixture progress pauses after a real candidate process was started. Production
                 // uses normal UI progress; there is no fault environment variable or command in the helper.
@@ -138,6 +157,14 @@ internal static class Program
 
     internal static string CatalogPath(string root) => Path.Combine(root, "storage-generations", "synthetic", "catalog-v2.sqlite");
     internal static string MediaPath(string root) => Path.Combine(root, "synthetic-media", "original.mov");
+    private static FileStream AcquireWriterLease(string root) =>
+        new(Path.Combine(root, "control", "fixture-single-writer.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+    private static int ReportStartupBusy(FixtureConfig config)
+    {
+        WriteNewJson(Path.Combine(config.Root, "control", "startup-busy-" + Environment.ProcessId + ".json"),
+            new { processId = Environment.ProcessId, phase = "startup-admission", version = Version });
+        return StartupBusyExitCode;
+    }
     internal static string ReadCatalogIntegrity(string root)
     {
         using var database = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = CatalogPath(root), Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
@@ -171,6 +198,7 @@ internal static class Program
 
 internal sealed record FixtureConfig(string Root, string PublicKey);
 internal sealed record PauseControl(string Checkpoint);
+internal sealed record HelperIdentity(int ProcessId, long StartTimeUtcTicks);
 
 internal sealed class SynchronousFixtureProgress(Action<string> report) : IProgress<string>
 { public void Report(string value) => report(value); }

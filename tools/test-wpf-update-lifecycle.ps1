@@ -39,6 +39,73 @@ foreach ($relative in $tracked) {
     New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
     Copy-Item -LiteralPath $source -Destination $target
 }
+# Deterministic scheduling is compiled into this owned source copy only. Shipping executables
+# have no environment/argument/config switch for these gates, and test packages are never released.
+$controlRoot = Join-Path $runRoot 'lifecycle-control'
+New-Item -ItemType Directory -Path $controlRoot | Out-Null
+$controlOwner = [Guid]::NewGuid().ToString('N')
+[IO.File]::WriteAllText((Join-Path $controlRoot 'owned-test-control.txt'), $controlOwner)
+$gateSource = @'
+using System.Diagnostics;
+using System.Text.Json;
+
+namespace PhotoShelf.Application.Updates.Installation;
+
+public static class UpdateLifecycleTestGate
+{
+    private const string ControlRoot = __CONTROL_ROOT__;
+    private const string Owner = __CONTROL_OWNER__;
+
+    public static void Wait(string checkpoint)
+    {
+        Record(checkpoint + ".reached.json", checkpoint);
+        var timer = Stopwatch.StartNew();
+        var release = Path.Combine(ControlRoot, checkpoint + ".release");
+        while (!File.Exists(release))
+        {
+            if (timer.Elapsed > TimeSpan.FromSeconds(45)) throw new TimeoutException("Owned WPF lifecycle gate was not released: " + checkpoint);
+            Thread.Sleep(25);
+        }
+    }
+
+    public static void RecordCatalogEntry() => Record("catalog-entry-" + Environment.ProcessId + ".json", "catalog-entry");
+
+    private static void Record(string file, string checkpoint)
+    {
+        UpdatePackageVerifier.RejectReparseAncestors(ControlRoot);
+        if (File.ReadAllText(Path.Combine(ControlRoot, "owned-test-control.txt")) != Owner)
+            throw new InvalidOperationException("Missing owned WPF lifecycle control marker.");
+        var path = Path.Combine(ControlRoot, file);
+        var pending = path + ".pending-" + Guid.NewGuid().ToString("N");
+        using (var output = new FileStream(pending, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+        {
+            JsonSerializer.Serialize(output, new { checkpoint, processId = Environment.ProcessId,
+                version = System.Reflection.Assembly.GetEntryAssembly()!.GetName().Version!.ToString(3), atUtc = DateTimeOffset.UtcNow });
+            output.Flush(true);
+        }
+        File.Move(pending, path, overwrite: false);
+    }
+}
+'@
+$gateSource = $gateSource.Replace('__CONTROL_ROOT__', ($controlRoot | ConvertTo-Json -Compress)).Replace('__CONTROL_OWNER__', ($controlOwner | ConvertTo-Json -Compress))
+[IO.File]::WriteAllText((Join-Path $sourceRoot 'src/PhotoShelf.Application/Updates/Installation/UpdateLifecycleTestGate.cs'), $gateSource, [Text.UTF8Encoding]::new($false))
+function Replace-OwnedSourceOnce([string]$RelativePath, [string]$Before, [string]$After) {
+    $path = Join-Path $sourceRoot $RelativePath
+    $text = [IO.File]::ReadAllText($path)
+    if ([regex]::Matches($text, [regex]::Escape($Before)).Count -ne 1) { throw "Expected exactly one test instrumentation target in $RelativePath" }
+    [IO.File]::WriteAllText($path, $text.Replace($Before, $After), [Text.UTF8Encoding]::new($false))
+}
+foreach ($checkpoint in @('before-pointer-publish', 'pointer-published')) {
+    $before = '_options.Checkpoint?.Invoke("' + $checkpoint + '");'
+    Replace-OwnedSourceOnce 'src/PhotoShelf.Application/Updates/Installation/UpdateInstaller.cs' $before `
+        ($before + "`n        UpdateLifecycleTestGate.Wait(`"$checkpoint`");")
+}
+$beforeHealth = 'UpdateStartupHealth.ReportReady(Environment.ProcessPath!, _updatePaths)'
+$instrumentedHealth = '{ if (Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable) is not null) UpdateLifecycleTestGate.Wait("candidate-before-health"); ' + $beforeHealth + '; }'
+Replace-OwnedSourceOnce 'src/PhotoShelf.Desktop/MainWindow.Updates.cs' $beforeHealth $instrumentedHealth
+$beforeStorage = 'var location = LocalCatalogStore.StorageLocation;'
+Replace-OwnedSourceOnce 'src/PhotoShelf.Desktop/App.Storage.cs' $beforeStorage `
+    ('PhotoShelf.Application.Updates.Installation.UpdateLifecycleTestGate.RecordCatalogEntry();' + "`n        " + $beforeStorage)
 $codecSource = Join-Path $repoRoot 'artifacts/heif-codec/win-x64'
 if (-not (Test-Path -LiteralPath (Join-Path $codecSource 'PhotoShelf.HeifWorker.exe') -PathType Leaf)) { throw 'Build bundled HEIF codecs first.' }
 New-Item -ItemType Directory -Path (Join-Path $sourceRoot 'artifacts/heif-codec') -Force | Out-Null
@@ -108,7 +175,8 @@ try {
 finally { $driverProcess.Dispose() }
 $proof = Get-Content -LiteralPath (Join-Path $ReportDirectory 'updater-desktop-e2e.json') -Raw | ConvertFrom-Json
 if ($proof.schema -ne 1 -or $proof.status -ne 'passed' -or $proof.commit -ne $commit -or $proof.version -ne $version -or
-    $proof.scope -ne 'production-desktop-update-lifecycle-with-test-trust' -or -not $proof.sourcePublicKeySubstituted) {
+    $proof.scope -ne 'production-desktop-update-lifecycle-with-test-trust' -or -not $proof.sourcePublicKeySubstituted -or
+    -not $proof.sourceFaultCheckpointsInserted) {
     throw 'WPF lifecycle report identity or outcome does not match this run.'
 }
 Write-Output ('Real WPF updater lifecycle evidence: ' + (Join-Path $ReportDirectory 'updater-desktop-e2e.json'))

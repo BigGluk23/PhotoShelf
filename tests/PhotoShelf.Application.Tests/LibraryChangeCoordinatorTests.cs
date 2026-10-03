@@ -1113,7 +1113,10 @@ public sealed class LibraryChangeCoordinatorTests
         Assert.Equal(1, factory.Count);
         Assert.Contains(batches, batch => batch.RevalidateContentRoots?.Contains(root) == true);
         probe.Availability = FileAvailability.AccessDenied;
-        await Until(() => factory.Latest(root).Disposed);
+        // Watcher disposal precedes publishing the batch; wait for the consumer-visible state.
+        await Until(() => batches.SelectMany(batch => batch.RootStates)
+            .Any(state => state.Path == root && state.Availability == FileAvailability.AccessDenied));
+        Assert.True(factory.Latest(root).Disposed);
         Assert.Contains(batches.SelectMany(batch => batch.RootStates), state => state.Availability == FileAvailability.AccessDenied);
     }
 

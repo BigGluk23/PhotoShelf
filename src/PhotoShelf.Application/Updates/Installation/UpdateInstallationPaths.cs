@@ -18,6 +18,8 @@ public sealed class UpdateInstallationPaths
     public string StagingRoot => Path.Combine(AppRoot, "updates", "staging");
     public string RequestsRoot => Path.Combine(AppRoot, "updates", "requests");
     public string ActivePointerPath => Path.Combine(ProgramRoot, "active-v1.json");
+    public string InstallationLockPath => Path.Combine(ProgramRoot, "installation.lock");
+    public string StartupEntryLockPath => Path.Combine(ProgramRoot, "startup-entry.lock");
 
     internal string InstallationDirectory(string installationId) => Path.Combine(VersionsRoot, RequireId(installationId));
     internal string OperationDirectory(string requestId) => Path.Combine(OperationsRoot, RequireId(requestId));

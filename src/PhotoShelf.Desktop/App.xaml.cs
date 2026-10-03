@@ -3,6 +3,7 @@ using System.Windows.Threading;
 using System.IO;
 using PhotoShelf.Infrastructure.Sqlite;
 using PhotoShelf.Application.Diagnostics;
+using PhotoShelf.Application.Updates.Installation;
 
 namespace PhotoShelf.Desktop;
 
@@ -15,17 +16,20 @@ public partial class App : System.Windows.Application
     private readonly bool _verificationOnly;
     private readonly UiSmokeSession? _uiSmoke;
     private readonly UiBrowseSmokeSession? _uiBrowseSmoke;
+    private readonly UpdateStartupLease? _updateStartupLease;
     internal bool VerificationFailed { get; private set; }
 
     public App() : this(false) { }
 
     public App(bool verificationOnly) : this(verificationOnly, null) { }
 
-    internal App(bool verificationOnly, UiSmokeSession? uiSmoke, UiBrowseSmokeSession? uiBrowseSmoke = null)
+    internal App(bool verificationOnly, UiSmokeSession? uiSmoke, UiBrowseSmokeSession? uiBrowseSmoke = null,
+        UpdateStartupLease? updateStartupLease = null)
     {
         _verificationOnly = verificationOnly;
         _uiSmoke = uiSmoke;
         _uiBrowseSmoke = uiBrowseSmoke;
+        _updateStartupLease = updateStartupLease;
         DispatcherUnhandledException += OnUnhandledDispatcherException;
     }
 
@@ -57,6 +61,7 @@ public partial class App : System.Windows.Application
                 ? "Local\\PhotoShelf.Smoke." + Guid.NewGuid().ToString("N")
                 : "Local\\PhotoShelf.Catalog.SingleWriter";
             _instanceMutex = new Mutex(true, mutexName, out var firstInstance);
+            _updateStartupLease?.Dispose();
             if (!firstInstance)
             {
                 System.Windows.MessageBox.Show("PhotoShelf уже запущен. Откройте его окно через значок в области уведомлений.", "PhotoShelf");

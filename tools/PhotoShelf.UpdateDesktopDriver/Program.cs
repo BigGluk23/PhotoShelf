@@ -29,8 +29,12 @@ internal static class Program
     private static readonly List<Process> OwnedProcesses = [];
     private static readonly Dictionary<string, (string Hash, long Length, long Modified)> Originals = new(StringComparer.OrdinalIgnoreCase);
     private static string _phase = "initializing", _runRoot = "", _profile = "", _ownerId = "";
+    private static string _controlRoot = "", _controlOwner = "";
     private static readonly List<ProcessRecord> ProcessEvidence = [];
+    private static readonly List<RaceRecord> RaceEvidence = [];
     private sealed record ProcessRecord(int Id, DateTime StartedUtc, string Executable);
+    private sealed record GateRecord(string Checkpoint, int ProcessId, string Version, DateTimeOffset AtUtc);
+    private sealed record RaceRecord(string Checkpoint, int ProcessId, bool BusyPromptShown, int ExitCode, bool CatalogStartup);
 
     [MTAThread]
     private static int Main(string[] args) => RunAsync(args).GetAwaiter().GetResult();
@@ -51,6 +55,9 @@ internal static class Program
             Require(_runRoot.StartsWith(Path.GetFullPath(Path.GetTempPath()), StringComparison.OrdinalIgnoreCase) &&
                 Path.GetFileName(_runRoot).StartsWith("PhotoShelf-WpfUpdateLifecycle-", StringComparison.Ordinal), "Unowned test source directory.");
             UpdatePackageVerifier.RejectReparseAncestors(_runRoot);
+            _controlRoot = Path.Combine(_runRoot, "lifecycle-control");
+            _controlOwner = await File.ReadAllTextAsync(Path.Combine(_controlRoot, "owned-test-control.txt"));
+            Require(Guid.TryParseExact(_controlOwner, "N", out _), "Missing owned compile-time scheduling control.");
             Require(args[2].Length == 40 && args[2].All(Uri.IsHexDigit), "Invalid source revision.");
             var oldExe = Path.Combine(_runRoot, "app-1.11.0", "PhotoShelf.exe");
             var oldHelper = Path.Combine(_runRoot, "app-1.11.0", "PhotoShelf.Updater.exe");
@@ -75,6 +82,7 @@ internal static class Program
             var old = StartOwned(oldExe);
             AutomationElement? oldWindow = null;
             await UntilAsync(() => (oldWindow = MainWindow(old.Id)) is not null && HasText(oldWindow, "preserved-photo.png"), "Old application did not show synthetic catalog.");
+            RequireGateRecord("catalog-entry-" + old.Id + ".json", "catalog-entry", old.Id, "1.11.0");
             Assertions["normalOldEntrypoint"] = true;
             var catalog = new CatalogLocation().Discover().Selection?.DirectoryPath ?? throw new IOException("No real catalog generation was selected.");
             var rowsBefore = await RowsSnapshotAsync(catalog);
@@ -102,17 +110,48 @@ internal static class Program
             var paths = new UpdateInstallationPaths();
             Process? helper = null;
             ActiveInstallationTarget? active = null;
-            // Poll only exact executable paths owned by this fixture. The isolated preflight is not
-            // the real successor: an active pointer and real startup-ready receipt are required below.
+            _phase = "repeated-launch-before-pointer";
+            // The pause is compiled into the owned source copy at an existing installer checkpoint.
+            // Ordinary launches still use the real zero-argument production entrypoint and controls.
             await UntilAsync(() =>
             {
                 helper ??= FindOwnedProcess(oldHelper);
-                if (File.Exists(paths.ActivePointerPath)) active = ActiveInstallationResolver.Resolve(paths, key);
-                return old.HasExited && helper is not null && active?.Version == "1.11.1";
-            }, "WPF close did not launch its helper and activate the signed successor.", 150);
+                return old.HasExited && helper is not null && GateReached("before-pointer-publish");
+            }, "WPF close did not reach its real helper's before-pointer checkpoint.", 150);
             Require(old.ExitCode == 0, "Old application did not close gracefully.");
             Assertions["oldProcessExited"] = true;
             Assertions["helperLaunched"] = true;
+            RequireGateRecord("before-pointer-publish.reached.json", "before-pointer-publish", helper!.Id, "1.11.0");
+            Require(!File.Exists(paths.ActivePointerPath), "The fresh profile already has an active pointer before publication.");
+            await AssertRepeatedLaunchBlockedAsync(oldExe, "before-pointer-publish", catalog, rowsBefore, journalsBefore);
+            Assertions["repeatedLaunchBeforePointerBlocked"] = true;
+            ReleaseGate("before-pointer-publish");
+
+            _phase = "repeated-launch-after-pointer";
+            await UntilAsync(() => GateReached("pointer-published"), "Helper did not reach its published-pointer checkpoint.", 30);
+            RequireGateRecord("pointer-published.reached.json", "pointer-published", helper.Id, "1.11.0");
+            active = ActiveInstallationResolver.Resolve(paths, key);
+            Require(active?.Version == "1.11.1", "The checkpoint does not point to the signed new version.");
+            Require(!HasReadyReceipt(paths), "New-version health was reported before the helper launched it.");
+            await AssertRepeatedLaunchBlockedAsync(oldExe, "pointer-published", catalog, rowsBefore, journalsBefore);
+            Assertions["repeatedLaunchAfterPointerBlocked"] = true;
+            ReleaseGate("pointer-published");
+
+            _phase = "repeated-launch-before-health";
+            Process? successor = null;
+            AutomationElement? newWindow = null;
+            await UntilAsync(() =>
+            {
+                successor ??= FindOwnedProcess(active!.ExecutablePath);
+                return successor is not null && GateReached("candidate-before-health") &&
+                    (newWindow = MainWindow(successor.Id)) is not null && HasText(newWindow, "preserved-photo.png");
+            }, "New actual WPF application did not show its catalog before startup health.", 30);
+            RequireGateRecord("candidate-before-health.reached.json", "candidate-before-health", successor!.Id, "1.11.1");
+            Require(!HasReadyReceipt(paths), "The candidate wrote health before its checkpoint was released.");
+            await AssertRepeatedLaunchBlockedAsync(oldExe, "candidate-before-health", catalog, rowsBefore, journalsBefore);
+            Assertions["repeatedLaunchBeforeHealthBlocked"] = true;
+            ReleaseGate("candidate-before-health");
+
             _phase = "new-application-ready";
             string? receiptPath = null;
             await UntilAsync(() =>
@@ -130,13 +169,6 @@ internal static class Program
                     request.RootElement.GetProperty("expectedVersion").GetString() == "1.11.1", "Install request lost parent/version identity.");
             }
             Assertions["startupReadyReceipt"] = true;
-            Process? successor = null;
-            AutomationElement? newWindow = null;
-            await UntilAsync(() =>
-            {
-                successor ??= FindOwnedProcess(active!.ExecutablePath);
-                return successor is not null && (newWindow = MainWindow(successor.Id)) is not null && HasText(newWindow, "preserved-photo.png");
-            }, "New actual WPF application did not show the retained catalog.");
             RequireVersion(active!.ExecutablePath, 1);
             Assertions["newProcessLaunched"] = true;
             Require(((ValuePattern)FindById(newWindow!, "SearchBox").GetCurrentPattern(ValuePattern.Pattern)).Current.Value == "preserved-photo",
@@ -213,6 +245,7 @@ internal static class Program
             {
                 schema = 1, status, commit = args[2], version = args[3], platform = "windows",
                 scope = "production-desktop-update-lifecycle-with-test-trust", sourcePublicKeySubstituted = true,
+                sourceFaultCheckpointsInserted = true, raceChecks = RaceEvidence,
                 testVersions = new[] { "1.11.0", "1.11.1" }, assertions = Assertions, phase = _phase,
                 elapsedSeconds = elapsed.Elapsed.TotalSeconds, processes = ProcessEvidence,
                 ownedProfile = _profile, ownedFixtures = _runRoot, error, failureDiagnostics,
@@ -220,6 +253,7 @@ internal static class Program
                 {
                     "Real Desktop and Updater source builds use an ephemeral compile-time test public key and two technical versions; these are not release artifacts.",
                     "Normal entrypoints, production WPF controls and real child processes are exercised on an initially absent disposable CI profile.",
+                    "Only owned source copies contain three scheduling checkpoints and a catalog-entry observer; production artifacts have no runtime fault-control switch.",
                     "This scenario verifies the successful WPF transition and old shortcut. Deterministic interruption cases are reported separately by updater-e2e.json.",
                     "Original byte/hash/mtime preservation and media-row/journal preservation are checked; physical power loss, real user libraries and video playback are not simulated."
                 }
@@ -325,6 +359,64 @@ internal static class Program
             Require(File.Exists(path) && Hash(path) == before.Hash && new FileInfo(path).Length == before.Length &&
                 File.GetLastWriteTimeUtc(path).Ticks == before.Modified, "A synthetic original was lost or changed: " + Path.GetFileName(path));
     }
+
+    private static bool GateReached(string checkpoint) => File.Exists(Path.Combine(_controlRoot, checkpoint + ".reached.json"));
+    private static bool HasReadyReceipt(UpdateInstallationPaths paths) => Directory.Exists(paths.OperationsRoot) &&
+        Directory.EnumerateFiles(paths.OperationsRoot, "startup-ready.json", SearchOption.AllDirectories).Any();
+    private static void RequireGateRecord(string file, string checkpoint, int pid, string version)
+    {
+        var path = Path.Combine(_controlRoot, file);
+        UpdatePackageVerifier.RejectReparseAncestors(path);
+        Require(new FileInfo(path).Length <= 2048, "Oversized owned checkpoint marker.");
+        var record = JsonSerializer.Deserialize<GateRecord>(File.ReadAllText(path), Json);
+        Require(record is not null && record.Checkpoint == checkpoint && record.ProcessId == pid && record.Version == version,
+            "Checkpoint does not belong to the expected real application/helper: " + checkpoint);
+    }
+    private static void ReleaseGate(string checkpoint)
+    {
+        UpdatePackageVerifier.RejectReparseAncestors(_controlRoot);
+        Require(File.ReadAllText(Path.Combine(_controlRoot, "owned-test-control.txt")) == _controlOwner,
+            "Refusing to release an unowned scheduling checkpoint.");
+        using var release = new FileStream(Path.Combine(_controlRoot, checkpoint + ".release"), FileMode.CreateNew,
+            FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
+        release.WriteByte(1);
+        release.Flush(true);
+    }
+    private static async Task AssertRepeatedLaunchBlockedAsync(string oldExe, string checkpoint, string catalog,
+        string rowsBefore, KeyValuePair<string, string>[] journalsBefore)
+    {
+        const string expectedText = "PhotoShelf запускается или обновляется. Дождитесь завершения и повторите запуск.";
+        var repeated = StartOwned(oldExe);
+        var catalogMarker = Path.Combine(_controlRoot, "catalog-entry-" + repeated.Id + ".json");
+        AutomationElement? busy = null;
+        await UntilAsync(() =>
+        {
+            // Fail fast on the unfixed baseline, instead of accepting an eventual file-lock failure.
+            // InvalidDataException is intentionally not one of UntilAsync's transient UI exceptions.
+            var enteredCatalog = File.Exists(catalogMarker);
+            var openedMainWindow = MainWindow(repeated.Id) is not null;
+            if (enteredCatalog || openedMainWindow)
+                throw new InvalidDataException($"Repeated old launch entered catalog startup during {checkpoint}. " +
+                    $"Process {repeated.Id}: catalogEntryMarker={enteredCatalog}, mainWindow={openedMainWindow}.");
+            if (repeated.HasExited)
+                throw new InvalidDataException("Repeated launch exited without the required busy prompt during " + checkpoint + ".");
+            busy = FindWindow(repeated.Id, "PhotoShelf");
+            return busy is not null && HasText(busy, expectedText);
+        }, "Repeated old launch did not show the exact update-in-progress message at " + checkpoint + ".", 15);
+        var okay = busy!.FindFirst(TreeScope.Descendants, new AndCondition(
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+            new PropertyCondition(AutomationElement.AutomationIdProperty, "1"))) ?? Button(busy, "OK");
+        Require(okay is not null && okay.Current.IsEnabled, "Busy prompt has no enabled native OK button.");
+        ((InvokePattern)okay!.GetCurrentPattern(InvokePattern.Pattern)).Invoke();
+        await UntilAsync(() => repeated.HasExited, "Dismissed busy launch did not exit at " + checkpoint + ".", 5);
+        Require(repeated.ExitCode == 0 && !File.Exists(catalogMarker) && MainWindow(repeated.Id) is null,
+            "Busy launch must exit successfully before catalog startup: " + checkpoint);
+        VerifyOriginals();
+        Require(await RowsSnapshotAsync(catalog) == rowsBefore && JournalSnapshot(catalog).SequenceEqual(journalsBefore),
+            "Repeated launch changed synthetic media rows or journals at " + checkpoint + ".");
+        RaceEvidence.Add(new(checkpoint, repeated.Id, BusyPromptShown: true, repeated.ExitCode, CatalogStartup: false));
+    }
+
     private static void PreserveOwnedErrorLogs(string reports)
     {
         try

@@ -5,6 +5,7 @@ namespace PhotoShelf.Application.Updates.Installation;
 
 public sealed class UpdateInstallationOptions
 {
+    public TimeSpan HandoffTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan ParentExitTimeout { get; init; } = TimeSpan.FromMinutes(2);
     public TimeSpan StartupVerificationTimeout { get; init; } = TimeSpan.FromSeconds(45);
     public TimeSpan StartupHealthTimeout { get; init; } = TimeSpan.FromSeconds(30);
@@ -34,12 +35,15 @@ public sealed class UpdateInstaller(UpdateInstallationPaths paths, string public
         if (!UpdateVersion.TryParse(currentVersion, out var helperVersion) ||
             !UpdateVersion.TryParse(request.CurrentVersion, out var requesterVersion) || helperVersion != requesterVersion)
             throw new InvalidDataException("The installation helper does not match the requesting application version.");
+        // Reserve normal startup while the original parent still owns its catalog mutex. Keep the
+        // gate until health completes; the claim declared below must be disposed BEFORE this lease.
+        using var installationLock = UpdateStartupLease.AcquireForInstallation(paths);
         UpdateInstallationPaths.CreateDirectory(paths.OperationsRoot);
         var operationDirectory = paths.OperationDirectory(request.RequestId);
         UpdateInstallationPaths.CreateDirectory(operationDirectory);
         // A durable, no-overwrite claim makes a request single-use, including after a crash or reboot.
         using var claim = new FileStream(Path.Combine(operationDirectory, "request-claimed.json"), FileMode.CreateNew,
-            FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
+            FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough);
         JsonSerializer.Serialize(claim, request, UpdateManifestVerifier.JsonOptions);
         claim.Flush(flushToDisk: true);
         var journal = new InstallationJournal(operationDirectory, _options.Progress);
@@ -47,15 +51,16 @@ public sealed class UpdateInstaller(UpdateInstallationPaths paths, string public
         var activated = false;
         try
         {
+            _options.Checkpoint?.Invoke("startup-reserved");
+            var handoff = await UpdateInstallationHandoff.ReserveAndWaitForAcceptanceAsync(request, paths,
+                _options.HandoffTimeout, token).ConfigureAwait(false);
+            _options.Checkpoint?.Invoke("handoff-accepted");
             journal.Write("waiting-for-parent");
             await _processes.WaitForParentExitAsync(request.ParentProcessId, request.ParentStartTimeUtcTicks,
                 _options.ParentExitTimeout, token).ConfigureAwait(false);
+            UpdateInstallationHandoff.RequireCommitted(paths, handoff);
             _options.Checkpoint?.Invoke("parent-exited");
             token.ThrowIfCancellationRequested();
-            UpdateInstallationPaths.CreateDirectory(paths.ProgramRoot);
-            var lockPath = Path.Combine(paths.ProgramRoot, "installation.lock");
-            UpdateInstallationPaths.RejectLinks(lockPath, allowMissing: true);
-            using var installationLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             var current = ActiveInstallationResolver.Resolve(paths, publicKeyPem, UpdateTrust.CurrentCatalogSchema);
             if (!UpdateVersion.IsNewer(request.ExpectedVersion, currentVersion) ||
                 current is not null && !UpdateVersion.IsNewer(request.ExpectedVersion, current.Version))

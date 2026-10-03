@@ -46,7 +46,8 @@ class ReleaseTests(unittest.TestCase):
                        originalHashesPreserved=True, sqliteIntegrityPassed=True,
                        scenarios=[{"name": name, "status": "passed"} for name in sorted(release.PROCESS_SCENARIOS)])
         desktop = dict(shared, scope="production-desktop-update-lifecycle-with-test-trust",
-                       sourcePublicKeySubstituted=True, testVersions=["1.2.3", "1.2.4"],
+                       sourcePublicKeySubstituted=True, sourceFaultCheckpointsInserted=True,
+                       testVersions=["1.2.3", "1.2.4"],
                        assertions={name: True for name in release.DESKTOP_ASSERTIONS})
         return json.dumps(process).encode(), json.dumps(desktop).encode()
 
@@ -198,6 +199,34 @@ class ReleaseTests(unittest.TestCase):
                 summary = self.summary()
                 summary["updaterDesktopLifecycleReportSha256"] = release.hashlib.sha256(changed).hexdigest()
                 with self.assertRaisesRegex(ValueError, "two distinct"):
+                    release.verify_lifecycle_evidence(summary, process, changed, self.version, self.commit)
+
+    def test_previous_happy_path_report_cannot_substitute_for_relaunch_race_evidence(self):
+        process, desktop = self.lifecycle_reports()
+        report = json.loads(desktop)
+        for name in ("repeatedLaunchBeforePointerBlocked", "repeatedLaunchAfterPointerBlocked",
+                     "repeatedLaunchBeforeHealthBlocked"):
+            del report["assertions"][name]
+        del report["sourceFaultCheckpointsInserted"]
+        changed = json.dumps(report).encode()
+        summary = self.summary()
+        summary["updaterDesktopLifecycleReportSha256"] = release.hashlib.sha256(changed).hexdigest()
+        with self.assertRaisesRegex(ValueError, "every required assertion"):
+            release.verify_lifecycle_evidence(summary, process, changed, self.version, self.commit)
+
+    def test_relaunch_assertions_require_instrumented_checkpoint_evidence(self):
+        process, desktop = self.lifecycle_reports()
+        for value in (None, False):
+            with self.subTest(checkpointEvidence=value):
+                report = json.loads(desktop)
+                if value is None:
+                    del report["sourceFaultCheckpointsInserted"]
+                else:
+                    report["sourceFaultCheckpointsInserted"] = value
+                changed = json.dumps(report).encode()
+                summary = self.summary()
+                summary["updaterDesktopLifecycleReportSha256"] = release.hashlib.sha256(changed).hexdigest()
+                with self.assertRaisesRegex(ValueError, "every required assertion"):
                     release.verify_lifecycle_evidence(summary, process, changed, self.version, self.commit)
 
     @unittest.skipIf(os.name == "nt", "Release signing executes on the Linux release runner, not Windows packaging")

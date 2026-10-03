@@ -430,6 +430,16 @@ public partial class MainWindow
         }
         catch (Exception ex)
         {
+            if (_updateHandoffCommitted)
+            {
+                // The current update already has explicit consent and a durable final handoff.
+                // Do not turn a failed Close() into a later unrelated installation on ordinary exit.
+                _closeReady = true;
+                // A modal error would delay actual exit beyond the helper's parent-exit deadline.
+                try { ErrorReporter.Save($"Не удалось завершить окно после передачи обновления\n{ex}"); }
+                finally { System.Windows.Application.Current.Shutdown(1); }
+                return;
+            }
             if (ErrorReporter.AutomatedCheck)
             {
                 ErrorReporter.Show(ex, "UI smoke shutdown failed");
