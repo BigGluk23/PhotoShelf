@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using SkiaSharp;
+using PhotoShelf.Application.Duplicates;
 using PhotoShelf.Application.Media;
 
 namespace PhotoShelf.Desktop;
@@ -136,6 +137,25 @@ public static class MediaBitmapLoader
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         return HeifDecoderClient.HasHeifSignature(stream) ||
             Path.GetExtension(path).ToLowerInvariant() is ".heic" or ".heif" or ".hif";
+    }
+
+    /// <summary>
+    /// Decodes one bounded still frame and immediately reduces it to a platform-independent
+    /// visual fingerprint. The full-resolution source is never retained by the indexer.
+    /// </summary>
+    public static PerceptualFingerprint LoadPerceptualFingerprint(string path, CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        var bitmap = LoadStillBounded(path, 64, token);
+        var gray = bitmap.Format == PixelFormats.Gray8
+            ? bitmap
+            : new FormatConvertedBitmap(bitmap, PixelFormats.Gray8, null, 0);
+        token.ThrowIfCancellationRequested();
+        var stride = gray.PixelWidth;
+        var pixels = new byte[checked(stride * gray.PixelHeight)];
+        gray.CopyPixels(pixels, stride, 0);
+        token.ThrowIfCancellationRequested();
+        return PerceptualFingerprintAlgorithm.Compute(pixels, gray.PixelWidth, gray.PixelHeight, stride);
     }
 
     /// <summary>Called only by background decoders. HEIC never depends on a Windows WIC extension.</summary>
