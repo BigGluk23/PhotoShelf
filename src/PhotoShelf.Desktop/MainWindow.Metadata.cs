@@ -12,6 +12,7 @@ public partial class MainWindow
     private void StartMetadataIndexing(bool resetExisting)
     {
         if (_fileOperationActive || _hasPendingRecovery || !_catalogLoaded || _closing || _backgroundProcessingPaused) return;
+        StartPerceptualFingerprintIndexing();
         if (!_metadataTask.IsCompleted && !resetExisting)
         {
             // A scan/browse completion adds work; it must not repeatedly cancel a progressing pass.

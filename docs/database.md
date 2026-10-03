@@ -20,6 +20,8 @@
 | `metadata_properties` | Lossless raw/unknown metadata с provenance |
 | `metadata_unique_ids` | Повторяемые идентификаторы EXIF/XMP/Apple |
 | `metadata_field_sources` | Provenance выбранного значения каждого normalized field |
+| `perceptual_fingerprint_cache` | Производный версионированный visual fingerprint с CAS-снимком файла |
+| `perceptual_fingerprint_bands` | Индексные 16-битные полосы для ограниченного поиска похожих кандидатов |
 | `tags`, `asset_tags` | Нормализованные keywords и их источник |
 | `quarantine_batches/items` | План, состояние и возможность восстановления |
 
@@ -30,6 +32,21 @@ SQLite TEXT хранит ISO-8601. Для EXIF-подобной даты отд�
 ## Raw metadata
 
 `metadata_properties` не ограничивает набор ключей. Сохраняются namespace/group/key, тип, raw text или blob, optional normalized text, language, ordinal, source kind и source file. Поэтому новый parser может переосмыслить уже сохранённые значения без изменения базовой схемы или повторного чтения отключённого диска.
+
+## Производный visual index
+
+`perceptual_fingerprint_cache` не является источником истины и может быть полностью
+пересоздан. Строка содержит версию алгоритма и снимок `asset_id/path/size/mtime/observation_version`.
+Поздний результат декодирования записывается только при полном совпадении снимка с
+`desktop_media_items`; изменение файла автоматически делает старую строку невидимой для
+очереди и поиска. Терминальные неподдерживаемые/повреждённые форматы запоминаются, а
+временные ошибки имеют `retry_at_utc_ticks`, поэтому не создают бесконечный цикл чтения.
+
+`perceptual_fingerprint_bands` хранит четыре части difference hash. Поиск сначала выбирает
+совпавшие полосы индексом SQLite, затем проверяет точное расстояние Хэмминга. При текущем
+пороговом диапазоне 0–3 хотя бы одна из четырёх полос обязательно совпадает. Это индекс
+похожести, а не основание для удаления: окончательное безопасное действие по-прежнему
+требует пользовательского решения и карантина.
 
 Большие binary blocks по умолчанию не копируются: сохраняются digest, length и locator. Малые неизвестные значения можно хранить inline. Это предотвращает разрастание каталога из-за previews и maker notes.
 

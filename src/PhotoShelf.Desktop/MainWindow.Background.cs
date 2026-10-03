@@ -377,6 +377,7 @@ public partial class MainWindow
         if (_libraryMonitor is not null) { await _libraryMonitor.PauseAsync(); _monitorPaused = true; }
         _scanCancellation?.Cancel(); _browseCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel();
+        _fingerprintCancellation?.Cancel();
         _saveCancellation?.Cancel(); _infoCancellation?.Cancel(); _rangeSelectionCancellation?.Cancel();
         if (stopDuplicates)
         {
@@ -384,7 +385,7 @@ public partial class MainWindow
             try { await _duplicateWorkTask; } catch (OperationCanceledException) { }
         }
         try { await Task.WhenAll(_infoWorkTasks.ToArray()); } catch (Exception) { /* All readers have finished, including canceled or failed reads. */ }
-        await Task.WhenAll(_scanTask, _browseTask, _metadataTask, _pendingSave);
+        await Task.WhenAll(_scanTask, _browseTask, _metadataTask, _fingerprintTask, _pendingSave);
     }
     protected override async void OnClosing(CancelEventArgs e)
     {

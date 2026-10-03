@@ -25,10 +25,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly MetadataIndexStore _metadataIndexStore = new();
     private readonly SqliteDesktopCatalogStore _desktopCatalogStore = new();
     private readonly DuplicateHashStore _duplicateHashStore = new();
+    private readonly PerceptualFingerprintStore _perceptualFingerprintStore = new();
     private readonly Forms.NotifyIcon _trayIcon;
     private CancellationTokenSource? _scanCancellation;
     private CancellationTokenSource? _duplicateCancellation;
     private CancellationTokenSource? _metadataIndexCancellation;
+    private CancellationTokenSource? _fingerprintCancellation;
+    private Task _fingerprintTask = Task.CompletedTask;
+    private bool _fingerprintRefreshPending;
     private int _columns = 5;
     private string? _activeFolder;
     private string _searchText = string.Empty;
@@ -360,6 +364,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (_fileOperationActive || _closing) { node.ApplyInclusion(_folderInclusion); return; }
         _scanCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel();
+        _fingerprintCancellation?.Cancel();
         var included = node.ToggleInclusion(_folderInclusion);
         _pendingFolderScans.RemoveWhere(path => !_folderInclusion.MayContainIncluded(path));
         if (included) _pendingFolderScans.Add(node.FullPath);
@@ -730,6 +735,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _scanCancellation?.Cancel();
         _duplicateCancellation?.Cancel();
         _metadataIndexCancellation?.Cancel();
+        _fingerprintCancellation?.Cancel();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         base.OnClosed(e);
@@ -965,6 +971,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await _desktopCatalogStore.InitializeAsync(_lifetime.Token);
         await _metadataIndexStore.InitializeAsync(_lifetime.Token);
         await _duplicateHashStore.InitializeAsync(_lifetime.Token);
+        await _perceptualFingerprintStore.InitializeAsync(_lifetime.Token);
         await CheckPendingOperationsAsync();
         _catalogLoaded = true;
         await PersistStateAsync(CaptureState(), _lifetime.Token, 0);
