@@ -105,5 +105,85 @@ public sealed class DuplicateSearchSessionTests : IDisposable
         await session.CompleteAsync(false); Assert.Equal(0, session.GroupCount);
     }
 
+    [Fact]
+    public async Task SelectionPersistsAcrossPagesAndChangingKeeperPreservesACompleteDecision()
+    {
+        await using var session = await DuplicateSearchSession.CreateAsync(_root);
+        var matches = Enumerable.Range(0, DuplicateSearchSession.MembersPerPage + 7)
+            .Select(member => Match(21, member)).ToArray();
+        await session.AddAsync(matches.Take(64).ToArray());
+        await session.AddAsync(matches.Skip(64).ToArray());
+        await session.CompleteAsync(false);
+
+        await session.SetAllExtrasSelectedAsync(true);
+        var group = Assert.Single(await session.ReadGroupsAsync(0));
+        Assert.Equal(matches.Length - 1, (await session.ReadSelectionSummaryAsync()).SelectedFiles);
+
+        var newKeeper = matches[^1].Item.Path;
+        var oldKeeper = group.KeeperPath;
+        await session.SetKeeperAsync(group.Id, newKeeper);
+        var selection = await session.ReadQuarantineSelectionAsync();
+
+        Assert.Equal(matches.Length - 1, selection.Count);
+        Assert.DoesNotContain(selection, item => item.Item.Path.Equals(newKeeper, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(selection, item => item.Item.Path.Equals(oldKeeper, StringComparison.OrdinalIgnoreCase));
+        Assert.All(selection, item => Assert.Equal(newKeeper, item.KeeperPath));
+        await Assert.ThrowsAsync<IOException>(() => session.SetItemSelectedAsync(newKeeper, true));
+        await Assert.ThrowsAsync<IOException>(() => session.ReadQuarantineSelectionAsync(2));
+
+        await session.SetItemSelectedAsync(oldKeeper, false);
+        Assert.Equal(matches.Length - 2, (await session.ReadSelectionSummaryAsync()).SelectedFiles);
+        var finalPage = await session.ReadGroupAsync(group.Id, DuplicateSearchSession.MembersPerPage);
+        Assert.DoesNotContain(oldKeeper, finalPage.SelectedPaths);
+    }
+
+    [Fact]
+    public async Task PriorityFolderRuleAndBulkMarkApplyToTheWholeSnapshot()
+    {
+        await using var session = await DuplicateSearchSession.CreateAsync(_root);
+        var preferred = Path.Combine(_root, "preferred");
+        var archive = Path.Combine(_root, "archive", "copies");
+        var matches = new List<DuplicateSearchMatch>();
+        for (var group = 30; group < 30 + DuplicateSearchSession.GroupsPerPage + 4; group++)
+        {
+            var hash = group.ToString("X64");
+            matches.Add(new DuplicateSearchMatch(new SavedMediaItem
+            {
+                Path = Path.Combine(archive, $"photo-{group}.jpg"), SizeBytes = group + 100,
+                FileModifiedAt = new DateTime(2026, 2, 2)
+            }, hash));
+            matches.Add(new DuplicateSearchMatch(new SavedMediaItem
+            {
+                Path = Path.Combine(preferred, $"photo-{group}.jpg"), SizeBytes = group + 100,
+                FileModifiedAt = new DateTime(2025, 1, 1)
+            }, hash));
+        }
+        foreach (var batch in matches.Chunk(128)) await session.AddAsync(batch);
+        await session.CompleteAsync(false);
+
+        await session.ApplyKeeperRuleAsync(DuplicateKeeperRule.PriorityFolder, preferred);
+        await session.SetAllExtrasSelectedAsync(true);
+        var summary = await session.ReadSelectionSummaryAsync();
+
+        Assert.Equal(DuplicateSearchSession.GroupsPerPage + 4, summary.SelectedGroups);
+        Assert.Equal(DuplicateSearchSession.GroupsPerPage + 4, summary.SelectedFiles);
+        for (long offset = 0; offset < session.GroupCount; offset += DuplicateSearchSession.GroupsPerPage)
+            Assert.All(await session.ReadGroupsAsync(offset), group =>
+                Assert.StartsWith(preferred, group.KeeperPath, StringComparison.OrdinalIgnoreCase));
+        Assert.All(await session.ReadQuarantineSelectionAsync(), item =>
+            Assert.StartsWith(archive, item.Item.Path, StringComparison.OrdinalIgnoreCase));
+
+        // Changing a mass rule after "mark all" keeps one survivor and every other exact
+        // copy selected instead of silently losing one decision per group.
+        await session.ApplyKeeperRuleAsync(DuplicateKeeperRule.NewestFile);
+        summary = await session.ReadSelectionSummaryAsync();
+        Assert.Equal(DuplicateSearchSession.GroupsPerPage + 4, summary.SelectedFiles);
+        for (long offset = 0; offset < session.GroupCount; offset += DuplicateSearchSession.GroupsPerPage)
+            Assert.All(await session.ReadGroupsAsync(offset), group =>
+                Assert.StartsWith(archive, group.KeeperPath, StringComparison.OrdinalIgnoreCase));
+        Assert.All(await session.ReadQuarantineSelectionAsync(), item =>
+            Assert.StartsWith(preferred, item.Item.Path, StringComparison.OrdinalIgnoreCase));
+    }
+
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }
 }

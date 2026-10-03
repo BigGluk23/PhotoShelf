@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Controls;
 using PhotoShelf.Application.Files;
 using PhotoShelf.Infrastructure.Sqlite;
+using Forms = System.Windows.Forms;
 
 namespace PhotoShelf.Desktop;
 
@@ -25,6 +26,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
     private bool _closingReview;
     private CancellationTokenSource? _moveCancellation;
     private TaskCompletionSource? _operationFinished;
+    private DuplicateSelectionSummary _selectionSummary = new(0, 0, 0);
     public Task PendingOperation => _operationFinished?.Task ?? Task.CompletedTask;
     public void StopOperation()
     {
@@ -72,57 +74,79 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
     private async void OnKeepItemClicked(object sender, RoutedEventArgs e)
     {
         if (_preparing || _moving || _editingSelection || _closingReview || _loadingPage) return;
-        if (sender is FrameworkElement { DataContext: DuplicateItemViewModel item })
-        {
-            item.IsSelected = false;
-            await EditSelectionAsync(group => { if (ReferenceEquals(group, SelectedGroup)) group.Keep(item); });
-        }
+        if (sender is FrameworkElement { DataContext: DuplicateItemViewModel item } && SelectedGroup is { } group)
+            await RunSessionEditAsync(() => _session.SetKeeperAsync(group.Index, item.Photo.Path, _pageCancellation.Token),
+                "Сохраняемая копия изменена для выбранной группы.");
     }
 
     private async void OnKeepNewestClicked(object sender, RoutedEventArgs e) =>
-        await EditSelectionAsync(group => group.KeepNewest());
+        await RunSessionEditAsync(() => _session.ApplyKeeperRuleAsync(DuplicateKeeperRule.NewestFile,
+            token: _pageCancellation.Token), "Во всех группах оставлена самая новая копия.");
 
     private async void OnKeepShortestPathClicked(object sender, RoutedEventArgs e) =>
-        await EditSelectionAsync(group => group.KeepShortestPath());
+        await RunSessionEditAsync(() => _session.ApplyKeeperRuleAsync(DuplicateKeeperRule.ShortestPath,
+            token: _pageCancellation.Token), "Во всех группах оставлена копия с наиболее коротким путём.");
 
-    private async void OnKeepLargestFileClicked(object sender, RoutedEventArgs e) =>
-        await EditSelectionAsync(group => group.KeepLargestFile());
+    private async void OnKeepPriorityFolderClicked(object sender, RoutedEventArgs e)
+    {
+        using var picker = new Forms.FolderBrowserDialog
+        {
+            Description = "Выберите папку, копии из которой нужно оставлять в первую очередь.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false
+        };
+        if (picker.ShowDialog() != Forms.DialogResult.OK) return;
+        var folder = Path.GetFullPath(picker.SelectedPath);
+        await RunSessionEditAsync(() => _session.ApplyKeeperRuleAsync(DuplicateKeeperRule.PriorityFolder,
+            folder, _pageCancellation.Token), $"Приоритет сохраняемой копии: {folder}");
+    }
 
     private async void OnMarkExtrasClicked(object sender, RoutedEventArgs e) =>
-        await EditSelectionAsync(group =>
-        {
-            foreach (var item in group.Items) item.IsSelected = !item.IsKeep;
-        });
+        await RunSessionEditAsync(() => _session.SetAllExtrasSelectedAsync(true, _pageCancellation.Token),
+            "Все лишние точные копии отмечены. Перед переносом будет показан полный план.");
 
-    private async Task EditSelectionAsync(Action<DuplicateGroupViewModel> edit)
+    private async void OnClearMarksClicked(object sender, RoutedEventArgs e) =>
+        await RunSessionEditAsync(() => _session.SetAllExtrasSelectedAsync(false, _pageCancellation.Token),
+            "Все отметки сняты.");
+
+    private async void OnMoveItemToggled(object sender, RoutedEventArgs e)
     {
         if (_preparing || _moving || _editingSelection || _closingReview || _loadingPage) return;
+        if (sender is not FrameworkElement { DataContext: DuplicateItemViewModel item }) return;
+        var requested = item.IsSelected;
         _editingSelection = true;
-        string? selectionError = null;
         UpdateEditingEnabled();
         try
         {
-            foreach (var batch in Groups.ToArray().Chunk(32))
-            {
-                if (_preparing || _moving || _closingReview || !IsLoaded) return;
-                foreach (var group in batch)
-                {
-                    var previous = group.KeepPath;
-                    edit(group);
-                    try { await _session.SetKeeperAsync(group.Index, group.KeepPath, _pageCancellation.Token); }
-                    catch { group.KeepItem = group.Items.FirstOrDefault(item => item.Photo.Path == previous); throw; }
-                }
-                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
-            }
+            await _session.SetItemSelectedAsync(item.Photo.Path, requested, _pageCancellation.Token);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { selectionError = $"Выбор не сохранён: {ex.Message}"; }
+        catch (Exception ex)
+        {
+            item.IsSelected = !requested;
+            if (IsLoaded) StatusText.Text = $"Выбор не сохранён: {ex.Message}";
+        }
         finally
         {
             _editingSelection = false;
             UpdateEditingEnabled();
-            if (IsLoaded) { RefreshSummary(); if (selectionError is not null) StatusText.Text = selectionError; }
+            if (IsLoaded) await RefreshSelectionSummaryAsync();
         }
+    }
+
+    private async Task RunSessionEditAsync(Func<Task> edit, string successText)
+    {
+        if (_preparing || _moving || _editingSelection || _closingReview || _loadingPage) return;
+        _editingSelection = true; UpdateEditingEnabled();
+        string? error = null;
+        try { await edit(); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { error = $"Выбор не сохранён: {ex.Message}"; }
+        finally { _editingSelection = false; UpdateEditingEnabled(); }
+        if (!IsLoaded || _closingReview) return;
+        await LoadGroupsPageAsync(_groupOffset);
+        if (error is not null) StatusText.Text = error;
+        else StatusText.Text = successText;
     }
 
     private void UpdateEditingEnabled()
@@ -133,7 +157,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             content.IsEnabled = !_preparing && !_moving && !_editingSelection && !_closingReview && !_loadingPage;
     }
 
-    private sealed record QuarantineGroupSnapshot(string KeepPath, string Hash, DuplicateItemViewModel[] Marked);
+    private sealed record QuarantineGroupSnapshot(long GroupId, string KeepPath, string Hash);
 
     private async Task<bool> CanStartQuarantineAsync()
     {
@@ -171,23 +195,32 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
         {
             // Recheck every attempt, including attempts after cancellation/failure in this same review window.
             if (!await CanStartQuarantineAsync() || _closingReview) return;
-            // Freeze all choices before opening the modal preview. No worker reads mutable view models.
-            var protectedGroups = Groups.Select(group => new QuarantineGroupSnapshot(
-                group.KeepPath, group.Hash, group.GetMarkedItems().ToArray()))
-                .Where(group => group.Marked.Length > 0).ToArray();
-            var marked = protectedGroups.SelectMany(group => group.Marked).ToArray();
-            if (marked.Length == 0) return;
-            var expectedHashes = protectedGroups.SelectMany(group => group.Marked.Select(item => (item.Photo.Path, group.Hash)))
-                .ToDictionary(x => x.Path, x => x.Hash, StringComparer.OrdinalIgnoreCase);
+            // Freeze the persisted snapshot, not just the visible page. The bounded session refuses
+            // more than the durable operation limit before any filesystem plan is created.
+            var candidates = await _session.ReadQuarantineSelectionAsync(token: _pageCancellation.Token);
+            if (candidates.Count == 0)
+            {
+                StatusText.Text = "Сначала отметьте лишние точные копии.";
+                return;
+            }
+            var protectedGroups = candidates.GroupBy(candidate => candidate.GroupId).Select(group =>
+            {
+                var first = group.First();
+                if (group.Any(item => !item.KeeperPath.Equals(first.KeeperPath, StringComparison.OrdinalIgnoreCase) ||
+                    !item.Hash.Equals(first.Hash, StringComparison.OrdinalIgnoreCase)))
+                    throw new IOException("Снимок выбора повреждён; повторите поиск точных дублей.");
+                return new QuarantineGroupSnapshot(first.GroupId, first.KeeperPath, first.Hash);
+            }).ToDictionary(group => group.GroupId);
+            var candidateByPath = candidates.ToDictionary(candidate => candidate.Item.Path,
+                StringComparer.OrdinalIgnoreCase);
+            var expectedHashes = candidates.ToDictionary(candidate => candidate.Item.Path,
+                candidate => candidate.Hash, StringComparer.OrdinalIgnoreCase);
             var quarantineRoot = await QuarantineConfiguration.GetOrChooseRootAsync(this);
             if (quarantineRoot is null || _closingReview || !IsLoaded) return;
             var batchRoot = Path.Combine(quarantineRoot, $"PhotoShelf-Quarantine-{DateTime.Now:yyyy-MM-dd_HH-mm-ss}-{Guid.NewGuid():N}");
-            var requests = marked.Select(x => new MoveRequest(x.Photo.Path, x.Photo.CaptureDate)).ToArray();
-            var dialog = new MovePlanWindow(requests, batchRoot, false) { Owner = this };
+            var requests = candidates.Select(candidate => new MoveRequest(candidate.Item.Path, candidate.Item.CaptureDate)).ToArray();
+            var dialog = new MovePlanWindow(requests, batchRoot, false, quarantineMode: true) { Owner = this };
             if (dialog.ShowDialog() != true || _closingReview || !IsLoaded) return;
-            // Persist the exact batch location before any file can move, including before recovery callbacks.
-            await QuarantineConfiguration.RegisterBatchAsync(batchRoot);
-            if (_closingReview || !IsLoaded) return;
             var plan = dialog.Plan;
             if (await _session.ContainsKeeperAsync(plan.Where(entry => entry.SkipReason is null).Select(entry => entry.Source), _pageCancellation.Token))
             {
@@ -195,6 +228,19 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             }
             if (_closingReview || !IsLoaded) return;
             plan = plan.Select(entry => expectedHashes.TryGetValue(entry.Source, out var hash) ? entry with { ExpectedHash = hash } : entry).ToArray();
+            var duplicateGroupByMoveGroup = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var moveGroup in plan.GroupBy(entry => entry.GroupId ?? throw new IOException("План не содержит безопасную группу связанных файлов.")))
+            {
+                var duplicateGroups = moveGroup.Where(entry => candidateByPath.ContainsKey(entry.Source))
+                    .Select(entry => candidateByPath[entry.Source].GroupId).Distinct().ToArray();
+                if (duplicateGroups.Length != 1)
+                    throw new IOException("Связанная группа пересекает несколько групп дублей. Автоматический карантин остановлен.");
+                duplicateGroupByMoveGroup.Add(moveGroup.Key, duplicateGroups[0]);
+            }
+            // Persist the exact batch location after every read-only validation and before
+            // any journal or media write, including before recovery callbacks.
+            await QuarantineConfiguration.RegisterBatchAsync(batchRoot);
+            if (_closingReview || !IsLoaded) return;
             _moving = true;
             _operationFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             using var cancellation = new CancellationTokenSource(); _moveCancellation = cancellation;
@@ -202,31 +248,54 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             try
             {
                 using var mediaPause = await AsyncMediaImage.PauseForFileOperationsAsync(plan.SelectMany(x => new[] { x.Source, x.Destination }).ToHashSet(StringComparer.OrdinalIgnoreCase));
-                var journal = Path.Combine(LocalCatalogStore.CatalogDirectory, "operations", $"quarantine-{Guid.NewGuid():N}.jsonl");
-                var progress = new Progress<int>(count => progressWindow.SetProgress(count));
-                var results = await Task.Run(async () =>
+                var results = new List<MoveResult>(plan.Count);
+                var journals = new List<string>();
+                var completedBeforeBatch = 0;
+                var batchNumber = 0;
+                foreach (var duplicateGroupBatch in protectedGroups.Keys.Chunk(128))
                 {
-                    var locks = new List<FileStream>();
-                    try
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    var duplicateGroupIds = duplicateGroupBatch.ToHashSet();
+                    var batchPlan = plan.Where(entry => entry.GroupId is { } moveGroupId &&
+                        duplicateGroupIds.Contains(duplicateGroupByMoveGroup[moveGroupId])).ToArray();
+                    if (batchPlan.Length == 0) continue;
+                    var batchKeepers = duplicateGroupBatch.Select(id => protectedGroups[id]).ToArray();
+                    var journal = Path.Combine(LocalCatalogStore.CatalogDirectory, "operations",
+                        $"quarantine-{Path.GetFileName(batchRoot)}-{++batchNumber:D4}.jsonl");
+                    journals.Add(journal);
+                    var progressBase = completedBeforeBatch;
+                    var progress = new Progress<int>(count => progressWindow.SetProgress(progressBase + count));
+                    var batchResults = await Task.Run(async () =>
                     {
-                        foreach (var group in protectedGroups)
+                        var locks = new List<FileStream>();
+                        try
                         {
-                            // Keep a verified surviving copy open without write/delete sharing until quarantine finishes.
-                            var stream = new FileStream(group.KeepPath, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                            locks.Add(stream);
-                            var actual = Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellation.Token));
-                            if (!actual.Equals(group.Hash, StringComparison.OrdinalIgnoreCase)) throw new IOException($"Сохраняемый файл изменился: {group.KeepPath}. Повторите поиск дублей.");
+                            foreach (var group in batchKeepers)
+                            {
+                                // The verified surviving copy stays open without write/delete sharing
+                                // for every filesystem group which can modify its exact duplicates.
+                                var stream = new FileStream(group.KeepPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                    131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                                locks.Add(stream);
+                                var actual = Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellation.Token));
+                                if (!actual.Equals(group.Hash, StringComparison.OrdinalIgnoreCase))
+                                    throw new IOException($"Сохраняемый файл изменился: {group.KeepPath}. Повторите поиск дублей.");
+                            }
+                            return await FileOperations.CreateService().ExecuteAsync(batchPlan, journal,
+                                _commitCatalog, progress, cancellation.Token);
                         }
-                        return await FileOperations.CreateService().ExecuteAsync(plan, journal, _commitCatalog, progress, cancellation.Token);
-                    }
-                    finally { foreach (var stream in locks) await stream.DisposeAsync(); }
-                });
+                        finally { foreach (var stream in locks) await stream.DisposeAsync(); }
+                    });
+                    results.AddRange(batchResults);
+                    completedBeforeBatch += batchResults.Count;
+                    var movedCandidates = batchResults.Where(result => result.Moved && candidateByPath.ContainsKey(result.Entry.Source))
+                        .Select(result => result.Entry.Source).ToArray();
+                    if (movedCandidates.Length > 0)
+                        await _session.MarkMovedAsync(movedCandidates, _pageCancellation.Token);
+                }
                 var moved = results.Where(x => x.Moved).Select(x => x.Entry.Source).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                await _session.MarkMovedAsync(moved, _pageCancellation.Token);
                 _reloadPageAfterMove = true;
-                RemoveMovedItems(marked.Where(x => moved.Contains(x.Photo.Path)).ToArray());
-                System.Windows.MessageBox.Show($"Перенесено: {moved.Count}\nНе завершено: {results.Count(x => !x.Moved)}\nКарантин: {batchRoot}\nВосстановление и откат: окно «Операции».\nЖурнал: {journal}", "Карантин");
-                RefreshSummary();
+                System.Windows.MessageBox.Show($"Перенесено файлов: {moved.Count:N0}\nНе завершено: {results.Count(x => !x.Moved):N0}\nКарантин: {batchRoot}\nЖурналов: {journals.Count:N0}\nВосстановление и откат доступны в окне «Операции».", "Карантин");
             }
             catch (OperationCanceledException) { StatusText.Text = "Остановлено. Проверьте журнал в окне «Операции»."; }
             catch (Exception ex) { System.Windows.MessageBox.Show(ex.Message, "Карантин: операция остановлена"); }
@@ -247,27 +316,6 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
         if (_moving) { _moveCancellation?.Cancel(); e.Cancel = true; StatusText.Text = "Останавливаю на безопасной границе…"; }
         else _closingReview = true;
         base.OnClosing(e);
-    }
-
-    private void RemoveMovedItems(IReadOnlyCollection<DuplicateItemViewModel> movedItems)
-    {
-        var moved = movedItems.Select(x => x.Photo.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var group in Groups)
-            for (var i = group.Items.Count - 1; i >= 0; i--)
-                if (moved.Contains(group.Items[i].Photo.Path)) group.Items.RemoveAt(i);
-
-        for (var index = Groups.Count - 1; index >= 0; index--)
-        {
-            if (Groups[index].Items.Count < 2)
-            {
-                Groups.RemoveAt(index);
-            }
-        }
-
-        if (Groups.Count > 0 && GroupList.SelectedIndex < 0)
-        {
-            GroupList.SelectedIndex = 0;
-        }
     }
 
     private async void OnOpenQuarantineClicked(object sender, RoutedEventArgs e)
@@ -296,7 +344,7 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             photo.ApplyIndexedCaptureDate(saved.CaptureDate); return photo;
         }).ToArray();
         return new DuplicateGroupViewModel(new DuplicateGroup(page.SizeBytes, page.Hash, photos), page.Id,
-            page.TotalFiles, page.MemberOffset, page.KeeperPath);
+            page.TotalFiles, page.MemberOffset, page.KeeperPath, page.SelectedPaths);
     }
 
     private async Task LoadGroupsPageAsync(long offset)
@@ -309,7 +357,8 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             var models = await Task.Run(() => page.Select(CreateGroup).ToArray(), _pageCancellation.Token);
             if (_closingReview) return;
             _groupOffset = offset; Groups.Clear(); foreach (var model in models) { ObserveSelection(model); Groups.Add(model); }
-            GroupList.SelectedIndex = Groups.Count > 0 ? 0 : -1; RefreshSummary();
+            GroupList.SelectedIndex = Groups.Count > 0 ? 0 : -1;
+            await RefreshSelectionSummaryAsync();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Не удалось загрузить страницу: {ex.Message}"; }
@@ -327,7 +376,8 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             var page = await _session.ReadGroupAsync(selected.Index, offset, _pageCancellation.Token);
             var model = await Task.Run(() => CreateGroup(page), _pageCancellation.Token);
             if (_closingReview) return;
-            ObserveSelection(model); var index = Groups.IndexOf(selected); Groups[index] = model; GroupList.SelectedIndex = index; RefreshSummary();
+            ObserveSelection(model); var index = Groups.IndexOf(selected); Groups[index] = model; GroupList.SelectedIndex = index;
+            await RefreshSelectionSummaryAsync();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusText.Text = $"Не удалось загрузить файлы: {ex.Message}"; }
@@ -358,8 +408,20 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
 
     private void RefreshSummary()
     {
-        SummaryText.Text = $"Групп в снимке: {_session.GroupCount:N0} · На странице: {Groups.Count} · Выбор действует только на загруженные файлы";
-        StatusText.Text = $"Отмечено на странице: {Groups.Sum(static group => group.MoveCount)} · При смене страницы отметки сбрасываются";
+        SummaryText.Text = $"Групп в снимке: {_session.GroupCount:N0} · Отмечено: {_selectionSummary.SelectedFiles:N0} файлов в {_selectionSummary.SelectedGroups:N0} группах";
+        StatusText.Text = $"Выбор сохраняется при перелистывании · Объём карантина: {_selectionSummary.SelectedBytes / 1048576d:N1} МиБ · Перед переносом будет полный план";
         RefreshPaging();
+    }
+
+    private async Task RefreshSelectionSummaryAsync()
+    {
+        try { _selectionSummary = await _session.ReadSelectionSummaryAsync(_pageCancellation.Token); }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex)
+        {
+            if (IsLoaded) StatusText.Text = $"Не удалось обновить итог выбора: {ex.Message}";
+            return;
+        }
+        if (IsLoaded && !_closingReview) RefreshSummary();
     }
 }
