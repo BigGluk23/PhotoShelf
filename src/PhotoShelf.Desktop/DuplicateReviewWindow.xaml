@@ -86,12 +86,20 @@
 
             <Border Grid.Column="2" Background="#FFFFFFFF" CornerRadius="18" BorderBrush="#FFE6DDD2" BorderThickness="1" Padding="14">
                 <DockPanel>
-                    <TextBlock DockPanel.Dock="Top"
-                               Text="Файлы в выбранной группе"
-                               FontSize="15"
-                               FontWeight="SemiBold"
-                               Margin="4,0,4,10"
-                               Foreground="#FF242424" />
+                    <Grid DockPanel.Dock="Top" Margin="4,0,4,10">
+                        <TextBlock Text="Файлы в выбранной группе"
+                                   FontSize="15"
+                                   FontWeight="SemiBold"
+                                   VerticalAlignment="Center"
+                                   Foreground="#FF242424" />
+                        <Button x:Name="CompareSelectedButton"
+                                HorizontalAlignment="Right"
+                                Style="{StaticResource PillButton}"
+                                Content="Сравнить 2–4"
+                                ToolTip="Выделите от двух до четырёх файлов с Ctrl или Shift"
+                                IsEnabled="False"
+                                Click="OnCompareSelectedClicked" />
+                    </Grid>
                     <StackPanel DockPanel.Dock="Bottom" Margin="4,8,4,4">
                         <TextBlock x:Name="MembersPageText" HorizontalAlignment="Center" />
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
@@ -101,6 +109,9 @@
                     </StackPanel>
                     <ListBox x:Name="ItemList"
                              ItemsSource="{Binding SelectedGroup.Items}"
+                             SelectionMode="Extended"
+                             SelectionChanged="OnCompareSelectionChanged"
+                             PreviewKeyDown="OnItemListPreviewKeyDown"
                              BorderThickness="0"
                              Background="Transparent"
                              HorizontalContentAlignment="Stretch"
@@ -114,7 +125,7 @@
                         </ListBox.ItemContainerStyle>
                         <ListBox.ItemTemplate>
                             <DataTemplate DataType="{x:Type local:DuplicateItemViewModel}">
-                                <Border Margin="4,5" Padding="10" Background="#FFFBFAF7" BorderBrush="#FFE9E1D8" BorderThickness="1" CornerRadius="14">
+                                <Border x:Name="ItemCard" Margin="4,5" Padding="10" Background="#FFFBFAF7" BorderBrush="#FFE9E1D8" BorderThickness="1" CornerRadius="14">
                                     <Grid>
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="118" />
@@ -149,6 +160,13 @@
                                         </StackPanel>
                                     </Grid>
                                 </Border>
+                                <DataTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType={x:Type ListBoxItem}}, Path=IsSelected}" Value="True">
+                                        <Setter TargetName="ItemCard" Property="BorderBrush" Value="#FFEC7834" />
+                                        <Setter TargetName="ItemCard" Property="BorderThickness" Value="2" />
+                                        <Setter TargetName="ItemCard" Property="Background" Value="#FFFFF7F1" />
+                                    </DataTrigger>
+                                </DataTemplate.Triggers>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
                     </ListBox>

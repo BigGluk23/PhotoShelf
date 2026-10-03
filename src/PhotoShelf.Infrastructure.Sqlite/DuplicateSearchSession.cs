@@ -198,6 +198,31 @@ public sealed class DuplicateSearchSession : IAsyncDisposable
         return 0;
     }, token);
 
+    public Task SetItemsSelectedAsync(IReadOnlyCollection<string> paths, bool selected,
+        CancellationToken token = default) => RunAsync(async () =>
+    {
+        RequireComplete();
+        if (paths.Count == 0) return 0;
+        if (paths.Count > MembersPerPage + 1)
+            throw new ArgumentOutOfRangeException(nameof(paths), $"За один раз можно изменить не более {MembersPerPage + 1} видимых файлов.");
+
+        await using var transaction = _connection.BeginTransaction();
+        await using var command = _connection.CreateCommand(); command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE items SET selected=$selected WHERE path=$path AND removed=0 AND EXISTS
+            (SELECT 1 FROM groups g WHERE g.size=items.size AND g.hash=items.hash AND g.keeper<>items.path);
+            """;
+        foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            token.ThrowIfCancellationRequested();
+            command.Parameters.Clear(); command.Parameters.AddWithValue("$selected", selected ? 1 : 0);
+            command.Parameters.AddWithValue("$path", path);
+            if (await command.ExecuteNonQueryAsync(token) != 1)
+                throw new IOException("Один из файлов недоступен для выбора или является сохраняемой копией.");
+        }
+        await transaction.CommitAsync(token); return 0;
+    }, token);
+
     public Task SetAllExtrasSelectedAsync(bool selected, CancellationToken token = default) => RunAsync(async () =>
     {
         RequireComplete(); await using var command = _connection.CreateCommand();
