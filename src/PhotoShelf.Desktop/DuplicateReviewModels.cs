@@ -7,7 +7,8 @@ public sealed class DuplicateGroupViewModel : INotifyPropertyChanged
 {
     private DuplicateItemViewModel? _keepItem;
 
-    public DuplicateGroupViewModel(DuplicateGroup group, long index, long totalFiles = 0, long memberOffset = 0, string? keeperPath = null)
+    public DuplicateGroupViewModel(DuplicateGroup group, long index, long totalFiles = 0, long memberOffset = 0,
+        string? keeperPath = null, IReadOnlySet<string>? selectedPaths = null)
     {
         Index = index;
         TotalFiles = totalFiles == 0 ? group.Items.Count : totalFiles;
@@ -15,7 +16,8 @@ public sealed class DuplicateGroupViewModel : INotifyPropertyChanged
         SizeBytes = group.SizeBytes;
         Hash = group.Hash;
         Items = new ObservableCollection<DuplicateItemViewModel>(
-            group.Items.Select(item => new DuplicateItemViewModel(item, this)));
+            group.Items.Select(item => new DuplicateItemViewModel(item, this,
+                selectedPaths?.Contains(item.Path) == true)));
         KeepItem = Items.FirstOrDefault(item => item.Photo.Path == keeperPath) ?? Items
             .OrderByDescending(static item => item.Photo.FileModifiedAt ?? DateTime.MinValue)
             .FirstOrDefault();
@@ -62,39 +64,6 @@ public sealed class DuplicateGroupViewModel : INotifyPropertyChanged
 
     public int MoveCount => Items.Count(item => item.IsMarkedForMove);
 
-    public void Keep(DuplicateItemViewModel item)
-    {
-        KeepItem = item;
-    }
-
-    public void KeepNewest()
-    {
-        KeepItem = Items
-            .OrderByDescending(static item => item.Photo.FileModifiedAt ?? DateTime.MinValue)
-            .FirstOrDefault();
-    }
-
-    public void KeepShortestPath()
-    {
-        KeepItem = Items
-            .OrderBy(static item => item.Photo.Path.Length)
-            .ThenBy(static item => item.Photo.Path, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-    }
-
-    public void KeepLargestFile()
-    {
-        KeepItem = Items
-            .OrderByDescending(static item => item.Photo.FileSizeBytes)
-            .ThenByDescending(static item => item.Photo.FileModifiedAt ?? DateTime.MinValue)
-            .FirstOrDefault();
-    }
-
-    public IReadOnlyList<DuplicateItemViewModel> GetMarkedItems()
-    {
-        return Items.Where(item => item.IsMarkedForMove).ToArray();
-    }
-
     internal void NotifyMoveCountChanged()
     {
         OnPropertyChanged(nameof(MoveCount));
@@ -111,10 +80,11 @@ public sealed class DuplicateItemViewModel : INotifyPropertyChanged
     private readonly DuplicateGroupViewModel _group;
     private bool _isSelected;
 
-    public DuplicateItemViewModel(PhotoItem photo, DuplicateGroupViewModel group)
+    public DuplicateItemViewModel(PhotoItem photo, DuplicateGroupViewModel group, bool isSelected = false)
     {
         Photo = photo;
         _group = group;
+        _isSelected = isSelected;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
