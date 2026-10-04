@@ -1,3 +1,4 @@
-# The owner reviews code that can become a signed update, including this file.
-# Enforcement requires the main ruleset in docs/release-protection-setup.md.
-* @BigGluk23
+# A code owner other than the PR author/last pusher reviews every change.
+# GitHub accepts one eligible owner approval; enforcement requires the main ruleset.
+# Release-environment approval remains exclusive to BigGluk23.
+* @BigGluk23 @Khrumium
