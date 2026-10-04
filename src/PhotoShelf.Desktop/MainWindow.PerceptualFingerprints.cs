@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Windows.Threading;
 using PhotoShelf.Application.Background;
 using PhotoShelf.Application.Catalog;
 using PhotoShelf.Application.Duplicates;
@@ -9,6 +10,8 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow
 {
+    internal Func<string, CancellationToken, PerceptualFingerprint> FingerprintReader { get; set; } =
+        MediaBitmapLoader.LoadPerceptualFingerprint;
     private FingerprintActivity _fingerprintActivity = new();
     private sealed record FingerprintProgress(string Phase = "ожидание", long Processed = 0,
         long Errors = 0, string? CurrentPath = null, string? Error = null, long Started = 0,
@@ -27,6 +30,9 @@ public partial class MainWindow
             _fingerprintRefreshPending = true;
             return;
         }
+        // Consume all requests accumulated before this pass, including a request
+        // retained while paused. A blocked start must leave that request intact.
+        _fingerprintRefreshPending = false;
         var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _fingerprintCancellation = operation;
         _fingerprintActivity = new FingerprintActivity();
@@ -92,7 +98,7 @@ public partial class MainWindow
                     try
                     {
                         var fingerprint = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash,
-                            readToken => MediaBitmapLoader.LoadPerceptualFingerprint(expected.Path, readToken), token);
+                            readToken => FingerprintReader(expected.Path, readToken), token);
                         result = PerceptualFingerprintReadResult.Found(fingerprint);
                     }
                     catch (NotSupportedException ex) { result = PerceptualFingerprintReadResult.Unsupported(ErrorCode(ex)); }
@@ -160,10 +166,16 @@ public partial class MainWindow
             if (ReferenceEquals(_fingerprintCancellation, operation))
             {
                 _fingerprintCancellation = null;
-                if (_fingerprintRefreshPending && !_closing && !_fileOperationActive && !_hasPendingRecovery && !_backgroundProcessingPaused)
+                if (_fingerprintRefreshPending && !_closing)
                 {
-                    _fingerprintRefreshPending = false;
-                    StartPerceptualFingerprintIndexing();
+                    // This task is still incomplete inside its finally. Restart on
+                    // the next dispatcher turn, after readers and this task finish.
+                    // Start rechecks the current pause/move/recovery/closing guards;
+                    // a newer explicit start may already have consumed the request.
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_fingerprintRefreshPending) StartPerceptualFingerprintIndexing();
+                    }), DispatcherPriority.Background);
                 }
             }
             operation.Dispose();
