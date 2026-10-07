@@ -7,7 +7,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if (-not $IsWindows) { throw 'This script builds the Windows x64 HEIC worker. See native/heif-worker/README.md for portable CMake commands.' }
+if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+    throw 'This script builds the Windows x64 HEIC worker. See native/heif-worker/README.md for portable CMake commands.'
+}
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $workerSource = Join-Path $repositoryRoot 'native/heif-worker'
 $vendor = Join-Path $workerSource 'vendor'

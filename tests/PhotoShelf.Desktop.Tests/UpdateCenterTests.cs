@@ -266,6 +266,48 @@ public sealed class UpdateCenterTests
         Assert.True(File.Exists(stage.SignaturePath));
     });
 
+    [Fact]
+    public Task StartupPrunesOnlyUnreferencedOwnedStagesAndKeepsPreparedDownload() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        using var fixture = new Fixture();
+        var stage = fixture.Descriptor();
+        Directory.CreateDirectory(stage.StageDirectory);
+        await File.WriteAllBytesAsync(stage.ManifestPath, fixture.Release.ManifestBytes.ToArray());
+        await File.WriteAllBytesAsync(stage.SignaturePath, fixture.Release.SignatureBytes.ToArray());
+        var orphan = Path.Combine(fixture.StagingRoot, Guid.NewGuid().ToString("N"));
+        var unknown = Path.Combine(fixture.StagingRoot, "manual-evidence");
+        Directory.CreateDirectory(orphan); Directory.CreateDirectory(unknown);
+        await fixture.Store.SaveAsync(new UpdatePreferences
+        { AutoCheck = false, PreparedStageId = Path.GetFileName(stage.StageDirectory) });
+
+        var center = fixture.CreateCenter();
+        await center.InitializeAsync();
+
+        Assert.True(center.CanInstall);
+        Assert.True(Directory.Exists(stage.StageDirectory));
+        Assert.False(Directory.Exists(orphan));
+        Assert.True(Directory.Exists(unknown));
+    });
+
+    [Fact]
+    public Task AlreadyInstalledPreparedStageIsRemovedAndPreferenceCleared() => WpfTestDispatcher.RunAsync(async () =>
+    {
+        using var fixture = new Fixture();
+        var stage = fixture.Descriptor();
+        Directory.CreateDirectory(stage.StageDirectory);
+        await File.WriteAllBytesAsync(stage.ManifestPath, fixture.Release.ManifestBytes.ToArray());
+        await File.WriteAllBytesAsync(stage.SignaturePath, fixture.Release.SignatureBytes.ToArray());
+        await fixture.Store.SaveAsync(new UpdatePreferences
+        { AutoCheck = false, PreparedStageId = Path.GetFileName(stage.StageDirectory) });
+
+        var center = fixture.CreateCenter(currentVersion: fixture.Release.Version);
+        await center.InitializeAsync();
+
+        Assert.False(center.CanInstall);
+        Assert.False(Directory.Exists(stage.StageDirectory));
+        Assert.Null((await fixture.Store.LoadAsync()).PreparedStageId);
+    });
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -487,9 +529,9 @@ public sealed class UpdateCenterTests
                 Path.Combine(directory, "photoshelf-update.json"), Path.Combine(directory, "photoshelf-update.sig"),
                 Release, Array.Empty<UpdatePackageFile>());
         }
-        public UpdateCenter CreateCenter(Func<StagedUpdate, Task>? install = null)
+        public UpdateCenter CreateCenter(Func<StagedUpdate, Task>? install = null, string currentVersion = "0.10.9")
         {
-            var center = new UpdateCenter(Service, Store, StagingRoot, "0.10.9", PublicKey,
+            var center = new UpdateCenter(Service, Store, StagingRoot, currentVersion, PublicKey,
                 install ?? (staged => { Installed.Add(staged); return Task.CompletedTask; }), () => Now);
             _centers.Add(center);
             return center;

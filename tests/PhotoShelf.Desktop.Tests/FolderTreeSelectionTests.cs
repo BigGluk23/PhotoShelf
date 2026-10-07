@@ -75,6 +75,17 @@ public sealed class FolderTreeSelectionTests
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 
+    [Fact]
+    public void UserFoldersNamedCacheOrTempAreNotSilentlyExcluded()
+    {
+        var volume = Path.GetPathRoot(Environment.CurrentDirectory)!;
+        var cache = Path.Combine(volume, "PhotoShelf-user-library", "Cache", "family.jpg");
+        var temp = Path.Combine(volume, "PhotoShelf-user-library", "Temp", "holiday.heic");
+        Assert.False(PhotoScanner.IsIgnoredPath(cache));
+        Assert.False(PhotoScanner.IsIgnoredPath(temp));
+        Assert.True(PhotoScanner.IsIgnoredPath(Path.Combine(Path.GetTempPath(), "PhotoShelf", "fixture.jpg")));
+    }
+
     private sealed class ClickableCheckBox : CheckBox
     {
         public void ClickForTest() => OnClick();

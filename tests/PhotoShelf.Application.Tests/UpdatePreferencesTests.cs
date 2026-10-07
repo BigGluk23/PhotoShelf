@@ -56,6 +56,23 @@ public sealed class UpdatePreferencesTests
     }
 
     [Fact]
+    public async Task LoadRemovesOnlyOwnedOrphanPendingFiles()
+    {
+        using var fixture = new UpdateFixture();
+        var path = Path.Combine(fixture.Root, "preferences.json");
+        var store = new UpdatePreferencesStore(path);
+        await store.SaveAsync(new UpdatePreferences { AutoCheck = false });
+        var orphan = path + ".pending-" + Guid.NewGuid().ToString("N");
+        var unrelated = path + ".pending-not-a-guid";
+        await File.WriteAllTextAsync(orphan, "partial");
+        await File.WriteAllTextAsync(unrelated, "retain");
+
+        Assert.False((await store.LoadAsync()).AutoCheck);
+        Assert.False(File.Exists(orphan));
+        Assert.Equal("retain", await File.ReadAllTextAsync(unrelated));
+    }
+
+    [Fact]
     public async Task UnreadablePreferencesFailClosed()
     {
         using var fixture = new UpdateFixture();

@@ -55,9 +55,7 @@ public static class PhotoScanner
         if (!string.IsNullOrWhiteSpace(localAppData))
         {
             var tempRoot = Path.GetFullPath(Path.GetTempPath());
-            if (normalized.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase) ||
-                normalized.Contains($"{Path.DirectorySeparatorChar}Cache{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) ||
-                normalized.Contains($"{Path.DirectorySeparatorChar}Temp{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            if (LibraryCatalogSynchronizer.IsUnder(normalized, tempRoot))
             {
                 return true;
             }

@@ -80,7 +80,7 @@ public sealed class FileMoveService
             var companions = FindCompanions(source, request.ConfirmedCompanions, directories, token, out var reason);
             if (companions.Count > DurableMoveJournal.MaxGroupMembers || result.Count + companions.Count > DurableMoveJournal.MaxOperationFiles)
                 throw new IOException("План превышает безопасный размер операции или связанной группы; разделите выбор, файлы не изменены");
-            if (companions.Any(used.Contains)) reason = "Связанный файл уже входит в другую группу";
+            if (companions.Any(used.Contains)) reason ??= "Связанный файл уже входит в другую группу";
             var baseStem = Path.GetFileNameWithoutExtension(source);
             var outputStem = layout.FileNameStyle == FileNameStyle.DatePrefix && request.CaptureDate is { } capture
                 ? capture.ToString("yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture) + "_" + baseStem : baseStem;
@@ -286,6 +286,7 @@ public sealed class FileMoveService
         foreach (var group in available.GroupBy(entry => entry.GroupId ?? entry.Source))
         {
             string? error = null;
+            var modified = new Dictionary<string, DateTime>(Paths);
             foreach (var item in group)
             {
                 try
@@ -293,11 +294,13 @@ public sealed class FileMoveService
                     ValidateRecord(item);
                     if (File.Exists(item.Source) || Directory.Exists(item.Source)) throw new IOException("Исходное имя занято; откат не перезаписывает файлы");
                     await VerifyAsync(item.Destination, item, token);
+                    modified[item.Destination] = File.GetLastWriteTimeUtc(item.Destination);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { error ??= ex.Message; }
             }
             foreach (var item in group)
-                inverse.Add(new(item.Destination, item.Source, item.Length, File.GetLastWriteTimeUtc(item.Destination), error, item.GroupId, item.Hash, item.ModifiedUtc));
+                inverse.Add(new(item.Destination, item.Source, item.Length,
+                    modified.GetValueOrDefault(item.Destination), error, item.GroupId, item.Hash, item.ModifiedUtc));
         }
         // Create the inverse journal first. Its full plan is durable before the original points to it.
         await using var undo = DurableMoveJournal.Create(undoJournalPath);

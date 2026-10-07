@@ -31,7 +31,8 @@ public partial class MainWindow
         _updateHttp = UpdateService.CreateHttpClient();
         _updates = new UpdateCenter(new UpdateService(_updateHttp, UpdateTrust.PublicKeyPem, RunningUpdateVersion),
             new UpdatePreferencesStore(Path.Combine(_updatePaths.AppRoot, "updates", "preferences-v1.json")),
-            _updatePaths.StagingRoot, RunningUpdateVersion, UpdateTrust.PublicKeyPem, RequestUpdateInstallationAsync);
+            _updatePaths.StagingRoot, RunningUpdateVersion, UpdateTrust.PublicKeyPem, RequestUpdateInstallationAsync,
+            requestsRoot: _updatePaths.RequestsRoot);
         _updates.PropertyChanged += OnUpdateStateChanged;
         return _updates;
     }
