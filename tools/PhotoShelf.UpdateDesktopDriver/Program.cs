@@ -59,12 +59,12 @@ internal static class Program
             _controlOwner = await File.ReadAllTextAsync(Path.Combine(_controlRoot, "owned-test-control.txt"));
             Require(Guid.TryParseExact(_controlOwner, "N", out _), "Missing owned compile-time scheduling control.");
             Require(args[2].Length == 40 && args[2].All(Uri.IsHexDigit), "Invalid source revision.");
-            var oldExe = Path.Combine(_runRoot, "app-1.11.0", "PhotoShelf.exe");
-            var oldHelper = Path.Combine(_runRoot, "app-1.11.0", "PhotoShelf.Updater.exe");
-            var newPackage = Path.Combine(_runRoot, "app-1.11.1");
-            RequireVersion(oldExe, 0); RequireVersion(oldHelper, 0);
-            RequireVersion(Path.Combine(newPackage, "PhotoShelf.exe"), 1);
-            RequireVersion(Path.Combine(newPackage, "PhotoShelf.Updater.exe"), 1);
+            var oldExe = Path.Combine(_runRoot, "app-1.11.1", "PhotoShelf.exe");
+            var oldHelper = Path.Combine(_runRoot, "app-1.11.1", "PhotoShelf.Updater.exe");
+            var newPackage = Path.Combine(_runRoot, "app-1.11.2");
+            RequireVersion(oldExe, 1); RequireVersion(oldHelper, 1);
+            RequireVersion(Path.Combine(newPackage, "PhotoShelf.exe"), 2);
+            RequireVersion(Path.Combine(newPackage, "PhotoShelf.Updater.exe"), 2);
             var key = await File.ReadAllTextAsync(Path.Combine(_runRoot, "source", "src", "PhotoShelf.Application", "Updates", "TrustedUpdateKey.pem"));
             var fallbackErrors = Path.Combine(Path.GetTempPath(), "PhotoShelf", "diagnostics", "errors");
             var fallbackBefore = ErrorSnapshot(fallbackErrors);
@@ -82,7 +82,7 @@ internal static class Program
             var old = StartOwned(oldExe);
             AutomationElement? oldWindow = null;
             await UntilAsync(() => (oldWindow = MainWindow(old.Id)) is not null && HasText(oldWindow, "preserved-photo.png"), "Old application did not show synthetic catalog.");
-            RequireGateRecord("catalog-entry-" + old.Id + ".json", "catalog-entry", old.Id, "1.11.0");
+            RequireGateRecord("catalog-entry-" + old.Id + ".json", "catalog-entry", old.Id, "1.11.1");
             Assertions["normalOldEntrypoint"] = true;
             var catalog = new CatalogLocation().Discover().Selection?.DirectoryPath ?? throw new IOException("No real catalog generation was selected.");
             var rowsBefore = await RowsSnapshotAsync(catalog);
@@ -121,7 +121,7 @@ internal static class Program
             Require(old.ExitCode == 0, "Old application did not close gracefully.");
             Assertions["oldProcessExited"] = true;
             Assertions["helperLaunched"] = true;
-            RequireGateRecord("before-pointer-publish.reached.json", "before-pointer-publish", helper!.Id, "1.11.0");
+            RequireGateRecord("before-pointer-publish.reached.json", "before-pointer-publish", helper!.Id, "1.11.1");
             Require(!File.Exists(paths.ActivePointerPath), "The fresh profile already has an active pointer before publication.");
             await AssertRepeatedLaunchBlockedAsync(oldExe, "before-pointer-publish", catalog, rowsBefore, journalsBefore);
             Assertions["repeatedLaunchBeforePointerBlocked"] = true;
@@ -129,9 +129,9 @@ internal static class Program
 
             _phase = "repeated-launch-after-pointer";
             await UntilAsync(() => GateReached("pointer-published"), "Helper did not reach its published-pointer checkpoint.", 30);
-            RequireGateRecord("pointer-published.reached.json", "pointer-published", helper.Id, "1.11.0");
+            RequireGateRecord("pointer-published.reached.json", "pointer-published", helper.Id, "1.11.1");
             active = ActiveInstallationResolver.Resolve(paths, key);
-            Require(active?.Version == "1.11.1", "The checkpoint does not point to the signed new version.");
+            Require(active?.Version == "1.11.2", "The checkpoint does not point to the signed new version.");
             Require(!HasReadyReceipt(paths), "New-version health was reported before the helper launched it.");
             await AssertRepeatedLaunchBlockedAsync(oldExe, "pointer-published", catalog, rowsBefore, journalsBefore);
             Assertions["repeatedLaunchAfterPointerBlocked"] = true;
@@ -146,7 +146,7 @@ internal static class Program
                 return successor is not null && GateReached("candidate-before-health") &&
                     (newWindow = MainWindow(successor.Id)) is not null && HasText(newWindow, "preserved-photo.png");
             }, "New actual WPF application did not show its catalog before startup health.", 30);
-            RequireGateRecord("candidate-before-health.reached.json", "candidate-before-health", successor!.Id, "1.11.1");
+            RequireGateRecord("candidate-before-health.reached.json", "candidate-before-health", successor!.Id, "1.11.2");
             Require(!HasReadyReceipt(paths), "The candidate wrote health before its checkpoint was released.");
             await AssertRepeatedLaunchBlockedAsync(oldExe, "candidate-before-health", catalog, rowsBefore, journalsBefore);
             Assertions["repeatedLaunchBeforeHealthBlocked"] = true;
@@ -166,10 +166,10 @@ internal static class Program
             using (var request = JsonDocument.Parse(await File.ReadAllTextAsync(requestPath)))
             {
                 Require(request.RootElement.GetProperty("parentProcessId").GetInt32() == old.Id &&
-                    request.RootElement.GetProperty("expectedVersion").GetString() == "1.11.1", "Install request lost parent/version identity.");
+                    request.RootElement.GetProperty("expectedVersion").GetString() == "1.11.2", "Install request lost parent/version identity.");
             }
             Assertions["startupReadyReceipt"] = true;
-            RequireVersion(active!.ExecutablePath, 1);
+            RequireVersion(active!.ExecutablePath, 2);
             Assertions["newProcessLaunched"] = true;
             Require(((ValuePattern)FindById(newWindow!, "SearchBox").GetCurrentPattern(ValuePattern.Pattern)).Current.Value == "preserved-photo",
                 "Transient search state was not restored across the real restart.");
@@ -191,7 +191,7 @@ internal static class Program
             InvokeButton(newWindow!, "Настройки");
             AutomationElement? newSettings = null;
             await UntilAsync(() => (newSettings = FindWindow(successor!.Id, "Настройки PhotoShelf")) is not null &&
-                HasText(newSettings, "Текущая версия: PhotoShelf Ultra 1.11.1"), "Running successor does not report its own technical version in the real update panel.");
+                HasText(newSettings, "Текущая версия: PhotoShelf Ultra 1.11.2"), "Running successor does not report its own technical version in the real update panel.");
             CloseWindow(newSettings!);
             CloseWindow(newWindow!);
             await UntilAsync(() => successor!.HasExited && helper!.HasExited, "Successor or update helper did not exit gracefully.");
@@ -246,7 +246,7 @@ internal static class Program
                 schema = 1, status, commit = args[2], version = args[3], platform = "windows",
                 scope = "production-desktop-update-lifecycle-with-test-trust", sourcePublicKeySubstituted = true,
                 sourceFaultCheckpointsInserted = true, raceChecks = RaceEvidence,
-                testVersions = new[] { "1.11.0", "1.11.1" }, assertions = Assertions, phase = _phase,
+                testVersions = new[] { "1.11.1", "1.11.2" }, assertions = Assertions, phase = _phase,
                 elapsedSeconds = elapsed.Elapsed.TotalSeconds, processes = ProcessEvidence,
                 ownedProfile = _profile, ownedFixtures = _runRoot, error, failureDiagnostics,
                 limitations = new[]
@@ -320,7 +320,7 @@ internal static class Program
         var stageId = Guid.NewGuid().ToString("N");
         var stage = Path.Combine(paths.StagingRoot, stageId);
         Directory.CreateDirectory(stage);
-        File.Copy(Path.Combine(_runRoot, "PhotoShelf-v1.11.1-ultra-win-x64.zip"), Path.Combine(stage, "package.zip"));
+        File.Copy(Path.Combine(_runRoot, "PhotoShelf-v1.11.2-ultra-win-x64.zip"), Path.Combine(stage, "package.zip"));
         ZipFile.ExtractToDirectory(Path.Combine(stage, "package.zip"), Path.Combine(stage, "package"));
         File.Copy(Path.Combine(_runRoot, "photoshelf-update.json"), Path.Combine(stage, "photoshelf-update.json"));
         File.Copy(Path.Combine(_runRoot, "photoshelf-update.sig"), Path.Combine(stage, "photoshelf-update.sig"));

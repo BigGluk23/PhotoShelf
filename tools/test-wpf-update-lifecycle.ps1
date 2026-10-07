@@ -119,7 +119,7 @@ try {
         & $Executable @Arguments
         if ($LASTEXITCODE -ne 0) { throw "$Executable failed with exit code $LASTEXITCODE" }
     }
-    foreach ($testVersion in @('1.11.0', '1.11.1')) {
+    foreach ($testVersion in @('1.11.1', '1.11.2')) {
         $destination = Join-Path $runRoot ('app-' + $testVersion)
         $helperDestination = Join-Path $runRoot ('helper-' + $testVersion)
         foreach ($project in @('Desktop', 'Updater')) {
@@ -134,18 +134,18 @@ try {
         Invoke-Checked $Python @((Join-Path $repoRoot 'tools/package_checks.py'), 'create', $destination,
             '--version', ($testVersion + '-ultra'), '--commit', $commit)
     }
-    $newPackage = Join-Path $runRoot 'app-1.11.1'
-    $zip = Join-Path $runRoot 'PhotoShelf-v1.11.1-ultra-win-x64.zip'
+    $newPackage = Join-Path $runRoot 'app-1.11.2'
+    $zip = Join-Path $runRoot 'PhotoShelf-v1.11.2-ultra-win-x64.zip'
     Compress-Archive -Path (Join-Path $newPackage '*') -DestinationPath $zip -CompressionLevel Optimal
     $unpacked = [long]((Get-ChildItem -LiteralPath $newPackage -File -Recurse | Measure-Object -Property Length -Sum).Sum)
     $manifest = [ordered]@{
-        protocolVersion = 1; version = '1.11.1'; runtime = 'win-x64'
-        packageUrl = 'https://github.com/BigGluk23/PhotoShelf/releases/download/v1.11.1-ultra/PhotoShelf-v1.11.1-ultra-win-x64.zip'
+        protocolVersion = 1; version = '1.11.2'; runtime = 'win-x64'
+        packageUrl = 'https://github.com/BigGluk23/PhotoShelf/releases/download/v1.11.2-ultra/PhotoShelf-v1.11.2-ultra-win-x64.zip'
         packageSha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
         packageManifestSha256 = (Get-FileHash -LiteralPath (Join-Path $newPackage 'package-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
         packageBytes = (Get-Item -LiteralPath $zip).Length; unpackedBytes = $unpacked
         minCatalogSchema = 5; maxCatalogSchema = 5
-        releaseNotesUrl = 'https://github.com/BigGluk23/PhotoShelf/releases/tag/v1.11.1-ultra'
+        releaseNotesUrl = 'https://github.com/BigGluk23/PhotoShelf/releases/tag/v1.11.2-ultra'
     }
     $manifestBytes = [Text.Encoding]::UTF8.GetBytes(($manifest | ConvertTo-Json -Depth 5 -Compress))
     [IO.File]::WriteAllBytes((Join-Path $runRoot 'photoshelf-update.json'), $manifestBytes)
