@@ -18,6 +18,17 @@
 Независимое восстановление ключа и личная 2FA этой проверкой не подтверждены.
 План подготовки кандидата и остающиеся согласования: [v1.11.1-release.md](v1.11.1-release.md).
 
+## Явно включённый solo-режим, 8 октября 2026
+
+По решению владельца `main` временно работает без обязательного второго ревьюера:
+required approvals = 0, CODEOWNERS review и last-push approval выключены. Обязательные
+PR, закрытие обсуждений, `windows`, `Same-host baseline/current performance`, запреты
+удаления и force-push сохранены. В окружении `release` Required reviewers выключен;
+разрешена только точная branch `main`, admin bypass выключен, ключ остаётся только
+environment secret. В этом режиме release workflow разрешает dispatch только при
+`actor == triggering_actor == BigGluk23`. Возврат Required reviewer BigGluk23 и
+Prevent self-review автоматически возвращает защищённый режим с независимым запуском.
+
 Ниже сохранён исторический снимок **до** исправления правил и приёмки PR #12.
 Он не описывает текущее состояние обязательного ревью.
 
@@ -60,14 +71,14 @@ gh api repos/BigGluk23/PhotoShelf/rules/branches/main
 
 ## 2. Сохранить защиту окружения release
 
-Окружение **release** уже создано. Перед выпуском проверить в [Settings → Environments](https://github.com/BigGluk23/PhotoShelf/settings/environments):
+Окружение **release** уже создано. Перед выпуском выбрать один режим и проверить его в [Settings → Environments](https://github.com/BigGluk23/PhotoShelf/settings/environments):
 
-- Required reviewer: **только BigGluk23**.
-- Включить **Prevent self-review**.
+- Protected: Required reviewer — **только BigGluk23**, **Prevent self-review** включён; запуск выполняет другой доверенный участник.
+- Solo: Required reviewers выключен; запуск выполняет только BigGluk23.
 - Выключить **Allow administrators to bypass configured protection rules**.
 - Deployment branches and tags: **Selected branches and tags**, ровно одно правило типа **Branch** с именем **main**. Не добавлять tag/wildcard.
 
-Минимальный образец хранится в `tools/release-environment.json`. Текущее окружение и policy `main` пересоздавать не нужно. Команды чтения:
+Минимальный образец protected-режима хранится в `tools/release-environment.json`. Текущее окружение и policy `main` пересоздавать не нужно. Команды чтения:
 
 ```bash
 gh api repos/BigGluk23/PhotoShelf/environments/release
@@ -76,7 +87,7 @@ gh api repos/BigGluk23/PhotoShelf/environments/release/deployment-branch-policie
 
 В ответе аудита от 4 октября присутствует `can_admins_bypass=false`. Если при последующей проверке это поле недоступно, запрет надо подтвердить в интерфейсе владельца: отсутствие поля не является доказательством запрета.
 
-Запуск релиза выполняет другой доверенный участник; владелец одобряет точный SHA и пакет в GitHub. Сам владелец не сможет одобрить запуск, который инициировал: это ожидаемое действие запрета self-review. Окружение не должно автоматически создаваться незащищённым при первом запуске YAML: preflight обязан заранее прочитать и проверить его конфигурацию.
+В protected-режиме запуск выполняет другой доверенный участник, а владелец одобряет точный SHA и пакет. В solo-режиме workflow принимает только запуск владельца и не требует approval. Окружение не должно автоматически создаваться при первом запуске YAML: preflight обязан заранее прочитать и проверить его конфигурацию.
 
 После отдельного согласования ключ помещается **только в Environment secrets окружения release**. Repository/organization secret с тем же именем недопустим: он доступен другим workflows. Не загружать ключ при выполнении этой инструкции. Публикация также требует отдельного решения.
 

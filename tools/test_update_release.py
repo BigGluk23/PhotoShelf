@@ -270,6 +270,20 @@ class ReleaseProtectionTests(unittest.TestCase):
     def test_expected_owner_gate_and_exact_main_are_accepted(self):
         self.assertEqual(42, self.verify()["environmentId"])
 
+    def test_owner_can_dispatch_solo_when_required_reviewers_are_disabled(self):
+        environment, _ = self.fixtures()
+        environment["protection_rules"] = []
+        result = self.verify(environment=environment, actor="BigGluk23")
+        self.assertEqual("solo", result["releaseMode"])
+        self.assertFalse(result["ownerApprovalRequired"])
+        with self.assertRaisesRegex(ValueError, "owner may dispatch"):
+            self.verify(environment=environment, actor="Khrumium")
+
+    def test_protected_mode_still_requires_independent_dispatch(self):
+        result = self.verify()
+        self.assertEqual("protected", result["releaseMode"])
+        self.assertTrue(result["ownerApprovalRequired"])
+
     def test_repo_secret_and_self_approval_and_rerun_are_rejected(self):
         for changes in ({"secret_present": True}, {"secret_present": None}, {"actor": "BigGluk23"}, {"attempt": 2}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
