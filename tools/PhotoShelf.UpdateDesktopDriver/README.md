@@ -1,6 +1,6 @@
 # Real WPF updater transition on a disposable Windows runner
 
-`tools/test-wpf-update-lifecycle.ps1 -ReportDirectory <owned-results>` copies tracked source to an owned temporary directory, embeds an ephemeral **public test key** there and publishes the real Desktop and Updater projects at technical versions `1.11.0` and `1.11.1`. The private test key stays in the PowerShell process's RSA object and is never exported. The production checkout, public key and version are unchanged; test binaries never enter release artifacts.
+`tools/test-wpf-update-lifecycle.ps1 -ReportDirectory <owned-results>` copies tracked source to an owned temporary directory, embeds an ephemeral **public test key** there and publishes the real Desktop and Updater projects at technical versions `1.11.1` and `1.11.2`. The private test key stays in the PowerShell process's RSA object and is never exported. The production checkout, public key and version are unchanged; test binaries never enter release artifacts.
 
 The driver does not inject a trust key, profile path, installation consent or test mode into a production executable. Both application starts use the normal zero-argument entrypoint. It atomically claims an initially absent `%LOCALAPPDATA%/PhotoShelf` on a disposable Windows GitHub Actions runner. Existing Local/Roaming PhotoShelf data or running PhotoShelf processes cause refusal. The owned test profile is retained, including on failure; no profile/media/catalog cleanup or rollback occurs.
 
@@ -11,7 +11,7 @@ External UI Automation performs the real Settings → Update and restart click. 
 - The old real WPF window displays the synthetic catalog before consent; a prepared stage creates no install request by itself.
 - The old process actually exits; the real helper runs from the old application directory and activates a separate verified program directory.
 - At three controlled points, a normal launch of the old executable shows the exact busy message and exits with code zero when dismissed: after the old process exits but before pointer publication, after pointer publication but before the successor starts, and after the successor displays its catalog but before it reports health. Each attempt must leave no catalog-startup marker or main window; original hashes, all catalog rows and journal bytes are checked at every point.
-- The new real WPF process reports ready after catalog startup/first projection. Its executable file version, signed active pointer and receipt identify `1.11.1`; the hardcoded main-window title alone is not version evidence.
+- The new real WPF process reports ready after catalog startup/first projection. Its executable file version, signed active pointer and receipt identify `1.11.2`; the hardcoded main-window title alone is not version evidence.
 - Search/view settings, every media-row column, SQLite integrity, originals' SHA-256/size/mtime, and completed journal bytes survive.
 - A subsequent normal launch of the old executable redirects to a fresh new-version process and closes gracefully.
 
