@@ -12,7 +12,7 @@ on:
         type: string
         required: true
       publish:
-        description: Publish after owner approval and asset verification (false creates a draft only)
+        description: Publish after policy validation and asset verification (false creates a draft only)
         type: boolean
         default: false
 
@@ -54,7 +54,7 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
-      - name: Require live owner protection before queuing a secret-bearing job
+      - name: Require the configured live release policy before queuing a secret-bearing job
         id: protection
         shell: bash
         env:
@@ -134,15 +134,16 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f"archive_sha256={manifest['packageSha256']}\nmanifest_sha256={hashlib.sha256(encoded).hexdigest()}\n")
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(f"Ready for BigGluk23 approval: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
+              summary.write(f"Validated release candidate: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
               summary.write('Exact Windows CI and performance gates passed. Both process-fixture and real Desktop test-trust lifecycle reports passed. Production signing and publication have not run.\n')
           PY
 
   sign_publish:
     needs: validate
     if: github.ref == 'refs/heads/main' && github.repository == 'BigGluk23/PhotoShelf'
-    # GitHub must release this job only after independent BigGluk23 approval.
-    # The validation job above cannot auto-create an unprotected missing environment.
+    # In protected mode GitHub releases this job only after independent owner approval.
+    # In explicitly configured solo mode the owner dispatches it directly. The validation
+    # job above cannot auto-create or silently weaken a missing environment.
     environment:
       name: release
     runs-on: ubuntu-latest
@@ -165,7 +166,7 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
-      - name: Recheck live protection and actual owner approval before using any secret
+      - name: Recheck live policy and any required owner approval before using any secret
         shell: bash
         env:
           RELEASE_ACTOR: ${{ github.actor }}
@@ -237,20 +238,20 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f"archive_sha256={manifest['packageSha256']}\nmanifest_sha256={hashlib.sha256(encoded).hexdigest()}\n")
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(f"Ready for BigGluk23 approval: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
+              summary.write(f"Revalidated release candidate: {os.environ['UPDATE_TAG']}\n\nSource: `{os.environ['GITHUB_SHA']}`\n\nZIP SHA-256: `{manifest['packageSha256']}`\n\n")
               summary.write('Exact Windows CI and performance gates passed. Both process-fixture and real Desktop test-trust lifecycle reports passed. Production signing and publication have not run.\n')
           PY
-      - name: Match this fresh download to the candidate approved by the owner
+      - name: Match this fresh download to the validated candidate
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import hashlib, json, os, pathlib
           encoded = pathlib.Path('release-work/candidate/photoshelf-update.json').read_bytes()
-          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Candidate changed after approval'
-          assert json.loads(encoded)['packageSha256'] == os.environ['EXPECTED_ARCHIVE_SHA256'], 'Archive changed after approval'
+          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Candidate changed after validation'
+          assert json.loads(encoded)['packageSha256'] == os.environ['EXPECTED_ARCHIVE_SHA256'], 'Archive changed after validation'
           PY
-      - name: Sign the approved exact package with the protected environment key
+      - name: Sign the validated exact package with the protected environment key
         shell: bash
         env:
           PHOTOSHELF_UPDATE_SIGNING_KEY: ${{ secrets.PHOTOSHELF_UPDATE_SIGNING_KEY }}
@@ -269,7 +270,7 @@ jobs:
               '--version', os.environ['UPDATE_VERSION'], '--commit', os.environ['GITHUB_SHA'], '--tag', os.environ['UPDATE_TAG'],
               '--public-key', 'src/PhotoShelf.Application/Updates/TrustedUpdateKey.pem', '--output', 'release-work/signed'], check=True)
           encoded = pathlib.Path('release-work/signed/photoshelf-update.json').read_bytes()
-          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Signed candidate differs from approval'
+          assert hashlib.sha256(encoded).hexdigest() == os.environ['EXPECTED_MANIFEST_SHA256'], 'Signed candidate differs from validation'
           PY
       - name: Create draft, upload, read back and optionally publish
         shell: bash
