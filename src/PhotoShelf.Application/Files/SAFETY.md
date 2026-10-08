@@ -4,7 +4,7 @@
 
 ## Public API and caller obligations
 
-- `Plan(...)` returns immutable individual entries with `GroupId`. Preview every member, including sidecars, before requesting execution. Optional `layout: MoveLayoutOptions` selects destination/year/year-month/year-month-day folders, capture-date filename prefixes, and a validated event folder. Missing capture dates are never fabricated. Optional `token:` cancels planning. Each source directory is indexed once per preview.
+- `Plan(...)` returns immutable individual entries with `GroupId`. Preview every member, including sidecars, before requesting execution. Optional `layout: MoveLayoutOptions` selects destination/year/year-month/year-month-day folders, selected-date filename prefixes, a validated event folder and an explicit date source. Capture date remains the conservative default; filesystem modification time is used only when the caller explicitly selects it or explicitly enables fallback. Every entry records the date origin for the confirmation UI. Missing dates are never fabricated. Optional `token:` cancels planning. Each source directory is indexed once per preview.
 - `ExecuteAsync(...)` creates a new journal with `FileMode.CreateNew`; existing journals are never overwritten.
 - `ReadHistory(directory)` returns completed, pending and undone counts, errors and an inverse-journal link.
 - `ReadPlan(journalPath)` reads the verified journal, exposes source/destination/size/hash/group for the confirmation UI.

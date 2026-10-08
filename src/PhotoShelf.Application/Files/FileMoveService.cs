@@ -8,11 +8,16 @@ namespace PhotoShelf.Application.Files;
 public enum CollisionPolicy { Skip, Rename }
 public enum FolderLayout { Destination, Year, YearMonth, YearMonthDay }
 public enum FileNameStyle { Original, DatePrefix }
+public enum MoveDateSource { CaptureDate, CaptureDateWithFileFallback, FileModifiedDate }
+public enum MoveDateOrigin { None, CaptureDate, FileModifiedDate }
 public sealed record MoveLayoutOptions(FolderLayout FolderLayout = FolderLayout.Destination,
-    FileNameStyle FileNameStyle = FileNameStyle.Original, string? EventName = null);
-public sealed record MoveRequest(string Source, DateTime? CaptureDate, IReadOnlyList<string>? ConfirmedCompanions = null);
+    FileNameStyle FileNameStyle = FileNameStyle.Original, string? EventName = null,
+    MoveDateSource DateSource = MoveDateSource.CaptureDate);
+public sealed record MoveRequest(string Source, DateTime? CaptureDate, IReadOnlyList<string>? ConfirmedCompanions = null,
+    DateTime? FileModifiedDate = null);
 public sealed record MoveEntry(string Source, string Destination, long Length, DateTime ModifiedUtc, string? SkipReason,
-    string? GroupId = null, string? ExpectedHash = null, DateTime? RestoreModifiedUtc = null);
+    string? GroupId = null, string? ExpectedHash = null, DateTime? RestoreModifiedUtc = null,
+    DateTime? OrganizationDate = null, MoveDateOrigin OrganizationDateOrigin = MoveDateOrigin.None);
 public sealed record MoveResult(MoveEntry Entry, bool Moved, string? Error);
 public sealed record MoveJournalEntry(string Source, string Destination, string Staging, string Status, string? Hash,
     string? Error, string? Temporary = null, long Length = 0, DateTime ModifiedUtc = default,
@@ -64,9 +69,10 @@ public sealed class FileMoveService
             if (used.Contains(source)) continue;
             var groupId = Guid.NewGuid().ToString("N");
             var directory = destination;
+            var (organizationDate, organizationDateOrigin) = ResolveOrganizationDate(request, layout.DateSource);
             if (layout.FolderLayout != FolderLayout.Destination)
             {
-                if (request.CaptureDate is { } date)
+                if (organizationDate is { } date)
                 {
                     var culture = CultureInfo.GetCultureInfo("ru-RU");
                     directory = Path.Combine(directory, date.Year.ToString("D4"));
@@ -74,7 +80,7 @@ public sealed class FileMoveService
                         directory = Path.Combine(directory, $"{date.Month:D2} {culture.TextInfo.ToTitleCase(culture.DateTimeFormat.GetMonthName(date.Month))}");
                     if (layout.FolderLayout == FolderLayout.YearMonthDay) directory = Path.Combine(directory, date.ToString("dd"));
                 }
-                else directory = Path.Combine(directory, "Без даты съёмки");
+                else directory = Path.Combine(directory, MissingDateFolderName(layout.DateSource));
             }
             if (eventName is not null) directory = Path.Combine(directory, eventName);
             var companions = FindCompanions(source, request.ConfirmedCompanions, directories, token, out var reason);
@@ -82,8 +88,8 @@ public sealed class FileMoveService
                 throw new IOException("План превышает безопасный размер операции или связанной группы; разделите выбор, файлы не изменены");
             if (companions.Any(used.Contains)) reason ??= "Связанный файл уже входит в другую группу";
             var baseStem = Path.GetFileNameWithoutExtension(source);
-            var outputStem = layout.FileNameStyle == FileNameStyle.DatePrefix && request.CaptureDate is { } capture
-                ? capture.ToString("yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture) + "_" + baseStem : baseStem;
+            var outputStem = layout.FileNameStyle == FileNameStyle.DatePrefix && organizationDate is { } selectedDate
+                ? selectedDate.ToString("yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture) + "_" + baseStem : baseStem;
             if (Paths.Equals(Path.GetDirectoryName(source), directory) && outputStem == baseStem) reason ??= "Уже в этой папке";
             var number = 0;
             Dictionary<string, string> targets;
@@ -113,7 +119,8 @@ public sealed class FileMoveService
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { reason ??= ex.Message; }
                 reserved.Add(targets[member]);
-                result.Add(new(member, targets[member], length, modified, reason, groupId));
+                result.Add(new(member, targets[member], length, modified, reason, groupId,
+                    OrganizationDate: organizationDate, OrganizationDateOrigin: organizationDateOrigin));
             }
             // Any invalid member blocks every member. A preview must never split a known group.
             if (reason is not null)
@@ -731,6 +738,24 @@ public sealed class FileMoveService
             reason ??= "Одноимённые связанные файлы не подтверждены: требуется разбор всей группы";
         return result.OrderBy(path => Paths.Equals(path, source) ? 0 : 1).ThenBy(path => path, Paths).ToList();
     }
+    private static (DateTime? Date, MoveDateOrigin Origin) ResolveOrganizationDate(MoveRequest request, MoveDateSource source) => source switch
+    {
+        MoveDateSource.CaptureDate when request.CaptureDate is { } capture => (capture, MoveDateOrigin.CaptureDate),
+        MoveDateSource.CaptureDate => (null, MoveDateOrigin.None),
+        MoveDateSource.CaptureDateWithFileFallback when request.CaptureDate is { } capture => (capture, MoveDateOrigin.CaptureDate),
+        MoveDateSource.CaptureDateWithFileFallback when request.FileModifiedDate is { } modified => (modified, MoveDateOrigin.FileModifiedDate),
+        MoveDateSource.CaptureDateWithFileFallback => (null, MoveDateOrigin.None),
+        MoveDateSource.FileModifiedDate when request.FileModifiedDate is { } modified => (modified, MoveDateOrigin.FileModifiedDate),
+        MoveDateSource.FileModifiedDate => (null, MoveDateOrigin.None),
+        _ => throw new ArgumentOutOfRangeException(nameof(source))
+    };
+    private static string MissingDateFolderName(MoveDateSource source) => source switch
+    {
+        MoveDateSource.CaptureDate => "Без даты съёмки",
+        MoveDateSource.CaptureDateWithFileFallback => "Без даты съёмки и файла",
+        MoveDateSource.FileModifiedDate => "Без даты файла",
+        _ => throw new ArgumentOutOfRangeException(nameof(source))
+    };
     private static string? ValidateEventName(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return null;

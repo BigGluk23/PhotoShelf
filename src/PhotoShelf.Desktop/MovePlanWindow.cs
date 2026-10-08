@@ -18,9 +18,19 @@ public sealed class MovePlanWindow : Window
     private int _revision;
     private CancellationTokenSource? _planning;
     private readonly ComboBox _layout = new() { ItemsSource = new[] { "В выбранную папку", "Год", "Год / месяц", "Год / месяц / день" }, Margin = new Thickness(8), Width = 200 };
-    private readonly ComboBox _names = new() { ItemsSource = new[] { "Сохранить имена", "Дата съёмки + имя" }, SelectedIndex = 0, Margin = new Thickness(8), Width = 190 };
+    private readonly ComboBox _names = new() { ItemsSource = new[] { "Сохранить имена", "Выбранная дата + имя" }, SelectedIndex = 0, Margin = new Thickness(8), Width = 190 };
+    private readonly ComboBox _dateSource = new()
+    {
+        ItemsSource = new[] { "Дата съёмки — без подмены", "Дата съёмки, иначе дата файла", "Дата файла" },
+        SelectedIndex = 0,
+        Margin = new Thickness(8),
+        Width = 260,
+        ToolTip = "Источник даты для папок и префикса имени. Fallback на дату файла применяется только при явном выборе."
+    };
     private readonly System.Windows.Controls.TextBox _event = new() { Margin = new Thickness(8), Width = 240, ToolTip = "Необязательная подпапка события. Например: Отпуск" };
     private readonly TextBlock _summary = new() { Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap };
+    private readonly DataGridTextColumn _organizationDateColumn = new() { Header = "Дата раскладки", Binding = new System.Windows.Data.Binding(nameof(MovePlanRow.OrganizationDateText)), Width = 145 };
+    private readonly DataGridTextColumn _organizationDateSourceColumn = new() { Header = "Источник даты", Binding = new System.Windows.Data.Binding(nameof(MovePlanRow.OrganizationDateSourceText)), Width = 125 };
     public IReadOnlyList<MoveEntry> Plan { get; private set; } = Array.Empty<MoveEntry>();
     public MovePlanWindow(MoveRequest[] requests, string destination, bool byYear, bool quarantineMode = false)
     {
@@ -36,9 +46,9 @@ public sealed class MovePlanWindow : Window
             top.Children.Add(new TextBlock { Text = synchronizationWarning, Margin = new Thickness(8), TextWrapping = TextWrapping.Wrap,
                 Foreground = System.Windows.Media.Brushes.DarkOrange });
         top.Children.Add(_collision);
-        var options = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+        var options = new WrapPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
         _layout.SelectedIndex = byYear ? 2 : 0;
-        options.Children.Add(_layout); options.Children.Add(_names);
+        options.Children.Add(_layout); options.Children.Add(_names); options.Children.Add(_dateSource);
         options.Children.Add(new TextBlock { Text = "Событие:", VerticalAlignment = VerticalAlignment.Center }); options.Children.Add(_event);
         if (quarantineMode) options.Visibility = Visibility.Collapsed;
         top.Children.Add(options); top.Children.Add(_summary);
@@ -46,11 +56,14 @@ public sealed class MovePlanWindow : Window
         DockPanel.SetDock(_execute, Dock.Bottom); panel.Children.Add(_execute);
         _grid.Columns.Add(new DataGridTextColumn { Header = "Откуда", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.Source)), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         _grid.Columns.Add(new DataGridTextColumn { Header = "Куда", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.Destination)), Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        _grid.Columns.Add(_organizationDateColumn);
+        _grid.Columns.Add(_organizationDateSourceColumn);
         _grid.Columns.Add(new DataGridTextColumn { Header = "Пропуск", Binding = new System.Windows.Data.Binding(nameof(MoveEntry.SkipReason)), Width = 160 });
         panel.Children.Add(_grid);
         _collision.SelectionChanged += async (_, _) => await RefreshAsync();
         _layout.SelectionChanged += async (_, _) => await RefreshAsync();
         _names.SelectionChanged += async (_, _) => await RefreshAsync();
+        _dateSource.SelectionChanged += async (_, _) => await RefreshAsync();
         _event.TextChanged += async (_, _) => await RefreshAsync();
         Loaded += async (_, _) => await RefreshAsync();
         Closed += (_, _) => { ++_revision; _planning?.Cancel(); };
@@ -66,16 +79,41 @@ public sealed class MovePlanWindow : Window
         try
         {
             var layout = _quarantineMode ? new MoveLayoutOptions() :
-                new MoveLayoutOptions((FolderLayout)Math.Max(0, _layout.SelectedIndex), (FileNameStyle)Math.Max(0, _names.SelectedIndex), _event.Text.Trim());
+                new MoveLayoutOptions((FolderLayout)Math.Max(0, _layout.SelectedIndex), (FileNameStyle)Math.Max(0, _names.SelectedIndex),
+                    _event.Text.Trim(), (MoveDateSource)Math.Max(0, _dateSource.SelectedIndex));
             await Task.Delay(120, operation.Token);
             var plan = await Task.Run(() => new FileMoveService().Plan(_requests, _destination, collision, _byYear, operation.Token, layout), operation.Token);
             if (revision != _revision) return;
-            Plan = plan; _grid.ItemsSource = plan;
-            _summary.Text = $"К переносу: {plan.Count(x => x.SkipReason is null):N0} · Пропусков: {plan.Count(x => x.SkipReason is not null):N0} · {plan.Where(x => x.SkipReason is null).Sum(x => x.Length) / 1048576d:N1} МиБ";
+            Plan = plan; _grid.ItemsSource = plan.Select(static entry => new MovePlanRow(entry)).ToArray();
+            var dateGroups = plan.GroupBy(static entry => entry.GroupId ?? entry.Source, StringComparer.OrdinalIgnoreCase)
+                .Select(static group => group.First()).ToArray();
+            var usesDate = !_quarantineMode && (layout.FolderLayout != FolderLayout.Destination || layout.FileNameStyle == FileNameStyle.DatePrefix);
+            _organizationDateColumn.Visibility = usesDate ? Visibility.Visible : Visibility.Collapsed;
+            _organizationDateSourceColumn.Visibility = usesDate ? Visibility.Visible : Visibility.Collapsed;
+            var summary = $"К переносу: {plan.Count(x => x.SkipReason is null):N0} · Пропусков: {plan.Count(x => x.SkipReason is not null):N0} · {plan.Where(x => x.SkipReason is null).Sum(x => x.Length) / 1048576d:N1} МиБ";
+            if (usesDate)
+                summary += $"\nДата съёмки: {dateGroups.Count(x => x.OrganizationDateOrigin == MoveDateOrigin.CaptureDate):N0} · " +
+                    $"Дата файла: {dateGroups.Count(x => x.OrganizationDateOrigin == MoveDateOrigin.FileModifiedDate):N0} · " +
+                    $"Без выбранной даты: {dateGroups.Count(x => x.OrganizationDateOrigin == MoveDateOrigin.None):N0}";
+            _summary.Text = summary;
             _execute.IsEnabled = plan.Any(x => x.SkipReason is null);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (revision == _revision) _summary.Text = $"План недоступен: {ex.Message}"; }
         finally { if (ReferenceEquals(_planning, operation)) _planning = null; }
+    }
+
+    private sealed class MovePlanRow(MoveEntry entry)
+    {
+        public string Source => entry.Source;
+        public string Destination => entry.Destination;
+        public string? SkipReason => entry.SkipReason;
+        public string OrganizationDateText => entry.OrganizationDate?.ToString("dd.MM.yyyy HH:mm:ss") ?? "—";
+        public string OrganizationDateSourceText => entry.OrganizationDateOrigin switch
+        {
+            MoveDateOrigin.CaptureDate => "Съёмка",
+            MoveDateOrigin.FileModifiedDate => "Файл",
+            _ => "Нет даты"
+        };
     }
 }
