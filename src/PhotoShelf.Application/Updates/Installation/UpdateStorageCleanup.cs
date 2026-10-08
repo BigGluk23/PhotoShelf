@@ -29,6 +29,9 @@ public static class UpdateStorageCleanup
                 !IsImmediateGuidChild(request.StageDirectory, paths.StagingRoot, out _))
                 return false;
             if (!TryDeleteOwnedStage(request.StageDirectory, paths.StagingRoot)) return false;
+            var viewPath = Path.Combine(paths.RequestsRoot, requestId + ".view.json");
+            UpdateInstallationPaths.RejectLinks(viewPath, allowMissing: true);
+            File.Delete(viewPath);
             UpdateInstallationPaths.RejectLinks(requestPath);
             File.Delete(requestPath);
             return true;
@@ -88,7 +91,7 @@ public static class UpdateStorageCleanup
             UpdateInstallationPaths.RejectLinks(root);
             foreach (var file in Directory.EnumerateFiles(root, "*.json", SearchOption.TopDirectoryOnly))
             {
-                var id = NormalizeId(Path.GetFileNameWithoutExtension(file));
+                var id = OwnedRequestArtifactId(Path.GetFileName(file));
                 if (id is null || id == preservedRequestId) continue;
                 try
                 {
@@ -114,6 +117,15 @@ public static class UpdateStorageCleanup
 
     private static string? NormalizeId(string? value) =>
         value is not null && Guid.TryParseExact(value, "N", out var id) && id.ToString("N") == value ? value : null;
+
+    private static string? OwnedRequestArtifactId(string fileName)
+    {
+        const string viewSuffix = ".view.json";
+        const string requestSuffix = ".json";
+        var id = fileName.EndsWith(viewSuffix, StringComparison.Ordinal) ? fileName[..^viewSuffix.Length] :
+            fileName.EndsWith(requestSuffix, StringComparison.Ordinal) ? fileName[..^requestSuffix.Length] : null;
+        return NormalizeId(id);
+    }
 
     private static bool ContainsLink(string root)
     {

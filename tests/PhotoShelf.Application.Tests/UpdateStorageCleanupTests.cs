@@ -26,9 +26,13 @@ public sealed class UpdateStorageCleanupTests : IDisposable
         Directory.CreateDirectory(Paths.RequestsRoot);
         var expired = Path.Combine(Paths.RequestsRoot, Guid.NewGuid().ToString("N") + ".json");
         var recent = Path.Combine(Paths.RequestsRoot, Guid.NewGuid().ToString("N") + ".json");
+        var expiredView = Path.ChangeExtension(expired, ".view.json");
+        var recentView = Path.ChangeExtension(recent, ".view.json");
         var unowned = Path.Combine(Paths.RequestsRoot, "notes.json");
-        File.WriteAllText(expired, "{}"); File.WriteAllText(recent, "{}"); File.WriteAllText(unowned, "{}");
+        File.WriteAllText(expired, "{}"); File.WriteAllText(recent, "{}");
+        File.WriteAllText(expiredView, "{}"); File.WriteAllText(recentView, "{}"); File.WriteAllText(unowned, "{}");
         File.SetLastWriteTimeUtc(expired, DateTime.UtcNow.AddHours(-1));
+        File.SetLastWriteTimeUtc(expiredView, DateTime.UtcNow.AddHours(-1));
 
         UpdateStorageCleanup.CleanupAtStartup(Paths.StagingRoot, kept, Paths.RequestsRoot,
             preservedRequestId: null, new DateTimeOffset(DateTime.UtcNow, TimeSpan.Zero));
@@ -36,7 +40,8 @@ public sealed class UpdateStorageCleanupTests : IDisposable
         Assert.True(Directory.Exists(Path.Combine(Paths.StagingRoot, kept)));
         Assert.False(Directory.Exists(Path.Combine(Paths.StagingRoot, orphan)));
         Assert.True(Directory.Exists(Path.Combine(Paths.StagingRoot, unknown)));
-        Assert.False(File.Exists(expired)); Assert.True(File.Exists(recent)); Assert.True(File.Exists(unowned));
+        Assert.False(File.Exists(expired)); Assert.False(File.Exists(expiredView));
+        Assert.True(File.Exists(recent)); Assert.True(File.Exists(recentView)); Assert.True(File.Exists(unowned));
     }
 
     [Fact]
@@ -52,6 +57,8 @@ public sealed class UpdateStorageCleanupTests : IDisposable
             "1.11.1", "1.11.2", new string('a', 64));
         var requestPath = Path.Combine(Paths.RequestsRoot, requestId + ".json");
         File.WriteAllText(requestPath, JsonSerializer.Serialize(request, JsonOptions));
+        var viewPath = Path.ChangeExtension(requestPath, ".view.json");
+        File.WriteAllText(viewPath, "{\"anchorIndex\":0}");
         var installationId = Guid.NewGuid().ToString("N");
         var executable = Path.Combine(Paths.VersionsRoot, installationId, "app", "PhotoShelf.exe");
         Directory.CreateDirectory(Path.GetDirectoryName(executable)!); File.WriteAllText(executable, "synthetic");
@@ -73,7 +80,7 @@ public sealed class UpdateStorageCleanupTests : IDisposable
             Environment.SetEnvironmentVariable(UpdateStartupHealth.InstallationVariable, previousInstallation);
         }
 
-        Assert.False(Directory.Exists(stage)); Assert.False(File.Exists(requestPath));
+        Assert.False(Directory.Exists(stage)); Assert.False(File.Exists(requestPath)); Assert.False(File.Exists(viewPath));
         Assert.True(File.Exists(Path.Combine(operation, "startup-ready.json")));
         Assert.True(File.Exists(executable)); Assert.True(File.Exists(Paths.ActivePointerPath));
     }

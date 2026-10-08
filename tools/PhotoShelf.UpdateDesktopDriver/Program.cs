@@ -148,7 +148,9 @@ internal static class Program
             }, "New actual WPF application did not show its catalog before startup health.", 30);
             RequireGateRecord("candidate-before-health.reached.json", "candidate-before-health", successor!.Id, "1.11.2");
             Require(!HasReadyReceipt(paths), "The candidate wrote health before its checkpoint was released.");
-            var requestPath = Directory.GetFiles(paths.RequestsRoot, "*.json", SearchOption.TopDirectoryOnly).Single();
+            var requestPath = Directory.GetFiles(paths.RequestsRoot, "*.json", SearchOption.TopDirectoryOnly)
+                .Single(path => !path.EndsWith(".view.json", StringComparison.Ordinal));
+            var viewPath = Path.ChangeExtension(requestPath, ".view.json");
             string requestId;
             string stageDirectory;
             using (var request = JsonDocument.Parse(await File.ReadAllTextAsync(requestPath)))
@@ -175,6 +177,7 @@ internal static class Program
                 receipt.RequestId == requestId && Guid.TryParseExact(receipt.RequestId, "N", out _),
                 "Receipt is not tied to the activated successor.");
             Require(!File.Exists(requestPath), "A confirmed startup retained its consumed one-time request.");
+            Require(!File.Exists(viewPath), "A confirmed startup retained its one-time view-resume hint.");
             Require(!Directory.Exists(stageDirectory), "A confirmed startup retained its verified staging directory.");
             Assertions["confirmedTransportCleaned"] = true;
             Assertions["startupReadyReceipt"] = true;
