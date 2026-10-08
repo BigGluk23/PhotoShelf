@@ -352,6 +352,7 @@ public partial class MainWindow
         DateGroupingMode = _dateGroupingMode.ToString(), ActiveFolder = _activeFolder, ViewMode = _viewMode.ToString(),
         SortNewestFirst = _sortNewestFirst, IncludeSubfolders = _includeSubfolders,
         BackgroundProcessingPaused = _backgroundProcessingPaused,
+        BackgroundLoadMode = BackgroundWorkController.Shared.Mode.ToString(),
         ExpandedFolders = _folderNodes.Values.Where(x => x.IsExpanded).Select(x => x.FullPath).ToList(),
         ExcludedFolders = _folderInclusion.ExcludedFolders.ToList(),
         IncludedFolders = _folderInclusion.IncludedFolders.ToList(),

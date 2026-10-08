@@ -11,6 +11,10 @@ on:
         description: Include synthetic 10k/100k/1M catalog tests
         type: boolean
         default: false
+      background_soak_seconds:
+        description: In-process mixed-media background soak (30..14400 seconds; 7200 for two hours)
+        type: number
+        default: 30
       performance_million:
         description: Also compare baseline/current WPF and SQL with 1M synthetic catalog records
         type: boolean
@@ -26,7 +30,7 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 50
+    timeout-minutes: 330
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,7 +48,8 @@ jobs:
         shell: pwsh
         env:
           PHOTOSHELF_SCALE_TESTS: ${{ inputs.scale == true }}
-        run: ./tools/harness.ps1 -Scale:($env:PHOTOSHELF_SCALE_TESTS -eq 'true')
+          PHOTOSHELF_SOAK_SECONDS: ${{ inputs.background_soak_seconds || 30 }}
+        run: ./tools/harness.ps1 -Scale:($env:PHOTOSHELF_SCALE_TESTS -eq 'true') -BackgroundSoakSeconds ([int]$env:PHOTOSHELF_SOAK_SECONDS)
       - name: Preserve test results and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

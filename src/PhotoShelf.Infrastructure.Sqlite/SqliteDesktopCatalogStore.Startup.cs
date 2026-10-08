@@ -229,6 +229,7 @@ public sealed partial class SqliteDesktopCatalogStore
             ["active_folder"] = state.ActiveFolder ?? "", ["view_mode"] = state.ViewMode, ["newest_first"] = state.SortNewestFirst.ToString(),
             ["include_subfolders"] = state.IncludeSubfolders.ToString(), ["expanded"] = JsonSerializer.Serialize(state.ExpandedFolders),
             ["background_processing_paused"] = state.BackgroundProcessingPaused.ToString(),
+                ["background_load_mode"] = state.BackgroundLoadMode,
             ["included_folders"] = JsonSerializer.Serialize(state.IncludedFolders), ["watched_folders"] = JsonSerializer.Serialize(state.WatchedFolders),
             ["quarantine_directory"] = state.QuarantineDirectory ?? "", ["quarantine_batches"] = JsonSerializer.Serialize(state.QuarantineBatchDirectories)
         };

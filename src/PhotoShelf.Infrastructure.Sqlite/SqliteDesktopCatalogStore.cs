@@ -153,6 +153,7 @@ public sealed partial class SqliteDesktopCatalogStore
                     case "view_mode": state.ViewMode = value; break;
                     case "newest_first": if (bool.TryParse(value, out var newest)) state.SortNewestFirst = newest; break;
                     case "include_subfolders": if (bool.TryParse(value, out var subfolders)) state.IncludeSubfolders = subfolders; break;
+                    case "background_load_mode": state.BackgroundLoadMode = value; break;
                     case "background_processing_paused": if (bool.TryParse(value, out var paused)) state.BackgroundProcessingPaused = paused; break;
                     case "expanded": state.ExpandedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
                     case "watched_folders": state.WatchedFolders = JsonSerializer.Deserialize<List<string>>(value) ?? new(); break;
@@ -191,6 +192,7 @@ public sealed partial class SqliteDesktopCatalogStore
                 ["active_folder"] = state.ActiveFolder ?? "", ["view_mode"] = state.ViewMode, ["newest_first"] = state.SortNewestFirst.ToString(),
                 ["include_subfolders"] = state.IncludeSubfolders.ToString(), ["expanded"] = JsonSerializer.Serialize(state.ExpandedFolders),
                 ["background_processing_paused"] = state.BackgroundProcessingPaused.ToString(),
+                ["background_load_mode"] = state.BackgroundLoadMode,
                 ["included_folders"] = JsonSerializer.Serialize(state.IncludedFolders),
                 ["watched_folders"] = JsonSerializer.Serialize(state.WatchedFolders)
             };

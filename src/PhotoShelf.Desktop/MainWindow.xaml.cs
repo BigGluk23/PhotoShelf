@@ -19,7 +19,7 @@ namespace PhotoShelf.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
-    private const string VersionLabel = "Ultra v1.11.3";
+    private const string VersionLabel = "Ultra v1.11.4";
     private readonly Dictionary<string, FolderNode> _folderNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LocalCatalogState _catalogState;
     private readonly MetadataIndexStore _metadataIndexStore = new();
@@ -61,6 +61,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         DataContext = this;
         _catalogState = initialState;
         _backgroundProcessingPaused = initialState.BackgroundProcessingPaused;
+        BackgroundWorkController.Shared.Mode = Enum.TryParse<BackgroundLoadMode>(initialState.BackgroundLoadMode, out var loadMode)
+            ? loadMode : BackgroundLoadMode.Balanced;
+        InitializeBackgroundEnvironment();
         TileWidth = Math.Clamp(_catalogState.TileWidth, 72, 260);
         ThumbnailSizeSlider.Value = TileWidth;
         ShowVideos = _catalogState.ShowVideos;
@@ -186,7 +189,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnSettingsClicked(object sender, RoutedEventArgs e)
     {
-        var dialog = new SettingsWindow(ShowVideos, _includeSystemFolders, EnsureUpdateCenter())
+        var dialog = new SettingsWindow(ShowVideos, _includeSystemFolders, EnsureUpdateCenter(), BackgroundWorkController.Shared.Mode)
         {
             Owner = this
         };
@@ -196,6 +199,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
+        BackgroundWorkController.Shared.Mode = dialog.LoadMode;
         ShowVideos = dialog.ShowVideos;
         _includeSystemFolders = dialog.IncludeSystemFolders;
         ShowVideosCheckBox.IsChecked = ShowVideos;

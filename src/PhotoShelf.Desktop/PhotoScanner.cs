@@ -93,7 +93,7 @@ public static class PhotoScanner
 
     public static Task ScanAsync(IEnumerable<string> roots, Func<PhotoScanBatch, Task> apply,
         bool includeSystemFolders, CancellationToken cancellationToken, string[]? excluded = null, bool recursive = true,
-        FolderInclusionRules? inclusion = null)
+        FolderInclusionRules? inclusion = null, Func<CancellationToken, Task>? checkpoint = null)
     {
         var rules = inclusion?.Snapshot() ?? new FolderInclusionRules(excluded ?? []);
         return Task.Run(async () =>
@@ -102,17 +102,20 @@ public static class PhotoScanner
             var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var batch = new List<string>(64);
             var seen = 0;
+            var enumerated = 0;
             var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false,
                 AttributesToSkip = FileAttributes.ReparsePoint | (includeSystemFolders ? 0 : FileAttributes.Hidden | FileAttributes.System | FileAttributes.Temporary) };
             while (pending.TryDequeue(out var folder))
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (checkpoint is not null) await checkpoint(cancellationToken).ConfigureAwait(false);
                 if (!visited.Add(folder) || !rules.MayContainIncluded(folder) || IsIgnoredPath(folder, includeSystemFolders)) continue;
                 try
                 {
                     if (rules.IsIncluded(folder)) foreach (var path in Directory.EnumerateFiles(folder, "*", options))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
+                        if (++enumerated % 64 == 0 && checkpoint is not null) await checkpoint(cancellationToken).ConfigureAwait(false);
                         if (!PhotoItem.IsSupported(path) || IsIgnoredPath(path, includeSystemFolders)) continue;
                         batch.Add(path); seen++;
                         if (batch.Count < 64) continue;
@@ -122,6 +125,7 @@ public static class PhotoScanner
                     if (recursive) foreach (var child in Directory.EnumerateDirectories(folder, "*", options))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
+                        if (++enumerated % 64 == 0 && checkpoint is not null) await checkpoint(cancellationToken).ConfigureAwait(false);
                         if (rules.MayContainIncluded(child)) pending.Enqueue(child);
                     }
                 }

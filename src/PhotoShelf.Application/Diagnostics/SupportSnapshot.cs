@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using PhotoShelf.Application.Background;
 using System.Text.Json;
 
 namespace PhotoShelf.Application.Diagnostics;
@@ -6,7 +7,7 @@ namespace PhotoShelf.Application.Diagnostics;
 /// <summary>A support export built from an explicit allowlist; never reads original logs, catalogs, or media.</summary>
 public static class SupportSnapshot
 {
-    public static string Create(string version, bool legacyCatalog, int currentSessionErrors)
+    public static string Create(string version, bool legacyCatalog, int currentSessionErrors, BackgroundWorkController? background = null, int pending = 0, int running = 0)
     {
         if (version.Length > 100 || !version.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '-' or '+'))
             version = "unknown";
@@ -16,8 +17,9 @@ public static class SupportSnapshot
             runtime = Environment.Version.ToString(), architecture = RuntimeInformation.ProcessArchitecture.ToString(),
             platform = OperatingSystem.IsWindows() ? "Windows" : OperatingSystem.IsMacOS() ? "macOS" : "Other",
             legacyCatalog, currentSessionErrors = Math.Max(0, currentSessionErrors),
+            background = background is null ? null : new { current = background.Snapshot(pending, running), history = background.History() },
             originalMediaIncluded = false, filePathsIncluded = false, rawLogsIncluded = false,
             note = "Minimal support summary. Raw exception messages, filenames, database contents and computer/user names are excluded."
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, new JsonSerializerOptions { WriteIndented = true, Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } });
     }
 }

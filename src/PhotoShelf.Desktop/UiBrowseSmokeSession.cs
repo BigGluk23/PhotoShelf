@@ -11,7 +11,7 @@ using PhotoShelf.Application.Catalog;
 namespace PhotoShelf.Desktop;
 
 /// <summary>Actual production browse/monitor/metadata interactions on owned synthetic files.</summary>
-internal sealed class UiBrowseSmokeSession
+internal sealed partial class UiBrowseSmokeSession
 {
     private const int NoiseDirectoriesPerPhase = 1100;
     private readonly Dictionary<string, byte[]> _originalHashes = new(StringComparer.OrdinalIgnoreCase);
@@ -173,6 +173,7 @@ internal sealed class UiBrowseSmokeSession
 
         await VerifySearchSortAsync(window);
         await VerifyBackgroundPauseAsync(window);
+        await VerifyBackgroundSoakAsync(window);
 
         _phase = "original-byte-verification";
         await Task.Run(() =>
@@ -434,6 +435,7 @@ internal sealed class UiBrowseSmokeSession
             selectionChecks = _searchSortSelectionChecks, anchorChecks = _searchSortAnchorChecks,
             rapidSearchVerified = _searchSortRapidVerified, wrongSearchPublications = _wrongSearchPublications,
             decodedPngVerified = _searchSortDecoderVerified, cases = _searchSortCases },
+        backgroundSoak = _soakReport,
         decoderReadersDrained = _readersDrained, catalogWritersDrained = _writersDrained, gracefulExit = GracefulExit,
         elapsedMs = _elapsed.Elapsed.TotalMilliseconds, errorCount = ErrorReporter.ErrorCount, exitCode,
         scope = "Actual production handlers, WPF decoded PNG, SQLite, metadata and filesystem monitoring; synthetic files only. Video count, not video decoding. CPU is observational; no physical input/DPI matrix."

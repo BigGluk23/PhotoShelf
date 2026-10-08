@@ -42,6 +42,14 @@
 
                     <Separator Margin="0,18,0,14" />
 
+                    <TextBlock Text="Фоновая обработка" FontSize="16" FontWeight="SemiBold" />
+                    <ComboBox x:Name="BackgroundLoadModeBox" Margin="0,10,0,8" SelectedIndex="1">
+                        <ComboBoxItem Content="Тихий — меньше фоновой нагрузки" />
+                        <ComboBoxItem Content="Сбалансированный" />
+                        <ComboBoxItem Content="Максимальная скорость" />
+                    </ComboBox>
+                    <TextBlock Text="При прокрутке, просмотре и работе от батареи фон автоматически замедляется. Режим меняет паузы между чтениями, а не качество фото. Прогресс и пауза доступны в «Операциях»." TextWrapping="Wrap" Foreground="#FF77706A" />
+                    <Separator Margin="0,18,0,14" />
                     <TextBlock Text="Каталог и кэш" FontSize="16" FontWeight="SemiBold" />
                     <TextBlock Margin="0,8,0,0" Text="Служебная папка:" Foreground="#FF77706A" />
                     <TextBox x:Name="CatalogPathBox" Margin="0,4,0,0" IsReadOnly="True" TextWrapping="NoWrap" />
