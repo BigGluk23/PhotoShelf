@@ -34,7 +34,7 @@ internal sealed partial class UiBrowseSmokeSession
         pulse.Tick += (_, _) => { var now = elapsed.Elapsed.TotalMilliseconds; maxGap = Math.Max(maxGap, now - lastTick); lastTick = now; };
         window.FingerprintReader = (path, token) =>
         {
-            if (Path.GetDirectoryName(path) == root && !Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal))
+            if (string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase) && !Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal))
                 reads.AddOrUpdate(path, 1, (_, count) => count + 1);
             return originalReader(path, token);
         };
@@ -62,9 +62,15 @@ internal sealed partial class UiBrowseSmokeSession
             });
             await window.ToggleBackgroundProcessingAsync();
             var store = new SqliteDesktopCatalogStore();
-            await UntilAsync(async () => await store.GetItemAsync(Path.Combine(root, "fixture.heic")) is { MetadataIndexed: true } && !window.BrowseSmokeBusy,
+            await UntilAsync(async () => await store.GetItemAsync(Path.Combine(root, "fixture.heic")) is { MetadataIndexed: true } &&
+                fixtures.Keys.All(path => reads.GetValueOrDefault(path) >= 1) && !window.BrowseSmokeBusy,
                 "Soak fixtures did not finish background processing.", 40);
-            Require(fixtures.Keys.All(path => reads.GetValueOrDefault(path) == 1), "Initial fingerprint pass did not read each fixture exactly once.");
+            // A predecessor may finish before its Dispatcher-posted refresh has started.
+            // Wait for observable work on every fixture, then a sustained idle boundary.
+            await Task.Delay(500);
+            await UntilAsync(() => Task.FromResult(!window.BrowseSmokeBusy), "Initial visual indexing did not settle.", 30);
+            Require(fixtures.Keys.All(path => reads.GetValueOrDefault(path) == 1),
+                "Initial fingerprint counts: " + string.Join(", ", fixtures.Keys.Select(path => Path.GetFileName(path) + "=" + reads.GetValueOrDefault(path))));
             var originalIds = new Dictionary<string, string>();
             foreach (var path in fixtures.Keys) originalIds.Add(path, (await store.GetItemAsync(path))!.AssetId);
             elapsed.Restart(); lastTick = 0; maxGap = 0;
