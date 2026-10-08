@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace PhotoShelf.Application.Updates.Installation;
 
 /// <summary>
@@ -9,13 +11,60 @@ public static class UpdateStorageCleanup
     private static readonly TimeSpan RequestLifetime = TimeSpan.FromMinutes(31);
 
     public static void CleanupAtStartup(string stagingRoot, string? preservedStageId,
-        string? requestsRoot = null, string? preservedRequestId = null, DateTimeOffset? now = null)
+        string? requestsRoot = null, string? preservedRequestId = null, DateTimeOffset? now = null,
+        string? operationsRoot = null)
     {
-        var keepStage = NormalizeId(preservedStageId);
-        var keepRequest = NormalizeId(preservedRequestId);
-        CleanupStages(stagingRoot, keepStage);
+        // A successor may still be opening its catalog. Its version number is not startup health.
+        if (!string.IsNullOrEmpty(preservedRequestId)) return;
+        var stages = new HashSet<string>(StringComparer.Ordinal);
+        var requests = new HashSet<string>(StringComparer.Ordinal);
+        if (NormalizeId(preservedStageId) is { } stageId) stages.Add(stageId);
+        // After a crash, environment variables are gone; durable claims still protect transport.
+        if (!CollectUnconfirmedInstallations(stagingRoot, operationsRoot, stages, requests)) return;
+        CleanupStages(stagingRoot, stages);
         if (!string.IsNullOrWhiteSpace(requestsRoot))
-            CleanupExpiredRequests(requestsRoot, keepRequest, now ?? DateTimeOffset.UtcNow);
+            CleanupExpiredRequests(requestsRoot, requests, now ?? DateTimeOffset.UtcNow);
+    }
+
+    private static bool CollectUnconfirmedInstallations(string stagingRoot, string? operationsRoot,
+        HashSet<string> stages, HashSet<string> requests)
+    {
+        if (operationsRoot is null) return true;
+        try
+        {
+            UpdateInstallationPaths.RejectLinks(operationsRoot, allowMissing: true);
+            if (!Directory.Exists(operationsRoot)) return true;
+            foreach (var operation in Directory.EnumerateDirectories(operationsRoot))
+            {
+                var requestId = NormalizeId(Path.GetFileName(operation));
+                if (requestId is null) continue;
+                UpdateInstallationPaths.RejectLinks(operation);
+                UpdateInstallRequest request;
+                try { request = UpdateInstallationPaths.ReadJson<UpdateInstallRequest>(Path.Combine(operation, "request-claimed.json")); }
+                catch (FileNotFoundException) { continue; }
+                if (request.ProtocolVersion != 1 || request.RequestId != requestId ||
+                    !IsImmediateGuidChild(request.StageDirectory, stagingRoot, out var stage)) return false;
+                var confirmed = false;
+                try
+                {
+                    var health = UpdateInstallationPaths.ReadJson<UpdateStartupHealthRecord>(Path.Combine(operation, "startup-ready.json"));
+                    confirmed = health.ProtocolVersion == 1 && health.RequestId == requestId &&
+                        health.State == "ready" && NormalizeId(health.InstallationId) is not null;
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+                    InvalidDataException or JsonException or ArgumentException or NotSupportedException) { }
+                if (confirmed) continue;
+                stages.Add(Path.GetFileName(stage));
+                requests.Add(requestId);
+            }
+            return true;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+            InvalidDataException or JsonException or ArgumentException or NotSupportedException)
+        {
+            // Unreadable/unfinished claims never grant permission to discard their transport.
+            return false;
+        }
     }
 
     internal static bool TryCleanupConfirmedRequest(UpdateInstallationPaths paths, string requestId)
@@ -61,7 +110,7 @@ public static class UpdateStorageCleanup
         }
     }
 
-    private static void CleanupStages(string stagingRoot, string? preservedStageId)
+    private static void CleanupStages(string stagingRoot, HashSet<string> preservedStages)
     {
         try
         {
@@ -71,7 +120,7 @@ public static class UpdateStorageCleanup
             foreach (var directory in Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly))
             {
                 var id = NormalizeId(Path.GetFileName(directory));
-                if (id is null || id == preservedStageId) continue;
+                if (id is null || preservedStages.Contains(id)) continue;
                 TryDeleteOwnedStage(directory, root);
             }
         }
@@ -82,7 +131,7 @@ public static class UpdateStorageCleanup
         }
     }
 
-    private static void CleanupExpiredRequests(string requestsRoot, string? preservedRequestId, DateTimeOffset now)
+    private static void CleanupExpiredRequests(string requestsRoot, HashSet<string> preservedRequests, DateTimeOffset now)
     {
         try
         {
@@ -92,7 +141,7 @@ public static class UpdateStorageCleanup
             foreach (var file in Directory.EnumerateFiles(root, "*.json", SearchOption.TopDirectoryOnly))
             {
                 var id = OwnedRequestArtifactId(Path.GetFileName(file));
-                if (id is null || id == preservedRequestId) continue;
+                if (id is null || preservedRequests.Contains(id)) continue;
                 try
                 {
                     UpdateInstallationPaths.RejectLinks(file);

@@ -27,7 +27,7 @@ DESKTOP_ASSERTIONS = {"normalOldEntrypoint", "realInstallButton", "oldProcessExi
                       "newProcessLaunched", "startupReadyReceipt", "viewRestored", "syntheticCatalogPreserved",
                       "syntheticOriginalsPreserved", "journalsPreserved", "oldShortcutRedirects", "noApplicationErrors",
                       "repeatedLaunchBeforePointerBlocked", "repeatedLaunchAfterPointerBlocked",
-                      "repeatedLaunchBeforeHealthBlocked"}
+                      "repeatedLaunchBeforeHealthBlocked", "unconfirmedTransportPreserved", "confirmedTransportCleaned"}
 
 
 def release_identity(version, commit, tag):

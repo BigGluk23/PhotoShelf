@@ -39,6 +39,8 @@ public sealed class PerceptualFingerprintStore
 {
     private readonly string _connectionString;
     private readonly string _directory;
+    // Per-instance test observation of the actual SQLite VM; production callers leave it unset.
+    internal Func<SqliteConnection, IDisposable>? ObserveCandidateQuery { get; init; }
 
     public PerceptualFingerprintStore(string? catalogDirectory = null)
     {
@@ -204,6 +206,7 @@ public sealed class PerceptualFingerprintStore
         command.Parameters.AddWithValue("$maximumDistance", maximumDifferenceDistance);
         command.Parameters.AddWithValue("$limit", limit);
         var candidates = new List<SavedPerceptualFingerprint>();
+        using var observation = ObserveCandidateQuery?.Invoke(connection);
         try
         {
             await using var reader = await command.ExecuteReaderAsync(token);

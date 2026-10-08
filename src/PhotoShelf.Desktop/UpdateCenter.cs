@@ -13,6 +13,7 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
     private readonly UpdatePreferencesStore _store;
     private readonly string _stagingRoot;
     private readonly string? _requestsRoot;
+    private readonly string? _operationsRoot;
     private readonly Func<StagedUpdate, Task> _install;
     private readonly string _publicKey;
     private readonly Func<DateTimeOffset> _clock;
@@ -30,10 +31,11 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
 
     public UpdateCenter(IUpdateService service, UpdatePreferencesStore store, string stagingRoot,
         string currentVersion, string publicKey, Func<StagedUpdate, Task> install, Func<DateTimeOffset>? clock = null,
-        string? requestsRoot = null)
+        string? requestsRoot = null, string? operationsRoot = null)
     {
         _service = service; _store = store; _stagingRoot = stagingRoot;
         _requestsRoot = requestsRoot;
+        _operationsRoot = operationsRoot;
         CurrentVersion = currentVersion; _publicKey = publicKey; _install = install;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
@@ -71,8 +73,10 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
         catch (OperationCanceledException) { return; }
         catch (Exception) { _preferences = new UpdatePreferences { AutoCheck = false }; }
         if (_disposed) return;
-        await Task.Run(() => UpdateStorageCleanup.CleanupAtStartup(_stagingRoot, _preferences.PreparedStageId,
-            _requestsRoot, Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable), _clock()), _lifetime.Token);
+        var startupPending = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable)) ||
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(UpdateStartupHealth.InstallationVariable));
+        if (!startupPending)
+            await CleanupTransportAsync(_preferences.PreparedStageId);
         if (_preferences.PreparedStageId is { } id && Guid.TryParseExact(id, "N", out _))
         {
             var keepPreparedStage = false;
@@ -88,12 +92,12 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
                     _status = "Загрузка сохранена. Перед установкой пакет будет проверен ещё раз.";
                     // Restoring downloaded state never grants permission to install or notify on startup.
                 }
-                else discardObsoleteStage = true;
+                else discardObsoleteStage = !startupPending;
             }
             catch (Exception) { /* Retain uncertain staged files; never activate or treat them as trusted. */ }
             if (discardObsoleteStage)
-                await Task.Run(() => UpdateStorageCleanup.CleanupAtStartup(_stagingRoot, null), _lifetime.Token);
-            if (!keepPreparedStage && (discardObsoleteStage || !Directory.Exists(Path.Combine(_stagingRoot, id))))
+                await CleanupTransportAsync(null);
+            if (!startupPending && !keepPreparedStage && (discardObsoleteStage || !Directory.Exists(Path.Combine(_stagingRoot, id))))
             {
                 _preferences = _preferences with { PreparedStageId = null };
                 try { await SavePreferencesAsync(); } catch (Exception) { }
@@ -101,6 +105,10 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
         }
         _initialized = true; Changed();
     }
+
+    private Task CleanupTransportAsync(string? preparedStageId) => Task.Run(() =>
+        UpdateStorageCleanup.CleanupAtStartup(_stagingRoot, preparedStageId, _requestsRoot,
+            now: _clock(), operationsRoot: _operationsRoot), _lifetime.Token);
 
     public async Task CheckOnStartupAsync()
     {

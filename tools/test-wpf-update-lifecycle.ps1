@@ -100,6 +100,11 @@ foreach ($checkpoint in @('before-pointer-publish', 'pointer-published')) {
     Replace-OwnedSourceOnce 'src/PhotoShelf.Application/Updates/Installation/UpdateInstaller.cs' $before `
         ($before + "`n        UpdateLifecycleTestGate.Wait(`"$checkpoint`");")
 }
+# Force update-center initialization while the successor is still unconfirmed. This is
+# the real cleanup path; compile-time scheduling in this owned copy avoids a timing race.
+$beforeReady = 'private async Task ReportUpdatedStartupReadyAsync()'
+Replace-OwnedSourceOnce 'src/PhotoShelf.Desktop/MainWindow.Updates.cs' $beforeReady `
+    ('private async Task ReportUpdatedStartupReadyAsync() { if (Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable) is not null && EnsureUpdateCenter() is { } updates) await updates.InitializeAsync(); await ReportUpdatedStartupReadyCoreAsync(); }' + "`n    private async Task ReportUpdatedStartupReadyCoreAsync()")
 $beforeHealth = 'UpdateStartupHealth.ReportReady(Environment.ProcessPath!, _updatePaths)'
 $instrumentedHealth = '{ if (Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable) is not null) UpdateLifecycleTestGate.Wait("candidate-before-health"); ' + $beforeHealth + '; }'
 Replace-OwnedSourceOnce 'src/PhotoShelf.Desktop/MainWindow.Updates.cs' $beforeHealth $instrumentedHealth
