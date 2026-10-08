@@ -90,6 +90,7 @@ jobs:
         shell: pwsh
         env:
           PHOTOSHELF_SCALE_DIAGNOSTICS: ${{ github.workspace }}/TestResults/scale
+          PHOTOSHELF_SCALE_DATA_ROOT: ${{ runner.temp }}
         run: |
           $ErrorActionPreference = 'Stop'
           $results = 'TestResults/scale'

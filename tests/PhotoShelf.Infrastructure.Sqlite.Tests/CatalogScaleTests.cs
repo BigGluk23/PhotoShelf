@@ -16,7 +16,11 @@ public sealed class CatalogScaleTests(ITestOutputHelper output)
     [Trait("Category","CatalogScale")]
     public async Task LargeCatalogReturnsBoundedPagesWithoutMaterializingAllItems(int count)
     {
-        var root=Path.Combine(Path.GetTempPath(),"photoshelf-scale-"+Guid.NewGuid().ToString("N"));
+        // CI uses its explicit scratch disk to separate runner storage from system
+        // profile TEMP latency. The same real
+        // writer, FULL/WAL, transaction size and row counts are exercised on either path.
+        var root=Path.Combine(Environment.GetEnvironmentVariable("PHOTOSHELF_SCALE_DATA_ROOT") ?? Path.GetTempPath(),
+            "photoshelf-scale-"+Guid.NewGuid().ToString("N"));
         var diagnostics = Environment.GetEnvironmentVariable("PHOTOSHELF_SCALE_DIAGNOSTICS");
         void Stage(string phase)
         {
@@ -41,7 +45,7 @@ public sealed class CatalogScaleTests(ITestOutputHelper output)
         }
         try
         {
-            Stage("initialize-start");
+            Stage($"initialize-start volume={Path.GetPathRoot(root)}");
             var store=new SqliteDesktopCatalogStore(root);await store.InitializeAsync();
             Stage("seed-start");
             var watch=Stopwatch.StartNew();
