@@ -148,6 +148,19 @@ internal static class Program
             }, "New actual WPF application did not show its catalog before startup health.", 30);
             RequireGateRecord("candidate-before-health.reached.json", "candidate-before-health", successor!.Id, "1.11.2");
             Require(!HasReadyReceipt(paths), "The candidate wrote health before its checkpoint was released.");
+            var requestPath = Directory.GetFiles(paths.RequestsRoot, "*.json", SearchOption.TopDirectoryOnly)
+                .Single(path => !path.EndsWith(".view.json", StringComparison.Ordinal));
+            var viewPath = Path.ChangeExtension(requestPath, ".view.json");
+            string requestId;
+            string stageDirectory;
+            using (var request = JsonDocument.Parse(await File.ReadAllTextAsync(requestPath)))
+            {
+                requestId = request.RootElement.GetProperty("requestId").GetString()!;
+                stageDirectory = request.RootElement.GetProperty("stageDirectory").GetString()!;
+                Require(request.RootElement.GetProperty("parentProcessId").GetInt32() == old.Id &&
+                    request.RootElement.GetProperty("expectedVersion").GetString() == "1.11.2",
+                    "Install request lost parent/version identity before startup health.");
+            }
             await AssertRepeatedLaunchBlockedAsync(oldExe, "candidate-before-health", catalog, rowsBefore, journalsBefore);
             Assertions["repeatedLaunchBeforeHealthBlocked"] = true;
             ReleaseGate("candidate-before-health");
@@ -161,13 +174,12 @@ internal static class Program
             }, "Actual new application's first projection never wrote its startup-ready receipt.");
             var receipt = JsonSerializer.Deserialize<UpdateStartupHealthRecord>(await File.ReadAllTextAsync(receiptPath!), Json)!;
             Require(receipt.State == "ready" && receipt.InstallationId == active!.InstallationId &&
-                Guid.TryParseExact(receipt.RequestId, "N", out _), "Receipt is not tied to the activated successor.");
-            var requestPath = Path.Combine(paths.RequestsRoot, receipt.RequestId + ".json");
-            using (var request = JsonDocument.Parse(await File.ReadAllTextAsync(requestPath)))
-            {
-                Require(request.RootElement.GetProperty("parentProcessId").GetInt32() == old.Id &&
-                    request.RootElement.GetProperty("expectedVersion").GetString() == "1.11.2", "Install request lost parent/version identity.");
-            }
+                receipt.RequestId == requestId && Guid.TryParseExact(receipt.RequestId, "N", out _),
+                "Receipt is not tied to the activated successor.");
+            Require(!File.Exists(requestPath), "A confirmed startup retained its consumed one-time request.");
+            Require(!File.Exists(viewPath), "A confirmed startup retained its one-time view-resume hint.");
+            Require(!Directory.Exists(stageDirectory), "A confirmed startup retained its verified staging directory.");
+            Assertions["confirmedTransportCleaned"] = true;
             Assertions["startupReadyReceipt"] = true;
             RequireVersion(active!.ExecutablePath, 2);
             Assertions["newProcessLaunched"] = true;

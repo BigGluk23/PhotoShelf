@@ -172,6 +172,7 @@ public sealed class PerceptualFingerprintStore
         if (maximumDifferenceDistance is < 0 or > 3) throw new ArgumentOutOfRangeException(nameof(maximumDifferenceDistance));
         if (limit is < 1 or > 2048) throw new ArgumentOutOfRangeException(nameof(limit));
         await using var connection = await OpenAsync(token);
+        using var interrupt = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(connection.Handle));
         connection.CreateFunction<long, long, int>("ps_hamming", (left, right) =>
             BitOperations.PopCount(unchecked((ulong)left) ^ unchecked((ulong)right)));
         await using var command = connection.CreateCommand();
@@ -203,17 +204,24 @@ public sealed class PerceptualFingerprintStore
         command.Parameters.AddWithValue("$maximumDistance", maximumDifferenceDistance);
         command.Parameters.AddWithValue("$limit", limit);
         var candidates = new List<SavedPerceptualFingerprint>();
-        await using var reader = await command.ExecuteReaderAsync(token);
-        while (await reader.ReadAsync(token))
+        try
         {
-            var candidateFingerprint = new PerceptualFingerprint(fingerprint.AlgorithmVersion,
-                unchecked((ulong)reader.GetInt64(5)), unchecked((ulong)reader.GetInt64(6)),
-                reader.GetInt32(7), reader.GetInt32(8));
-            candidates.Add(new(reader.GetString(0), reader.GetString(1), reader.GetInt64(2),
-                reader.GetInt64(3) == 0 ? null : new DateTime(reader.GetInt64(3), DateTimeKind.Utc).ToLocalTime(),
-                reader.GetInt64(4), candidateFingerprint, reader.GetInt32(9), reader.GetInt32(10)));
+            await using var reader = await command.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token))
+            {
+                var candidateFingerprint = new PerceptualFingerprint(fingerprint.AlgorithmVersion,
+                    unchecked((ulong)reader.GetInt64(5)), unchecked((ulong)reader.GetInt64(6)),
+                    reader.GetInt32(7), reader.GetInt32(8));
+                candidates.Add(new(reader.GetString(0), reader.GetString(1), reader.GetInt64(2),
+                    reader.GetInt64(3) == 0 ? null : new DateTime(reader.GetInt64(3), DateTimeKind.Utc).ToLocalTime(),
+                    reader.GetInt64(4), candidateFingerprint, reader.GetInt32(9), reader.GetInt32(10)));
+            }
+            return candidates;
         }
-        return candidates;
+        catch (SqliteException) when (token.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(token);
+        }
     }, token);
 
     /// <summary>

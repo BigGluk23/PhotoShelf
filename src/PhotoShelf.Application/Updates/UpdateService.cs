@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using PhotoShelf.Application.Updates.Installation;
 
 namespace PhotoShelf.Application.Updates;
 
@@ -127,22 +128,30 @@ public sealed class UpdateService : IUpdateService
                 UpdatePackageVerifier.RejectReparseAncestors(root);
                 RequireSpace(root, verified.Manifest);
                 var stage = Path.Combine(root, Guid.NewGuid().ToString("N"));
-                Directory.CreateDirectory(stage);
-                var zipPath = Path.Combine(stage, "package.zip");
-                var pendingPath = Path.Combine(stage, "package.download");
-                await DownloadPackageAsync(verified, pendingPath, progress, cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-                File.Move(pendingPath, zipPath, overwrite: false);
-                progress?.Report(new UpdateDownloadProgress(verified.Manifest.PackageBytes, verified.Manifest.PackageBytes, "Проверка и распаковка"));
-                await UpdatePackageVerifier.ExtractAsync(zipPath, Path.Combine(stage, "package"), verified, cancellationToken).ConfigureAwait(false);
-                var packageDirectory = Path.Combine(stage, "package");
-                var files = await UpdatePackageVerifier.VerifyExtractedDirectoryAsync(packageDirectory, verified, cancellationToken).ConfigureAwait(false);
-                WriteNewDurable(Path.Combine(stage, "photoshelf-update.json"), verified.ManifestBytes.Span);
-                WriteNewDurable(Path.Combine(stage, "photoshelf-update.sig"), verified.SignatureBytes.Span);
-                // ZIP was authenticated while streaming; avoid hashing the complete download and extraction twice.
-                // The separate helper performs full independent VerifyStagedAsync again after explicit install consent.
-                return new StagedUpdate(stage, zipPath, packageDirectory, Path.Combine(stage, "photoshelf-update.json"),
-                    Path.Combine(stage, "photoshelf-update.sig"), verified, files);
+                try
+                {
+                    Directory.CreateDirectory(stage);
+                    var zipPath = Path.Combine(stage, "package.zip");
+                    var pendingPath = Path.Combine(stage, "package.download");
+                    await DownloadPackageAsync(verified, pendingPath, progress, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    File.Move(pendingPath, zipPath, overwrite: false);
+                    progress?.Report(new UpdateDownloadProgress(verified.Manifest.PackageBytes, verified.Manifest.PackageBytes, "Проверка и распаковка"));
+                    await UpdatePackageVerifier.ExtractAsync(zipPath, Path.Combine(stage, "package"), verified, cancellationToken).ConfigureAwait(false);
+                    var packageDirectory = Path.Combine(stage, "package");
+                    var files = await UpdatePackageVerifier.VerifyExtractedDirectoryAsync(packageDirectory, verified, cancellationToken).ConfigureAwait(false);
+                    WriteNewDurable(Path.Combine(stage, "photoshelf-update.json"), verified.ManifestBytes.Span);
+                    WriteNewDurable(Path.Combine(stage, "photoshelf-update.sig"), verified.SignatureBytes.Span);
+                    // ZIP was authenticated while streaming; avoid hashing the complete download and extraction twice.
+                    // The separate helper performs full independent VerifyStagedAsync again after explicit install consent.
+                    return new StagedUpdate(stage, zipPath, packageDirectory, Path.Combine(stage, "photoshelf-update.json"),
+                        Path.Combine(stage, "photoshelf-update.sig"), verified, files);
+                }
+                catch
+                {
+                    UpdateStorageCleanup.TryDeleteOwnedStage(stage, root);
+                    throw;
+                }
             }, cancellationToken).ConfigureAwait(false);
         }
         finally { _downloadGate.Release(); }

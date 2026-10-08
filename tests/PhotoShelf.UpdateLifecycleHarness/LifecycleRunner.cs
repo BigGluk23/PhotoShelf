@@ -137,7 +137,20 @@ internal sealed class LifecycleRunner : IDisposable
         var afterKill = Resolve(scenario);
         Require(afterKill == atBoundary, "Process death must retain the last complete active pointer.");
         Require(File.Exists(scenario.Previous.ExecutablePath), "The old executable must survive interruption.");
-        Require(File.Exists(scenario.NewStage.PackagePath), "The signed staging package must survive interruption.");
+        if (activated)
+        {
+            Require(!File.Exists(scenario.NewStage.PackagePath),
+                "A stage must be removed after the candidate published durable startup health.");
+            Require(!File.Exists(request),
+                "The consumed request must be removed after the candidate published durable startup health.");
+        }
+        else
+        {
+            Require(File.Exists(scenario.NewStage.PackagePath),
+                "The signed staging package must survive interruption before activation.");
+            Require(File.Exists(request),
+                "The request must survive interruption before candidate startup health.");
+        }
         AssertDataUnchanged(scenario);
 
         // Normal old-shortcut startup must obey the committed pointer and must never resume a pending request.
@@ -150,6 +163,7 @@ internal sealed class LifecycleRunner : IDisposable
         AssertDataUnchanged(scenario);
         Add(name, new { checkpoint, killedProcessId = helper.Id, activeVersion = afterKill.Version,
             resumedAutomatically = false, candidateStartedBeforeInterruption = activated,
+            stageRetained = File.Exists(scenario.NewStage.PackagePath), requestRetained = File.Exists(request),
             ordinaryShortcutLaunchesRejectedBeforePointer = rejectedShortcutLaunches,
             originalAndCatalogHashesPreserved = true, sqliteIntegrity = "ok" });
     }

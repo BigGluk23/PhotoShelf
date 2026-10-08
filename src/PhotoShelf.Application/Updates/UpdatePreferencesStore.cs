@@ -17,6 +17,7 @@ public sealed class UpdatePreferencesStore(string path)
             {
                 try
                 {
+                    CleanupPendingFiles();
                     UpdatePackageVerifier.RejectReparseAncestors(path);
                     using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
                     if (stream.Length > MaximumBytes) return Disabled();
@@ -57,19 +58,48 @@ public sealed class UpdatePreferencesStore(string path)
                 var bytes = JsonSerializer.SerializeToUtf8Bytes(preferences with { Schema = 1 }, UpdateManifestVerifier.JsonOptions);
                 if (bytes.Length > MaximumBytes) throw new InvalidDataException("Update preferences exceed supported bounds.");
                 var temporary = fullPath + ".pending-" + Guid.NewGuid().ToString("N");
-                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    4096, FileOptions.WriteThrough))
+                try
                 {
-                    stream.Write(bytes);
-                    stream.Flush(flushToDisk: true);
+                    using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        4096, FileOptions.WriteThrough))
+                    {
+                        stream.Write(bytes);
+                        stream.Flush(flushToDisk: true);
+                    }
+                    // One atomic name replacement: failed writes leave the previous opt-out intact.
+                    cancellationToken.ThrowIfCancellationRequested();
+                    File.Move(temporary, fullPath, overwrite: true);
                 }
-                // One atomic name replacement: failed writes leave the previous opt-out intact.
-                cancellationToken.ThrowIfCancellationRequested();
-                File.Move(temporary, fullPath, overwrite: true);
+                finally { TryDelete(temporary); }
             }, cancellationToken).ConfigureAwait(false);
         }
         finally { _gate.Release(); }
     }
 
     private static UpdatePreferences Disabled() => new() { AutoCheck = false };
+
+    private void CleanupPendingFiles()
+    {
+        var fullPath = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(fullPath)!;
+        if (!Directory.Exists(directory)) return;
+        UpdatePackageVerifier.RejectReparseAncestors(directory);
+        var prefix = Path.GetFileName(fullPath) + ".pending-";
+        foreach (var candidate in Directory.EnumerateFiles(directory, prefix + "*", SearchOption.TopDirectoryOnly))
+        {
+            var suffix = Path.GetFileName(candidate)[prefix.Length..];
+            if (Guid.TryParseExact(suffix, "N", out _)) TryDelete(candidate);
+        }
+    }
+
+    private static void TryDelete(string file)
+    {
+        try
+        {
+            UpdatePackageVerifier.RejectReparseAncestors(file);
+            File.Delete(file);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+            InvalidDataException or ArgumentException or NotSupportedException) { }
+    }
 }

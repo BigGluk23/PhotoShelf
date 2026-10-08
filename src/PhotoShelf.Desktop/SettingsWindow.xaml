@@ -36,7 +36,7 @@
                     <CheckBox x:Name="IncludeSystemFoldersCheckBox" Margin="0,8,0,0" Content="Показывать и сканировать системные/скрытые папки" />
 
                     <TextBlock Margin="0,8,0,0"
-                               Text="Если системные папки выключены, PhotoShelf не будет тащить в библиотеку Windows, Program Files, временные папки и кэши."
+                               Text="Если выключено, пропускаются Windows, Program Files, ProgramData, настоящий системный TEMP и элементы с атрибутами Hidden/System/Temporary. Обычные пользовательские папки с именами Cache или Temp сканируются. Корзина, карантин и служебные данные PhotoShelf исключены всегда."
                                Foreground="#FF77706A"
                                TextWrapping="Wrap" />
 

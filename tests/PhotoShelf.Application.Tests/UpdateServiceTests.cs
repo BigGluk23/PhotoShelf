@@ -197,6 +197,7 @@ public sealed class UpdateServiceTests
         var release = (await service.CheckAsync()).Release!;
         await Assert.ThrowsAsync<InvalidDataException>(() => service.DownloadAndStageAsync(release, fixture.Root));
         Assert.Empty(Directory.GetFiles(fixture.Root, "photoshelf-update.json", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetDirectories(fixture.Root));
     }
 
     [Fact]
@@ -209,6 +210,7 @@ public sealed class UpdateServiceTests
         var release = (await service.CheckAsync()).Release!;
         await Assert.ThrowsAsync<InvalidDataException>(() => service.DownloadAndStageAsync(release, fixture.Root));
         Assert.Empty(Directory.GetFiles(fixture.Root, "photoshelf-update.json", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetDirectories(fixture.Root));
     }
 
     [Fact]

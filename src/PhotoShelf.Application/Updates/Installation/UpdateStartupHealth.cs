@@ -36,5 +36,8 @@ public static class UpdateStartupHealth
         File.Move(pending, path, overwrite: false);
         Environment.SetEnvironmentVariable(RequestVariable, null);
         Environment.SetEnvironmentVariable(InstallationVariable, null);
+        // The final health receipt is durable and the installed copy no longer reads staging.
+        // Cleanup is best effort and strictly limited to the stage named by this consumed request.
+        UpdateStorageCleanup.TryCleanupConfirmedRequest(paths, requestId!);
     }
 }

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
 using PhotoShelf.Application.Updates;
+using PhotoShelf.Application.Updates.Installation;
 
 namespace PhotoShelf.Desktop;
 
@@ -11,6 +12,7 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
     private readonly IUpdateService _service;
     private readonly UpdatePreferencesStore _store;
     private readonly string _stagingRoot;
+    private readonly string? _requestsRoot;
     private readonly Func<StagedUpdate, Task> _install;
     private readonly string _publicKey;
     private readonly Func<DateTimeOffset> _clock;
@@ -27,9 +29,11 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
     private StagedUpdate? _staged;
 
     public UpdateCenter(IUpdateService service, UpdatePreferencesStore store, string stagingRoot,
-        string currentVersion, string publicKey, Func<StagedUpdate, Task> install, Func<DateTimeOffset>? clock = null)
+        string currentVersion, string publicKey, Func<StagedUpdate, Task> install, Func<DateTimeOffset>? clock = null,
+        string? requestsRoot = null)
     {
         _service = service; _store = store; _stagingRoot = stagingRoot;
+        _requestsRoot = requestsRoot;
         CurrentVersion = currentVersion; _publicKey = publicKey; _install = install;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
@@ -67,8 +71,12 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
         catch (OperationCanceledException) { return; }
         catch (Exception) { _preferences = new UpdatePreferences { AutoCheck = false }; }
         if (_disposed) return;
+        await Task.Run(() => UpdateStorageCleanup.CleanupAtStartup(_stagingRoot, _preferences.PreparedStageId,
+            _requestsRoot, Environment.GetEnvironmentVariable(UpdateStartupHealth.RequestVariable), _clock()), _lifetime.Token);
         if (_preferences.PreparedStageId is { } id && Guid.TryParseExact(id, "N", out _))
         {
+            var keepPreparedStage = false;
+            var discardObsoleteStage = false;
             try
             {
                 var staged = await UpdatePackageVerifier.ReadStagedDescriptorAsync(Path.Combine(_stagingRoot, id),
@@ -76,11 +84,20 @@ public sealed class UpdateCenter : INotifyPropertyChanged, IDisposable
                 if (UpdateVersion.IsNewer(staged.Release.Version, CurrentVersion))
                 {
                     _staged = staged; _available = staged.Release;
+                    keepPreparedStage = true;
                     _status = "Загрузка сохранена. Перед установкой пакет будет проверен ещё раз.";
                     // Restoring downloaded state never grants permission to install or notify on startup.
                 }
+                else discardObsoleteStage = true;
             }
             catch (Exception) { /* Retain uncertain staged files; never activate or treat them as trusted. */ }
+            if (discardObsoleteStage)
+                await Task.Run(() => UpdateStorageCleanup.CleanupAtStartup(_stagingRoot, null), _lifetime.Token);
+            if (!keepPreparedStage && (discardObsoleteStage || !Directory.Exists(Path.Combine(_stagingRoot, id))))
+            {
+                _preferences = _preferences with { PreparedStageId = null };
+                try { await SavePreferencesAsync(); } catch (Exception) { }
+            }
         }
         _initialized = true; Changed();
     }

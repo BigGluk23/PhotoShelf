@@ -79,6 +79,19 @@ public sealed class PerceptualFingerprintStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CandidateLookupHonorsCancellation()
+    {
+        var catalog = new SqliteDesktopCatalogStore(_root);
+        await catalog.InitializeAsync();
+        var store = new PerceptualFingerprintStore(_root);
+        await store.InitializeAsync();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.FindCandidatesAsync(
+            new PerceptualFingerprint(1, 0, 0, 20, 20), token: cancellation.Token));
+    }
+
+    [Fact]
     public async Task ObservedBatchReturnsOnlyCurrentMatchingSnapshots()
     {
         var catalog = new SqliteDesktopCatalogStore(_root);
