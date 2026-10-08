@@ -129,13 +129,25 @@ internal sealed partial class UiBrowseSmokeSession
                 cycles++;
                 // Leave a quiet interval to catch accidental self-restarting passes.
                 await Task.Delay(500);
-                Require(!window.BrowseSmokeBusy, "Unchanged library failed to remain idle.");
+                // A legitimate periodic reconciliation may coincide with this instant.
+                // Require it to settle; the read counters above detect repeated decoding.
+                await UntilAsync(() => Task.FromResult(!window.BrowseSmokeBusy), "Unchanged library did not settle after its maintenance tick.", 30);
             } while (elapsed.Elapsed.TotalSeconds < seconds || cycles < 3);
             _soakReport = new { passed = true, requestedSeconds = seconds, elapsedSeconds = elapsed.Elapsed.TotalSeconds,
                 cycles, maxDispatcherGapMs = maxGap, maxPrivateBytes = maxMemory, warmPrivateBytes = warmedMemory,
                 originalsChecked = fixtures.Count, originalHashesSizesAndTimesPreserved = true, stableAssetIds = true,
                 unchangedFingerprintsReadOnce = true, simulatedSuspendResume = true, allLoadModes = true,
                 samples = samples.ToArray(), physicalSleepTested = false, videoDecodeTested = false };
+        }
+        catch
+        {
+            _soakReport = new { passed = false, requestedSeconds = seconds, cycles,
+                elapsedSeconds = elapsed.Elapsed.TotalSeconds, maxDispatcherGapMs = maxGap,
+                // Only generated fixture basenames; never user paths or raw diagnostics.
+                fixtureReads = fixtures.Keys.Where(path => !Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal))
+                    .Select(path => new { name = Path.GetFileName(path), count = reads.GetValueOrDefault(path) }).ToArray(),
+                work = control.Snapshot(BackgroundWorkScheduler.Shared.PendingCount, BackgroundWorkScheduler.Shared.RunningCount) };
+            throw;
         }
         finally
         {
