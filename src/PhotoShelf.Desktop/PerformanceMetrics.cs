@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using PhotoShelf.Application.Background;
+using PhotoShelf.Application.Diagnostics;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -14,9 +15,9 @@ internal static class PerformanceMetrics
     private static readonly Stopwatch Uptime = Stopwatch.StartNew();
     private static DispatcherTimer? _heartbeat;
     private static System.Threading.Timer? _flush;
-    private static long _lastTick;
+    private static DispatcherHeartbeatMonitor? _dispatcherHeartbeat;
     private static int _writing;
-    private static double _lastCpuMs, _lastSampleMs, _dispatcherDelay;
+    private static double _lastCpuMs, _lastSampleMs;
     public static void Record(string metric, double milliseconds, long count = 0)
     {
         if (Pending.Count >= 512) return;
@@ -24,13 +25,11 @@ internal static class PerformanceMetrics
     }
     public static void Start(Dispatcher dispatcher)
     {
-        _lastTick = Uptime.ElapsedMilliseconds;
+        _dispatcherHeartbeat = new();
         _heartbeat = new DispatcherTimer(DispatcherPriority.Input, dispatcher) { Interval = TimeSpan.FromMilliseconds(100) };
         _heartbeat.Tick += (_, _) =>
         {
-            var now = Uptime.ElapsedMilliseconds;
-            Volatile.Write(ref _dispatcherDelay, Math.Max(0, now - _lastTick - 100));
-            Record("dispatcher.lateness", Volatile.Read(ref _dispatcherDelay)); _lastTick = now;
+            Record("dispatcher.lateness", _dispatcherHeartbeat.Tick());
         };
         _heartbeat.Start();
         _flush = new System.Threading.Timer(_ => Flush(), null, 5000, 5000);
@@ -52,7 +51,7 @@ internal static class PerformanceMetrics
             var cpu = process.TotalProcessorTime.TotalMilliseconds;
             var percent = _lastSampleMs <= 0 ? 0 : (cpu - _lastCpuMs) / Math.Max(1, now - _lastSampleMs) / Environment.ProcessorCount * 100;
             _lastCpuMs = cpu; _lastSampleMs = now;
-            BackgroundWorkController.Shared.RecordSample(percent, process.WorkingSet64, Volatile.Read(ref _dispatcherDelay),
+            BackgroundWorkController.Shared.RecordSample(percent, process.WorkingSet64, _dispatcherHeartbeat?.TakeDelayMilliseconds() ?? 0,
                 BackgroundWorkScheduler.Shared.PendingCount, BackgroundWorkScheduler.Shared.RunningCount);
             lines.Add(string.Create(CultureInfo.InvariantCulture, $"{DateTime.UtcNow:O},process.working_set_mb,0,{process.WorkingSet64 / 1048576}"));
             File.AppendAllLines(path, lines);

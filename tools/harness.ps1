@@ -246,7 +246,7 @@ try {
     if ($soak.passed -ne $true -or $soak.requestedSeconds -ne $BackgroundSoakSeconds -or
         $soak.elapsedSeconds -lt $BackgroundSoakSeconds -or $soak.cycles -lt 3 -or
         $soak.originalHashesSizesAndTimesPreserved -ne $true -or $soak.stableAssetIds -ne $true -or
-        $soak.unchangedFingerprintsReadOnce -ne $true -or $soak.simulatedSuspendResume -ne $true -or
+        $soak.unchangedFingerprintsNotReread -ne $true -or $soak.simulatedSuspendResume -ne $true -or
         $soak.allLoadModes -ne $true -or $soak.maxDispatcherGapMs -ge 5000 -or
         $soak.originalsChecked -lt 8 -or @($soak.samples).Count -lt 3) {
         throw 'Background soak did not pass its requested duration, UI, cache and original preservation checks.'

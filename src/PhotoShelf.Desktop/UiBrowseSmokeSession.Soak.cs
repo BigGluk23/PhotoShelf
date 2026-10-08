@@ -22,12 +22,14 @@ internal sealed partial class UiBrowseSmokeSession
         var root = Path.Combine(_proof, "soak");
         var fixtures = new Dictionary<string, (byte[] Hash, long Size, DateTime Modified)>();
         var reads = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var settledReads = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var originalReader = window.FingerprintReader;
         var control = BackgroundWorkController.Shared;
         var originalMode = control.Mode;
         var elapsed = Stopwatch.StartNew();
         var lastTick = elapsed.Elapsed.TotalMilliseconds;
         double maxGap = 0;
+        double previousCpuMs = 0, initialCpuMs = 0, previousSampleMs = 0, maxCpuPercent = 0, averageCpuPercent = 0;
         long maxMemory = 0, warmedMemory = 0;
         var cycles = 0; var samples = new Queue<object>();
         var pulse = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(100) };
@@ -69,11 +71,17 @@ internal sealed partial class UiBrowseSmokeSession
             // Wait for observable work on every fixture, then a sustained idle boundary.
             await Task.Delay(500);
             await UntilAsync(() => Task.FromResult(!window.BrowseSmokeBusy), "Initial visual indexing did not settle.", 30);
-            Require(fixtures.Keys.All(path => reads.GetValueOrDefault(path) == 1),
-                "Initial fingerprint counts: " + string.Join(", ", fixtures.Keys.Select(path => Path.GetFileName(path) + "=" + reads.GetValueOrDefault(path))));
+            // Creating a file emits both directory and changed-file notifications. A
+            // changed-file notification must invalidate even identical size/mtime,
+            // and can arrive after the first directory discovery/decode. Cache reuse
+            // is asserted after those initial notifications have drained, not while
+            // the fixture is still being admitted through the real watcher.
+            foreach (var path in fixtures.Keys) settledReads.Add(path, reads.GetValueOrDefault(path));
             var originalIds = new Dictionary<string, string>();
             foreach (var path in fixtures.Keys) originalIds.Add(path, (await store.GetItemAsync(path))!.AssetId);
             elapsed.Restart(); lastTick = 0; maxGap = 0;
+            using (var process = Process.GetCurrentProcess())
+                initialCpuMs = previousCpuMs = process.TotalProcessorTime.TotalMilliseconds;
             do
             {
                 control.Mode = (BackgroundLoadMode)(cycles % 3);
@@ -106,7 +114,8 @@ internal sealed partial class UiBrowseSmokeSession
                     await window.ToggleBackgroundProcessingAsync();
                     await UntilAsync(() => Task.FromResult(!window.BrowseSmokeBusy), "Soak resume did not settle.", 30);
                 }
-                Require(reads.All(pair => pair.Value == 1), "Unchanged or corrupt media were fingerprinted repeatedly.");
+                Require(settledReads.All(pair => reads.GetValueOrDefault(pair.Key) == pair.Value),
+                    "Settled unchanged or corrupt media were fingerprinted again.");
                 foreach (var pair in originalIds)
                     Require((await store.GetItemAsync(pair.Key))?.AssetId == pair.Value, "Soak lost or replaced a catalog identity.");
                 await Task.Run(() =>
@@ -117,11 +126,17 @@ internal sealed partial class UiBrowseSmokeSession
                             pair.Value.Hash.SequenceEqual(SHA256.HashData(File.ReadAllBytes(pair.Key))), "Soak changed synthetic originals.");
                 });
                 using var process = Process.GetCurrentProcess();
+                var sampleMs = elapsed.Elapsed.TotalMilliseconds;
+                var cpuMs = process.TotalProcessorTime.TotalMilliseconds;
+                var cpuPercent = Math.Clamp((cpuMs - previousCpuMs) / Math.Max(1, sampleMs - previousSampleMs) / Environment.ProcessorCount * 100, 0, 100);
+                averageCpuPercent = Math.Clamp((cpuMs - initialCpuMs) / Math.Max(1, sampleMs) / Environment.ProcessorCount * 100, 0, 100);
+                maxCpuPercent = Math.Max(maxCpuPercent, cpuPercent);
+                previousCpuMs = cpuMs; previousSampleMs = sampleMs;
                 maxMemory = Math.Max(maxMemory, process.PrivateMemorySize64);
                 if (cycles == 2) warmedMemory = process.PrivateMemorySize64;
                 if (samples.Count == 120) samples.Dequeue();
                 samples.Enqueue(new { cycle = cycles, elapsedSeconds = elapsed.Elapsed.TotalSeconds,
-                    privateBytes = process.PrivateMemorySize64, pending = BackgroundWorkScheduler.Shared.PendingCount,
+                    cpuPercent, mode = control.Mode.ToString(), privateBytes = process.PrivateMemorySize64, pending = BackgroundWorkScheduler.Shared.PendingCount,
                     running = BackgroundWorkScheduler.Shared.RunningCount });
                 Require(maxGap < 5000, "Soak observed a Dispatcher gap of five seconds or more.");
                 Require(warmedMemory == 0 || process.PrivateMemorySize64 <= warmedMemory + 256L * 1024 * 1024,
@@ -135,8 +150,11 @@ internal sealed partial class UiBrowseSmokeSession
             } while (elapsed.Elapsed.TotalSeconds < seconds || cycles < 3);
             _soakReport = new { passed = true, requestedSeconds = seconds, elapsedSeconds = elapsed.Elapsed.TotalSeconds,
                 cycles, maxDispatcherGapMs = maxGap, maxPrivateBytes = maxMemory, warmPrivateBytes = warmedMemory,
+                maxSampleCpuPercent = maxCpuPercent, averageCpuPercent,
                 originalsChecked = fixtures.Count, originalHashesSizesAndTimesPreserved = true, stableAssetIds = true,
-                unchangedFingerprintsReadOnce = true, simulatedSuspendResume = true, allLoadModes = true,
+                unchangedFingerprintsNotReread = true,
+                initialFixtureReads = settledReads.Select(pair => new { name = Path.GetFileName(pair.Key), count = pair.Value }).ToArray(),
+                simulatedSuspendResume = true, allLoadModes = true,
                 samples = samples.ToArray(), physicalSleepTested = false, videoDecodeTested = false };
         }
         catch
@@ -145,7 +163,7 @@ internal sealed partial class UiBrowseSmokeSession
                 elapsedSeconds = elapsed.Elapsed.TotalSeconds, maxDispatcherGapMs = maxGap,
                 // Only generated fixture basenames; never user paths or raw diagnostics.
                 fixtureReads = fixtures.Keys.Where(path => !Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal))
-                    .Select(path => new { name = Path.GetFileName(path), count = reads.GetValueOrDefault(path) }).ToArray(),
+                    .Select(path => new { name = Path.GetFileName(path), count = reads.GetValueOrDefault(path), baseline = settledReads.GetValueOrDefault(path) }).ToArray(),
                 work = control.Snapshot(BackgroundWorkScheduler.Shared.PendingCount, BackgroundWorkScheduler.Shared.RunningCount) };
             throw;
         }
