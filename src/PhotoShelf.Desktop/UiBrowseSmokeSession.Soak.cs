@@ -22,6 +22,7 @@ internal sealed partial class UiBrowseSmokeSession
         var root = Path.Combine(_proof, "soak");
         var fixtures = new Dictionary<string, (byte[] Hash, long Size, DateTime Modified)>();
         var reads = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var decoded = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
         var settledReads = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var originalReader = window.FingerprintReader;
         var control = BackgroundWorkController.Shared;
@@ -36,9 +37,12 @@ internal sealed partial class UiBrowseSmokeSession
         pulse.Tick += (_, _) => { var now = elapsed.Elapsed.TotalMilliseconds; maxGap = Math.Max(maxGap, now - lastTick); lastTick = now; };
         window.FingerprintReader = (path, token) =>
         {
-            if (string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase))
+            var owned = string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase);
+            if (owned)
                 reads.AddOrUpdate(path, 1, (_, count) => count + 1);
-            return originalReader(path, token);
+            var fingerprint = originalReader(path, token);
+            if (owned) decoded.TryAdd(path, 0);
+            return fingerprint;
         };
         pulse.Start();
         try
@@ -100,7 +104,7 @@ internal sealed partial class UiBrowseSmokeSession
                 window.BrowseSmokeScrollToItem(cycles % 2 == 0 ? 0 : 80);
                 await UntilAsync(() => Task.FromResult(window.BrowseSmokeTopRowPaths.Any(window.BrowseSmokeDecodedPixels)), "Soak scroll did not render a decoded preview.");
                 await UntilAsync(async () => await store.GetItemAsync(witness) is { MetadataIndexed: true } &&
-                    reads.GetValueOrDefault(witness) >= 1 && !window.BrowseSmokeBusy,
+                    decoded.ContainsKey(witness) && !window.BrowseSmokeBusy,
                     "Soak background processing failed to become idle.", 30);
                 // Inject only the policy signals. No attempt to suspend the CI host.
                 control.SetSuspended(true);
@@ -153,7 +157,7 @@ internal sealed partial class UiBrowseSmokeSession
                 cycles, maxDispatcherGapMs = maxGap, maxPrivateBytes = maxMemory, warmPrivateBytes = warmedMemory,
                 maxSampleCpuPercent = maxCpuPercent, averageCpuPercent,
                 originalsChecked = fixtures.Count, originalHashesSizesAndTimesPreserved = true, stableAssetIds = true,
-                incomingFilesDecoded = cycles,
+                incomingFilesDecoded = decoded.Keys.Count(path => Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal)),
                 unchangedFingerprintsNotReread = true,
                 initialFixtureReads = settledReads.Select(pair => new { name = Path.GetFileName(pair.Key), count = pair.Value }).ToArray(),
                 simulatedSuspendResume = true, allLoadModes = true,
