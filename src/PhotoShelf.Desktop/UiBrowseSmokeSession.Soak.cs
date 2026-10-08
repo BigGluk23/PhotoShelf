@@ -36,7 +36,7 @@ internal sealed partial class UiBrowseSmokeSession
         pulse.Tick += (_, _) => { var now = elapsed.Elapsed.TotalMilliseconds; maxGap = Math.Max(maxGap, now - lastTick); lastTick = now; };
         window.FingerprintReader = (path, token) =>
         {
-            if (string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase) && !Path.GetFileName(path).StartsWith("event-", StringComparison.Ordinal))
+            if (string.Equals(Path.GetDirectoryName(path), root, StringComparison.OrdinalIgnoreCase))
                 reads.AddOrUpdate(path, 1, (_, count) => count + 1);
             return originalReader(path, token);
         };
@@ -99,7 +99,8 @@ internal sealed partial class UiBrowseSmokeSession
                 await SettleAsync(window, Path.Combine(_mediaRoot, "SearchSort"), SearchSortFixtureCount, false);
                 window.BrowseSmokeScrollToItem(cycles % 2 == 0 ? 0 : 80);
                 await UntilAsync(() => Task.FromResult(window.BrowseSmokeTopRowPaths.Any(window.BrowseSmokeDecodedPixels)), "Soak scroll did not render a decoded preview.");
-                await UntilAsync(async () => await store.GetItemAsync(witness) is { MetadataIndexed: true } && !window.BrowseSmokeBusy,
+                await UntilAsync(async () => await store.GetItemAsync(witness) is { MetadataIndexed: true } &&
+                    reads.GetValueOrDefault(witness) >= 1 && !window.BrowseSmokeBusy,
                     "Soak background processing failed to become idle.", 30);
                 // Inject only the policy signals. No attempt to suspend the CI host.
                 control.SetSuspended(true);
@@ -152,6 +153,7 @@ internal sealed partial class UiBrowseSmokeSession
                 cycles, maxDispatcherGapMs = maxGap, maxPrivateBytes = maxMemory, warmPrivateBytes = warmedMemory,
                 maxSampleCpuPercent = maxCpuPercent, averageCpuPercent,
                 originalsChecked = fixtures.Count, originalHashesSizesAndTimesPreserved = true, stableAssetIds = true,
+                incomingFilesDecoded = cycles,
                 unchangedFingerprintsNotReread = true,
                 initialFixtureReads = settledReads.Select(pair => new { name = Path.GetFileName(pair.Key), count = pair.Value }).ToArray(),
                 simulatedSuspendResume = true, allLoadModes = true,

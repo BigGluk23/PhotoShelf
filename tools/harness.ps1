@@ -248,7 +248,7 @@ try {
         $soak.originalHashesSizesAndTimesPreserved -ne $true -or $soak.stableAssetIds -ne $true -or
         $soak.unchangedFingerprintsNotReread -ne $true -or $soak.simulatedSuspendResume -ne $true -or
         $soak.allLoadModes -ne $true -or $soak.maxDispatcherGapMs -ge 5000 -or
-        $soak.originalsChecked -lt 8 -or @($soak.samples).Count -lt 3) {
+        $soak.originalsChecked -lt 8 -or $soak.incomingFilesDecoded -ne $soak.cycles -or @($soak.samples).Count -lt 3) {
         throw 'Background soak did not pass its requested duration, UI, cache and original preservation checks.'
     }
     $result.backgroundSoakVerified = $true
