@@ -314,9 +314,59 @@ public sealed class FileMoveRecoveryTests : IDisposable
     [Fact] public void DateLayoutNeverInventsMissingCaptureDates()
     {
         var source = Write("in/p.jpg");
-        var plan = Service().Plan([new(source, null)], Out, CollisionPolicy.Rename,
+        var plan = Service().Plan([new(source, null, FileModifiedDate: new DateTime(2024, 8, 3, 4, 5, 6))], Out, CollisionPolicy.Rename,
             layout: new(FolderLayout.YearMonthDay, FileNameStyle.DatePrefix, "Семья"));
-        Assert.Equal(Path.Combine(Out, "Без даты съёмки", "Семья", "p.jpg"), Assert.Single(plan).Destination);
+        var entry = Assert.Single(plan);
+        Assert.Equal(Path.Combine(Out, "Без даты съёмки", "Семья", "p.jpg"), entry.Destination);
+        Assert.Equal(MoveDateOrigin.None, entry.OrganizationDateOrigin);
+        Assert.Null(entry.OrganizationDate);
+    }
+
+    [Fact] public void ExplicitCaptureDateFallbackUsesFileDateAndShowsItsOrigin()
+    {
+        var source = Write("in/p.jpg");
+        var fileDate = new DateTime(2024, 8, 3, 4, 5, 6);
+        var plan = Service().Plan([new(source, null, FileModifiedDate: fileDate)], Out, CollisionPolicy.Rename,
+            layout: new(FolderLayout.YearMonthDay, FileNameStyle.DatePrefix, DateSource: MoveDateSource.CaptureDateWithFileFallback));
+        var entry = Assert.Single(plan);
+        Assert.Equal(Path.Combine(Out, "2024", "08 Август", "03", "2024-08-03_04-05-06_p.jpg"), entry.Destination);
+        Assert.Equal(MoveDateOrigin.FileModifiedDate, entry.OrganizationDateOrigin);
+        Assert.Equal(fileDate, entry.OrganizationDate);
+    }
+
+    [Fact] public void CaptureDateFallbackPrefersCaptureDateWhenBothDatesExist()
+    {
+        var source = Write("in/p.jpg");
+        var captureDate = new DateTime(2023, 7, 2, 3, 4, 5);
+        var fileDate = new DateTime(2024, 8, 3, 4, 5, 6);
+        var plan = Service().Plan([new(source, captureDate, FileModifiedDate: fileDate)], Out, CollisionPolicy.Rename,
+            layout: new(FolderLayout.YearMonth, DateSource: MoveDateSource.CaptureDateWithFileFallback));
+        var entry = Assert.Single(plan);
+        Assert.Equal(Path.Combine(Out, "2023", "07 Июль", "p.jpg"), entry.Destination);
+        Assert.Equal(MoveDateOrigin.CaptureDate, entry.OrganizationDateOrigin);
+        Assert.Equal(captureDate, entry.OrganizationDate);
+    }
+
+    [Fact] public void ExplicitFileDateIgnoresCaptureDate()
+    {
+        var source = Write("in/p.jpg");
+        var fileDate = new DateTime(2024, 8, 3, 4, 5, 6);
+        var plan = Service().Plan([new(source, new DateTime(2023, 7, 2), FileModifiedDate: fileDate)], Out, CollisionPolicy.Rename,
+            layout: new(FolderLayout.Year, DateSource: MoveDateSource.FileModifiedDate));
+        var entry = Assert.Single(plan);
+        Assert.Equal(Path.Combine(Out, "2024", "p.jpg"), entry.Destination);
+        Assert.Equal(MoveDateOrigin.FileModifiedDate, entry.OrganizationDateOrigin);
+        Assert.Equal(fileDate, entry.OrganizationDate);
+    }
+
+    [Fact] public void ExplicitFileDateKeepsMissingDatesInASeparateVisibleFolder()
+    {
+        var source = Write("in/p.jpg");
+        var plan = Service().Plan([new(source, null)], Out, CollisionPolicy.Rename,
+            layout: new(FolderLayout.YearMonth, DateSource: MoveDateSource.FileModifiedDate));
+        var entry = Assert.Single(plan);
+        Assert.Equal(Path.Combine(Out, "Без даты файла", "p.jpg"), entry.Destination);
+        Assert.Equal(MoveDateOrigin.None, entry.OrganizationDateOrigin);
     }
 
     [Theory]

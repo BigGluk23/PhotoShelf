@@ -266,7 +266,8 @@ public partial class DuplicateReviewWindow : Window, INotifyPropertyChanged
             var quarantineRoot = await QuarantineConfiguration.GetOrChooseRootAsync(this);
             if (quarantineRoot is null || _closingReview || !IsLoaded) return;
             var batchRoot = Path.Combine(quarantineRoot, $"PhotoShelf-Quarantine-{DateTime.Now:yyyy-MM-dd_HH-mm-ss}-{Guid.NewGuid():N}");
-            var requests = candidates.Select(candidate => new MoveRequest(candidate.Item.Path, candidate.Item.CaptureDate)).ToArray();
+            var requests = candidates.Select(candidate => new MoveRequest(candidate.Item.Path, candidate.Item.CaptureDate,
+                FileModifiedDate: candidate.Item.FileModifiedAt)).ToArray();
             var dialog = new MovePlanWindow(requests, batchRoot, false, quarantineMode: true) { Owner = this };
             if (dialog.ShowDialog() != true || _closingReview || !IsLoaded) return;
             var plan = dialog.Plan;

@@ -232,7 +232,7 @@
                                                             <MenuItem Header="Открыть" Click="OnPhotoContextOpenClicked" />
                                                             <MenuItem Header="Открыть в проводнике" Click="OnPhotoContextOpenFolderClicked" />
                                                             <MenuItem Header="Избранное / убрать" Click="OnPhotoContextFavoriteClicked" />
-                                                            <MenuItem Header="Разложить выбранные по годам…" Click="OnOrganizeYearsClicked" />
+                                                            <MenuItem Header="Разложить выбранные по датам…" Click="OnOrganizeYearsClicked" />
                                                             <MenuItem Header="Сведения" Click="OnPhotoContextInfoClicked" />
                                                         </ContextMenu>
                                                     </Border.ContextMenu>
@@ -351,6 +351,8 @@
                 <WrapPanel Grid.Row="1" VerticalAlignment="Center">
                     <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="★  Избранное" Click="OnFavoriteActionClicked" />
                     <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="▣  Папка" Click="OnOpenFolderClicked" />
+                    <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="▦  Разложить…" Click="OnOrganizeYearsClicked"
+                            ToolTip="Предварительный план безопасной раскладки выбранных файлов по дате" />
                     <Button Style="{StaticResource FlatActionButton}" Foreground="White" Content="↻  Метаданные" Click="OnReindexMetadataClicked" ToolTip="Переиндексировать дату съёмки и базовые метаданные" Margin="0,0,14,0" />
                     <CheckBox x:Name="ShowInfoCheckBox"
                               Content="Сведения"

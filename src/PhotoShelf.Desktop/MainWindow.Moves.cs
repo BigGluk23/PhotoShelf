@@ -38,8 +38,13 @@ public partial class MainWindow
     }
     private async void OnOrganizeYearsClicked(object sender, RoutedEventArgs e)
     {
-        if (_fileOperationActive || _selection.Count == 0) return;
-        using var dialog = new Forms.FolderBrowserDialog { Description = "Корневая папка для раскладки по дате съёмки", UseDescriptionForTitle = true };
+        if (_fileOperationActive) return;
+        if (_selection.Count == 0)
+        {
+            System.Windows.MessageBox.Show("Сначала выберите одну или несколько фотографий либо видео.", "Раскладка по датам");
+            return;
+        }
+        using var dialog = new Forms.FolderBrowserDialog { Description = "Корневая папка для безопасной раскладки по выбранной дате", UseDescriptionForTitle = true };
         if (dialog.ShowDialog() == Forms.DialogResult.OK) await PreviewMoveAsync(_selection.ToArray(), dialog.SelectedPath, true);
     }
     private async Task PreviewMoveAsync(PhotoItem[] items, string destination, bool byYear)
@@ -49,7 +54,8 @@ public partial class MainWindow
         {
             System.Windows.MessageBox.Show("Сначала проверьте незавершённые операции в окне «Операции». Новые переносы временно заблокированы.", "Восстановление"); return;
         }
-        var requests = items.Select(x => new MoveRequest(x.Path, x.CaptureDate)).ToArray();
+        var requests = items.Select(x => new MoveRequest(x.Path, x.CaptureDate,
+            FileModifiedDate: x.FileModifiedAt)).ToArray();
         var dialog = new MovePlanWindow(requests, destination, byYear) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         var journal = Path.Combine(OperationsDirectory, $"move-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.jsonl");
