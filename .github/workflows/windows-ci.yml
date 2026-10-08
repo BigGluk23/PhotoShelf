@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.workflow }}-${{ github.ref }}
+  group: windows-${{ github.workflow }}-${{ github.ref }}-${{ inputs.background_soak_seconds || 30 }}
   cancel-in-progress: true
 
 jobs:
@@ -88,6 +88,8 @@ jobs:
           python-version: '3.13'
       - name: Exercise isolated journals and large catalogs
         shell: pwsh
+        env:
+          PHOTOSHELF_SCALE_DIAGNOSTICS: ${{ github.workspace }}/TestResults/scale
         run: |
           $ErrorActionPreference = 'Stop'
           $results = 'TestResults/scale'

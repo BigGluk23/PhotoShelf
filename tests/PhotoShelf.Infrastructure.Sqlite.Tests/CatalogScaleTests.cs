@@ -17,25 +17,49 @@ public sealed class CatalogScaleTests(ITestOutputHelper output)
     public async Task LargeCatalogReturnsBoundedPagesWithoutMaterializingAllItems(int count)
     {
         var root=Path.Combine(Path.GetTempPath(),"photoshelf-scale-"+Guid.NewGuid().ToString("N"));
+        var diagnostics = Environment.GetEnvironmentVariable("PHOTOSHELF_SCALE_DIAGNOSTICS");
+        void Stage(string phase)
+        {
+            var line = $"{DateTime.UtcNow:O} count={count} {phase}";
+            output.WriteLine(line);
+            if (string.IsNullOrWhiteSpace(diagnostics)) return;
+            Directory.CreateDirectory(diagnostics);
+            File.AppendAllText(Path.Combine(diagnostics, $"catalog-{count}.progress.log"), line + Environment.NewLine);
+        }
+        IEnumerable<SavedMediaItem> Items()
+        {
+            for (var i = 0; i < count; i++)
+            {
+                if (i % 10_000 == 0) Stage($"upsert-enumerated={i}");
+                yield return new SavedMediaItem
+                {
+                    Path=$"D:\\Фото\\{2000+i%27}\\{i:D8}.jpg",SizeBytes=1000+i%100,
+                    FileModifiedAt=new DateTime(2026,1+i%12,1+i%27,12,0,0,DateTimeKind.Local),
+                    CaptureDate=i%7==0 ? null : new DateTime(2000+i%27,1+i%12,1),MetadataIndexed=true
+                };
+            }
+        }
         try
         {
+            Stage("initialize-start");
             var store=new SqliteDesktopCatalogStore(root);await store.InitializeAsync();
+            Stage("seed-start");
             var watch=Stopwatch.StartNew();
             if (count == 1_000_000) await SeedMillionAsync(root);
-            else await store.UpsertItemsAsync(Enumerable.Range(0,count).Select(i=>new SavedMediaItem
-            {
-                Path=$"D:\\Фото\\{2000+i%27}\\{i:D8}.jpg",SizeBytes=1000+i%100,
-                FileModifiedAt=new DateTime(2026,1+i%12,1+i%27,12,0,0,DateTimeKind.Local),
-                CaptureDate=i%7==0 ? null : new DateTime(2000+i%27,1+i%12,1),MetadataIndexed=true
-            }));
+            else await store.UpsertItemsAsync(Items());
+            Stage("seed-complete; first-page-start");
             var ingestMs=watch.ElapsedMilliseconds;var query=new CatalogViewQuery{PageSize=128};
             watch.Restart();var first=await store.QueryPageAsync(query);var pageMs=watch.Elapsed.TotalMilliseconds;
+            Stage("groups-start");
             watch.Restart();var groups=await store.QueryGroupsAsync(query);var groupMs=watch.Elapsed.TotalMilliseconds;
             Assert.Equal(count,groups.Sum(x=>x.Count));Assert.Equal(128,first.Items.Count);Assert.True(first.HasMore);
+            Stage("distant-page-start");
             watch.Restart();var distant=await store.QueryPageAsync(query,count-128,128);var offsetMs=watch.Elapsed.TotalMilliseconds;
             Assert.Equal(128,distant.Items.Count);Assert.False(distant.HasMore);
+            Stage("capture-page-start");
             watch.Restart();var capture=await store.QueryPageAsync(query with{UseCaptureDate=true});var captureMs=watch.Elapsed.TotalMilliseconds;
             Assert.Equal(128,capture.Items.Count);Assert.NotNull(capture.Items[0].CaptureDate);
+            Stage("cancellation-start");
             using var cancellation=new CancellationTokenSource();var received=0;
             await Assert.ThrowsAnyAsync<OperationCanceledException>(async()=>
             {
@@ -43,6 +67,7 @@ public sealed class CatalogScaleTests(ITestOutputHelper output)
                 { received++;if(received==128)cancellation.Cancel(); }
             });
             Assert.Equal(128,received);
+            Stage("bounded-update-start");
             // Exercise the real bounded writer at the full catalog size too. Bulk
             // fixture setup above is not evidence of production ingestion throughput.
             var ids = first.Items.ToDictionary(item => item.Path, item => item.AssetId);
@@ -52,6 +77,7 @@ public sealed class CatalogScaleTests(ITestOutputHelper output)
             Assert.Equal(128, saved.Count);
             Assert.All(saved.Values, item => { Assert.True(item.IsFavorite); Assert.Equal(ids[item.Path], item.AssetId); });
             Assert.Equal(count, await store.CountAsync(query));
+            Stage("complete");
             output.WriteLine($"SQLITE_BENCH count={count} setup_ms={ingestMs} setup={(count == 1_000_000 ? "fixture-only-64MiB" : "production-upsert")} first128_ms={pageMs:F2} groups_ms={groupMs:F2} offset128_ms={offsetMs:F2} capture128_ms={captureMs:F2}");
         }
         finally {SqliteConnection.ClearAllPools();if(Directory.Exists(root))Directory.Delete(root,true);}
