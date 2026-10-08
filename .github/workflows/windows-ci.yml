@@ -47,9 +47,8 @@ jobs:
       - name: Build, test, publish and exercise isolated main window
         shell: pwsh
         env:
-          PHOTOSHELF_SCALE_TESTS: ${{ inputs.scale == true }}
           PHOTOSHELF_SOAK_SECONDS: ${{ inputs.background_soak_seconds || 30 }}
-        run: ./tools/harness.ps1 -Scale:($env:PHOTOSHELF_SCALE_TESTS -eq 'true') -BackgroundSoakSeconds ([int]$env:PHOTOSHELF_SOAK_SECONDS)
+        run: ./tools/harness.ps1 -BackgroundSoakSeconds ([int]$env:PHOTOSHELF_SOAK_SECONDS)
       - name: Preserve test results and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -66,6 +65,52 @@ jobs:
           path: |
             artifacts/windows-*/*.zip
             artifacts/windows-*/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  scale:
+    name: Bounded synthetic catalog scale tests
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.scale == true }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Set up result validator
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Exercise isolated journals and large catalogs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $results = 'TestResults/scale'
+          New-Item -ItemType Directory -Path $results -Force | Out-Null
+          $failed = $false
+          foreach ($project in @('Application', 'Infrastructure.Sqlite')) {
+            $path = "tests/PhotoShelf.$project.Tests/PhotoShelf.$project.Tests.csproj"
+            dotnet restore $path --locked-mode --disable-parallel
+            if ($LASTEXITCODE -ne 0) { throw "Restore failed: $project" }
+            dotnet test $path -c Release --no-restore -m:1 -nr:false -p:UseSharedCompilation=false `
+              --filter 'Category=CatalogScale' --results-directory $results `
+              --logger "trx;LogFileName=$project.trx" --logger 'console;verbosity=normal' `
+              --blame-hang-timeout 15m --blame-hang-dump-type none
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          python tools/harness_checks.py trx $results --projects Application Infrastructure.Sqlite --summary "$results/summary.json"
+          if ($LASTEXITCODE -ne 0 -or $failed) { throw 'Scale tests failed or did not complete.' }
+      - name: Preserve scale results and active-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-scale-${{ github.sha }}
+          path: TestResults/scale/
           if-no-files-found: error
           retention-days: 14
 

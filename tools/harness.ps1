@@ -57,6 +57,12 @@ try {
             # Native malformed-image regressions run in a disposable testhost with a hard watchdog.
             $arguments += @('--blame-hang-timeout', '30s', '--blame-hang-dump-type', 'none')
         }
+        else {
+            # A stalled suite must leave its active-test sequence instead of hiding
+            # every later gate behind the overall job timeout. No user files are used.
+            $testTimeout = if ($Scale) { '15m' } else { '5m' }
+            $arguments += @('--blame-hang-timeout', $testTimeout, '--blame-hang-dump-type', 'none')
+        }
         # Collect every suite's result so one failure does not hide independent Windows regressions.
         & $DotNet @arguments
         if ($LASTEXITCODE -ne 0) { $hadTestFailure = $true }
