@@ -14,7 +14,8 @@ public sealed partial class SqliteDesktopCatalogStore
             token.ThrowIfCancellationRequested();
             await CatalogDatabaseAccess.WriteAsync(_directory, async () =>
             {
-                await using var connection=await OpenAsync(token);await using var transaction=connection.BeginTransaction();
+                await using var connection=await CatalogDatabaseAccess.OpenAsync(_connectionString, token, useWriteCache: true);
+                await using var transaction=connection.BeginTransaction();
                 var caches = new List<string>();
                 foreach (var table in new[] { "desktop_metadata_cache", "duplicate_hash_cache" })
                     if (await TableExistsAsync(connection, transaction, table, token)) caches.Add(table);
