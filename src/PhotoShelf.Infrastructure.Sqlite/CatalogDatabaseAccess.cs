@@ -14,20 +14,14 @@ internal static class CatalogDatabaseAccess
         Cache = SqliteCacheMode.Private, Pooling = true, DefaultTimeout = 10
     }.ToString();
 
-    public static async Task<SqliteConnection> OpenAsync(string connectionString, CancellationToken token,
-        bool useWriteCache = false)
+    public static async Task<SqliteConnection> OpenAsync(string connectionString, CancellationToken token)
     {
         var connection = new SqliteConnection(connectionString);
         try
         {
             await connection.OpenAsync(token).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
-            // A small page cache spills heavily while maintaining multiple indexes.
-            // Only the serialized bounded upsert gets a 32 MiB suggested page budget.
-            // Reset on every checkout: pooled writer settings must not spread to readers.
-            // This does not change WAL, FULL durability, spill policy or transaction size.
-            command.CommandText = "PRAGMA busy_timeout=10000; PRAGMA synchronous=FULL; " +
-                (useWriteCache ? "PRAGMA cache_size=-32768;" : "PRAGMA cache_size=-2000;");
+            command.CommandText = "PRAGMA busy_timeout=10000; PRAGMA synchronous=FULL;";
             await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
             return connection;
         }
