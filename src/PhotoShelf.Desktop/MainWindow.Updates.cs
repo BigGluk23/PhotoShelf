@@ -32,7 +32,7 @@ public partial class MainWindow
         _updates = new UpdateCenter(new UpdateService(_updateHttp, UpdateTrust.PublicKeyPem, RunningUpdateVersion),
             new UpdatePreferencesStore(Path.Combine(_updatePaths.AppRoot, "updates", "preferences-v1.json")),
             _updatePaths.StagingRoot, RunningUpdateVersion, UpdateTrust.PublicKeyPem, RequestUpdateInstallationAsync,
-            requestsRoot: _updatePaths.RequestsRoot);
+            requestsRoot: _updatePaths.RequestsRoot, operationsRoot: _updatePaths.OperationsRoot);
         _updates.PropertyChanged += OnUpdateStateChanged;
         return _updates;
     }

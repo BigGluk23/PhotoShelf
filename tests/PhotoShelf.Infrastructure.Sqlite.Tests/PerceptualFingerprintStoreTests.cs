@@ -92,6 +92,70 @@ public sealed class PerceptualFingerprintStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CandidateLookupInterruptsRunningSqlAndLeavesCatalogUsable()
+    {
+        var catalog = new SqliteDesktopCatalogStore(_root);
+        await catalog.InitializeAsync();
+        var item = await SeedAsync(catalog, Item("cancelled-query", Path.Combine(_root, "synthetic.png")));
+        var fingerprint = new PerceptualFingerprint(1, 0, 0, 20, 20);
+        using var cancellation = new CancellationTokenSource();
+        using var resumeVm = new ManualResetEventSlim();
+        var enteredVm = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbacksAfterCancellation = 0;
+        var observeOnce = 0;
+        var store = new PerceptualFingerprintStore(_root)
+        {
+            ObserveCandidateQuery = connection =>
+            {
+                if (Interlocked.Exchange(ref observeOnce, 1) != 0) return new Cleanup(() => { });
+                var handle = connection.Handle;
+                SQLitePCL.raw.sqlite3_progress_handler(handle, 1, _ =>
+                {
+                    if (enteredVm.TrySetResult()) resumeVm.Wait(TimeSpan.FromSeconds(10));
+                    // This callback never cancels the successful case itself. A bounded watchdog
+                    // makes a missing production sqlite3_interrupt fail instead of hanging the test.
+                    return cancellation.IsCancellationRequested &&
+                        Interlocked.Increment(ref callbacksAfterCancellation) > 256 ? 1 : 0;
+                }, null);
+                return new Cleanup(() => SQLitePCL.raw.sqlite3_progress_handler(handle, 0, null, null));
+            }
+        };
+        await store.InitializeAsync();
+        Assert.True(Assert.Single(await store.SaveObservedBatchAsync([
+            new(item, PerceptualFingerprintReadResult.Found(fingerprint), DateTime.UtcNow)])));
+
+        var lookup = store.FindCandidatesAsync(fingerprint, token: cancellation.Token);
+        try
+        {
+            await enteredVm.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.False(cancellation.IsCancellationRequested);
+            Assert.False(lookup.IsCompleted);
+            cancellation.Cancel(); // SQLite is executing the real band query at this point.
+        }
+        finally { resumeVm.Set(); }
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => lookup.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.InRange(callbacksAfterCancellation, 0, 32);
+
+        var after = (await catalog.GetItemAsync(item.Path))!;
+        Assert.Equal(item.AssetId, after.AssetId);
+        Assert.Equal(item.ObservationVersion, after.ObservationVersion);
+        Assert.Equal(item.SizeBytes, after.SizeBytes);
+        Assert.Equal(item.Path, Assert.Single(await store.FindCandidatesAsync(fingerprint)).Path);
+        Assert.True(Assert.Single(await store.SaveObservedBatchAsync([
+            new(after, PerceptualFingerprintReadResult.Found(fingerprint), DateTime.UtcNow)])));
+        await using var check = new SqliteConnection($"Data Source={Path.Combine(_root, "catalog-v2.sqlite")};Pooling=False");
+        await check.OpenAsync();
+        await using var command = check.CreateCommand();
+        command.CommandText = "PRAGMA quick_check;";
+        Assert.Equal("ok", await command.ExecuteScalarAsync());
+    }
+
+    private sealed class Cleanup(Action cleanup) : IDisposable
+    {
+        public void Dispose() => cleanup();
+    }
+
+    [Fact]
     public async Task ObservedBatchReturnsOnlyCurrentMatchingSnapshots()
     {
         var catalog = new SqliteDesktopCatalogStore(_root);

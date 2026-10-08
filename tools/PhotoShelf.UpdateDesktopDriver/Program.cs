@@ -163,6 +163,13 @@ internal static class Program
             }
             await AssertRepeatedLaunchBlockedAsync(oldExe, "candidate-before-health", catalog, rowsBefore, journalsBefore);
             Assertions["repeatedLaunchBeforeHealthBlocked"] = true;
+            Require(File.Exists(viewPath), "Unconfirmed successor discarded its view-resume hint.");
+            // The owned source initializes UpdateCenter before reaching this checkpoint.
+            // Reverify every transport byte so an early cleanup cannot pass on timing alone.
+            await UpdatePackageVerifier.VerifyConsentedStageAsync(
+                await UpdatePackageVerifier.ReadStagedDescriptorAsync(stageDirectory, key, UpdateTrust.CurrentCatalogSchema,
+                    CancellationToken.None), key, UpdateTrust.CurrentCatalogSchema, CancellationToken.None);
+            Assertions["unconfirmedTransportPreserved"] = true;
             ReleaseGate("candidate-before-health");
 
             _phase = "new-application-ready";
@@ -170,7 +177,8 @@ internal static class Program
             await UntilAsync(() =>
             {
                 receiptPath = Directory.GetFiles(paths.OperationsRoot, "startup-ready.json", SearchOption.AllDirectories).SingleOrDefault();
-                return receiptPath is not null;
+                return receiptPath is not null && !File.Exists(requestPath) &&
+                    !File.Exists(viewPath) && !Directory.Exists(stageDirectory);
             }, "Actual new application's first projection never wrote its startup-ready receipt.");
             var receipt = JsonSerializer.Deserialize<UpdateStartupHealthRecord>(await File.ReadAllTextAsync(receiptPath!), Json)!;
             Require(receipt.State == "ready" && receipt.InstallationId == active!.InstallationId &&

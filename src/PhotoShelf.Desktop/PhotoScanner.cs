@@ -32,7 +32,7 @@ public static class PhotoScanner
 
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         if (!string.IsNullOrWhiteSpace(windows) &&
-            normalized.StartsWith(Path.GetFullPath(windows), StringComparison.OrdinalIgnoreCase))
+            LibraryCatalogSynchronizer.IsUnder(normalized, windows))
         {
             return true;
         }
@@ -45,7 +45,7 @@ public static class PhotoScanner
                  })
         {
             if (!string.IsNullOrWhiteSpace(programFolder) &&
-                normalized.StartsWith(Path.GetFullPath(programFolder), StringComparison.OrdinalIgnoreCase))
+                LibraryCatalogSynchronizer.IsUnder(normalized, programFolder))
             {
                 return true;
             }

@@ -309,6 +309,44 @@ public sealed class UpdateCenterTests
     });
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public Task SuccessorInitializationPreservesTransportBeforeStartupHealth(bool savedPreference)
+        => WpfTestDispatcher.RunAsync(async () =>
+    {
+        using var fixture = new Fixture();
+        var stage = fixture.Descriptor();
+        Directory.CreateDirectory(stage.StageDirectory);
+        await File.WriteAllBytesAsync(stage.ManifestPath, fixture.Release.ManifestBytes.ToArray());
+        await File.WriteAllBytesAsync(stage.SignaturePath, fixture.Release.SignatureBytes.ToArray());
+        await File.WriteAllTextAsync(stage.PackagePath, "synthetic package");
+        await fixture.Store.SaveAsync(new UpdatePreferences
+        { AutoCheck = false, PreparedStageId = savedPreference ? fixture.StageId : null });
+        var requestVariable = PhotoShelf.Application.Updates.Installation.UpdateStartupHealth.RequestVariable;
+        var installationVariable = PhotoShelf.Application.Updates.Installation.UpdateStartupHealth.InstallationVariable;
+        var previousRequest = Environment.GetEnvironmentVariable(requestVariable);
+        var previousInstallation = Environment.GetEnvironmentVariable(installationVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(requestVariable, Guid.NewGuid().ToString("N"));
+            Environment.SetEnvironmentVariable(installationVariable, Guid.NewGuid().ToString("N"));
+            var center = fixture.CreateCenter(currentVersion: fixture.Release.Version);
+            // Equal versions used to delete the candidate even though startup had not reported ready.
+            await center.CheckOnStartupAsync();
+            Assert.True(center.IsInitialized);
+            Assert.False(center.CanInstall);
+            Assert.Equal(0, fixture.Service.CheckCalls);
+            Assert.Equal("synthetic package", await File.ReadAllTextAsync(stage.PackagePath));
+            Assert.Equal(savedPreference ? fixture.StageId : null, (await fixture.Store.LoadAsync()).PreparedStageId);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(requestVariable, previousRequest);
+            Environment.SetEnvironmentVariable(installationVariable, previousInstallation);
+        }
+    });
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public Task SkipOrSnoozeSurvivesRestartButManualCheckCanShowTheOffer(bool skipVersion) => WpfTestDispatcher.RunAsync(async () =>

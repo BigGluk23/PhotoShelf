@@ -86,6 +86,24 @@ public sealed class FolderTreeSelectionTests
         Assert.True(PhotoScanner.IsIgnoredPath(Path.Combine(Path.GetTempPath(), "PhotoShelf", "fixture.jpg")));
     }
 
+    [Theory]
+    [InlineData(Environment.SpecialFolder.Windows)]
+    [InlineData(Environment.SpecialFolder.ProgramFiles)]
+    [InlineData(Environment.SpecialFolder.ProgramFilesX86)]
+    [InlineData(Environment.SpecialFolder.CommonApplicationData)]
+    public void SystemRootExclusionDoesNotExcludeSimilarlyNamedSibling(Environment.SpecialFolder folder)
+    {
+        var root = Environment.GetFolderPath(folder);
+        Assert.False(string.IsNullOrWhiteSpace(root)); // These tests run on Windows, without creating any system files.
+        root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+        Assert.True(PhotoScanner.IsIgnoredPath(root));
+        Assert.True(PhotoScanner.IsIgnoredPath(Path.Combine(root, "photos", "synthetic.jpg")));
+        var sibling = Path.Combine(root + "Photos", "synthetic.jpg");
+        Assert.False(PhotoScanner.IsIgnoredPath(sibling));
+        Assert.False(PhotoScanner.IsIgnoredPath(Path.Combine(root, "..", Path.GetFileName(root) + "Photos", "synthetic.jpg")));
+        Assert.False(PhotoScanner.IsIgnoredPath(Path.Combine(root, "photos", "synthetic.jpg"), includeSystemFolders: true));
+    }
+
     private sealed class ClickableCheckBox : CheckBox
     {
         public void ClickForTest() => OnClick();
