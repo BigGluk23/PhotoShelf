@@ -36,12 +36,13 @@ public sealed class BackgroundWorkScheduler : IAsyncDisposable
     public int PendingCount { get { lock (_sync) return _queue.Count; } }
     public int RunningCount => Volatile.Read(ref _running);
 
-    public Task<T> RunAsync<T>(BackgroundWorkPriority priority, Func<CancellationToken, T> work, CancellationToken cancellationToken = default) =>
-        RunAsync(priority, token => Task.FromResult(work(token)), cancellationToken);
+    public Task<T> RunAsync<T>(BackgroundWorkPriority priority, Func<CancellationToken, T> work, CancellationToken cancellationToken = default, BackgroundWorkController.Activity? activity = null) =>
+        RunAsync(priority, token => Task.FromResult(work(token)), cancellationToken, activity);
 
-    public async Task<T> RunAsync<T>(BackgroundWorkPriority priority, Func<CancellationToken, Task<T>> work, CancellationToken cancellationToken = default)
+    public async Task<T> RunAsync<T>(BackgroundWorkPriority priority, Func<CancellationToken, Task<T>> work, CancellationToken cancellationToken = default, BackgroundWorkController.Activity? activity = null)
     {
         ArgumentNullException.ThrowIfNull(work);
+        activity?.SetPhase(BackgroundTaskPhase.Queued);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdown.Token);
         var background = priority >= BackgroundWorkPriority.Scan;
         if (background) await _backgroundCapacity.WaitAsync(linked.Token).ConfigureAwait(false);
@@ -53,6 +54,7 @@ public sealed class BackgroundWorkScheduler : IAsyncDisposable
             try
             {
                 linked.Token.ThrowIfCancellationRequested();
+                activity?.SetPhase(BackgroundTaskPhase.Reading);
                 completion.TrySetResult(await work(linked.Token).ConfigureAwait(false));
             }
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { completion.TrySetCanceled(linked.Token); }

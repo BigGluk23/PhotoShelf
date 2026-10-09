@@ -9,12 +9,13 @@ public sealed class DesktopCatalogTests : IDisposable
     [Fact] public async Task SettingsAndStreamingCatalogRoundTripWithoutReadingMediaFiles()
     {
         var store = new SqliteDesktopCatalogStore(_root); await store.InitializeAsync();
-        var state = new LocalCatalogState { DateGroupingMode = "CaptureDate", TileWidth = 173.5, IncludeSystemFolders = true,
+        var state = new LocalCatalogState { BackgroundLoadMode = "Quiet", DateGroupingMode = "CaptureDate", TileWidth = 173.5, IncludeSystemFolders = true,
             ActiveFolder = "D:\\Фото", ViewMode = "Folder", SortNewestFirst = false, IncludeSubfolders = false,
             ExcludedFolders = new() { "D:\\Private" }, ExpandedFolders = new() { "D:\\Фото" },
             Items = Enumerable.Range(0, 300).Select(i => new SavedMediaItem { Path = $"D:\\Фото\\{i}.jpg", SizeBytes = 42, FileModifiedAt = new DateTime(2026, 1, 1), IsFavorite = i == 7 }).ToList() };
         await store.SaveAsync(state);
         var settings = await store.LoadAsync(includeItems: false);
+        Assert.Equal("Quiet", settings.BackgroundLoadMode);
         Assert.Empty(settings.Items); Assert.True(settings.ReadItemsFromSqlite); Assert.Equal("CaptureDate", settings.DateGroupingMode);
         Assert.True(settings.IncludeSystemFolders); Assert.Equal(173.5, settings.TileWidth); Assert.Equal(state.ActiveFolder, settings.ActiveFolder);
         Assert.False(settings.IncludeSubfolders); Assert.False(settings.SortNewestFirst); Assert.Equal(state.ExpandedFolders, settings.ExpandedFolders);

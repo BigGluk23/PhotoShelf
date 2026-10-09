@@ -64,7 +64,7 @@
       "photoshelf.application": {
         "type": "Project",
         "dependencies": {
-          "PhotoShelf.Domain": "[1.11.3-ultra, )"
+          "PhotoShelf.Domain": "[1.11.4-ultra, )"
         }
       },
       "photoshelf.domain": {
@@ -74,8 +74,8 @@
         "type": "Project",
         "dependencies": {
           "Microsoft.Data.Sqlite": "[10.0.12, )",
-          "PhotoShelf.Application": "[1.11.3-ultra, )",
-          "PhotoShelf.Domain": "[1.11.3-ultra, )",
+          "PhotoShelf.Application": "[1.11.4-ultra, )",
+          "PhotoShelf.Domain": "[1.11.4-ultra, )",
           "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.5, )"
         }
       }

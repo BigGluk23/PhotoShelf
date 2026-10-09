@@ -82,7 +82,8 @@ public partial class MainWindow
             var key = string.Join('\n', roots) + "|library:" + string.Join('\n', libraryRoots) + "|" + browse + "|" + _includeSubfolders + "|" + rulesKey;
             if (_libraryMonitor is null)
             {
-                _librarySynchronizer = new(_desktopCatalogStore, PublishLibraryUpdateAsync);
+                _librarySynchronizer = new(_desktopCatalogStore, PublishLibraryUpdateAsync,
+                    workController: PhotoShelf.Application.Background.BackgroundWorkController.Shared);
                 async Task ProcessBatchAsync(LibraryMonitorBatch batch, CancellationToken token)
                 {
                     Interlocked.Increment(ref _monitorCallbacksActive);

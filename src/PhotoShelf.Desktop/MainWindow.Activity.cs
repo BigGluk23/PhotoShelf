@@ -70,7 +70,7 @@ public partial class MainWindow
             : activity.IsPaused ? "Пауза" : activity.IsProcessing
             ? activity.ActiveReconciliationRoots.Count > 0 ? "Сверка: " + string.Join(", ", activity.ActiveReconciliationRoots) : "Обработка файловых событий"
             : "Ожидание изменений";
-        var details = $"Поиск файлов: {(_searchStopping ? "останавливается" : _searchStopped ? "остановлен; новый поиск возобновит автообновление" : !_scanTask.IsCompleted || !_browseTask.IsCompleted ? "выполняется" : "не выполняется")}\n" +
+        var details = BackgroundLoadDetails() + "\n" + $"Поиск файлов: {(_searchStopping ? "останавливается" : _searchStopped ? "остановлен; новый поиск возобновит автообновление" : !_scanTask.IsCompleted || !_browseTask.IsCompleted ? "выполняется" : "не выполняется")}\n" +
             $"Чтение выбранной папки: {(!_browseTask.IsCompleted ? "выполняется" : "не выполняется")}.\n" +
             $"Метаданные: {progress.Phase}. Обработано в проходе: {progress.Processed:N0}; осталось: ≈{progress.Due:N0}; ждут повтора: {progress.Deferred:N0}; не прочитано: {progress.Errors:N0}.\n" +
             $"Визуальное сходство: {fingerprints.Phase}. Проиндексировано в проходе: {fingerprints.Processed:N0}; ошибок/неподдерживаемых: {fingerprints.Errors:N0}.\n" +

@@ -48,10 +48,13 @@ public partial class MainWindow
                     IsCurrentViewAffected(new(batch, [], [], false))) NoteCatalogChanged();
             }, DispatcherPriority.Background);
         }
+        using var workActivity = BackgroundWorkController.Shared.Begin(BackgroundTaskKind.Metadata);
         try
         {
             activity.Value = new("Ожидание завершения предыдущего чтения");
+            workActivity.SetPhase(BackgroundTaskPhase.WaitingForReader);
             await previous;
+            workActivity.SetPhase(BackgroundTaskPhase.Preparing);
             var token = operation.Token; token.ThrowIfCancellationRequested();
             var rules = _folderInclusion.Snapshot();
             activity.Value = new("Подготовка очереди", Started: Stopwatch.GetTimestamp());
@@ -64,11 +67,12 @@ public partial class MainWindow
                 activity.Value = activity.Value with { Due = initial.DueCount, Deferred = initial.DeferredRetryCount };
                 var pending = new List<(MetadataCatalogUpdate Update, SavedMediaItem Fresh)>(64);
                 var sinceCommit = Stopwatch.StartNew();
-                var workBudget = Stopwatch.StartNew();
+                var workBudget = BackgroundWorkController.Shared.CreatePacer();
 
                 async Task CommitAsync()
                 {
                     if (pending.Count == 0) return;
+                    workActivity.SetPhase(BackgroundTaskPhase.Saving);
                     activity.Value = activity.Value with { Phase = "Запись результатов в каталог" };
                     var batch = pending.ToArray();
                     var committed = await _desktopCatalogStore.UpdateMetadataResultsAsync(batch.Select(x => x.Update).ToArray(), token);
@@ -98,15 +102,18 @@ public partial class MainWindow
 
                 async Task ReadOneAsync(SavedMediaItem item)
                 {
+                    workActivity.SetPhase(BackgroundTaskPhase.Reading);
                     activity.Value = activity.Value with { Phase = "Чтение метаданных", CurrentPath = item.Path };
                     var fresh = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
-                        _ => ToSavedItem(item.Path), token);
+                        _ => ToSavedItem(item.Path), token, workActivity);
                     var result = fresh is null
                         ? new CaptureDateReadResult(MetadataReadStatus.TransientError, ErrorCode: "unavailable-file")
-                        : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, readToken => CaptureDateReader.Read(item.Path, readToken), token);
+                        : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata, readToken => CaptureDateReader.Read(item.Path, readToken), token, workActivity);
+                    result = result.WithRetryBackoff(item.MetadataAttemptedAtUtc, item.MetadataRetryAtUtc);
+                    if (result.Status is not (MetadataReadStatus.Found or MetadataReadStatus.Absent)) workActivity.Progress(0, 1);
                     token.ThrowIfCancellationRequested();
                     var after = fresh is null ? null : await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Metadata,
-                        _ => ToSavedItem(item.Path), token);
+                        _ => ToSavedItem(item.Path), token, workActivity);
                     if (fresh is not null && (after is null || fresh.SizeBytes != after.SizeBytes || fresh.FileModifiedAt != after.FileModifiedAt)) return;
                     if (fresh is not null && (fresh.SizeBytes != item.SizeBytes || fresh.FileModifiedAt != item.FileModifiedAt))
                     {
@@ -137,14 +144,9 @@ public partial class MainWindow
                     {
                         token.ThrowIfCancellationRequested();
                         await ReadOneAsync(item);
+                        workActivity.Progress();
                         if (pending.Count >= 64 || sinceCommit.ElapsedMilliseconds >= 250) await CommitAsync();
-                        // Yield between real completed reads. This is cooperative pacing, not
-                        // a CPU percentage guarantee or cancellation of a live native reader.
-                        if (workBudget.ElapsedMilliseconds >= 75)
-                        {
-                            await Task.Delay((int)Math.Min(100, workBudget.ElapsedMilliseconds), token);
-                            workBudget.Restart();
-                        }
+                        await workBudget.CheckpointAsync(token, workActivity);
                     }
                     afterPath = page[^1].Path;
                 }
@@ -154,8 +156,9 @@ public partial class MainWindow
                     remaining.DeferredRetryCount > 0 ? "Ожидание повторных попыток" : "Готово", Due = remaining.DueCount,
                     Deferred = remaining.DeferredRetryCount, CurrentPath = null };
             }, token);
+            workActivity.Finish(BackgroundTaskPhase.Completed);
         }
-        catch (OperationCanceledException) { activity.Value = activity.Value with { Phase = "Остановлено", CurrentPath = null }; }
+        catch (OperationCanceledException) { workActivity.Finish(BackgroundTaskPhase.Cancelled); activity.Value = activity.Value with { Phase = "Остановлено", CurrentPath = null }; }
         catch (Exception ex) { activity.Value = activity.Value with { Phase = "Ошибка", Error = ex.Message, CurrentPath = null }; }
         finally
         {

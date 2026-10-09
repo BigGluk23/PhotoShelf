@@ -3,16 +3,18 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using PhotoShelf.Application.Diagnostics;
+using PhotoShelf.Application.Background;
 
 namespace PhotoShelf.Desktop;
 
 public partial class SettingsWindow : Window
 {
-    public SettingsWindow(bool showVideos, bool includeSystemFolders, UpdateCenter? updates = null)
+    public SettingsWindow(bool showVideos, bool includeSystemFolders, UpdateCenter? updates = null, BackgroundLoadMode loadMode = BackgroundLoadMode.Balanced)
     {
         InitializeComponent();
         UpdatesSection.DataContext = updates;
         UpdatesSection.Visibility = updates is null ? Visibility.Collapsed : Visibility.Visible;
+        BackgroundLoadModeBox.SelectedIndex = Enum.IsDefined(loadMode) ? (int)loadMode : 1;
         ShowVideosCheckBox.IsChecked = showVideos;
         IncludeSystemFoldersCheckBox.IsChecked = includeSystemFolders;
         CatalogPathBox.Text = LocalCatalogStore.CatalogDirectory;
@@ -25,6 +27,7 @@ public partial class SettingsWindow : Window
         StorageWarningText.Text = string.Join("\n", warnings);
     }
 
+    public BackgroundLoadMode LoadMode { get; private set; } = BackgroundLoadMode.Balanced;
     public bool ShowVideos { get; private set; }
     public bool IncludeSystemFolders { get; private set; }
 
@@ -41,6 +44,7 @@ public partial class SettingsWindow : Window
 
     private void OnSaveClicked(object sender, RoutedEventArgs e)
     {
+        LoadMode = (BackgroundLoadMode)Math.Clamp(BackgroundLoadModeBox.SelectedIndex, 0, 2);
         ShowVideos = ShowVideosCheckBox.IsChecked == true;
         IncludeSystemFolders = IncludeSystemFoldersCheckBox.IsChecked == true;
         DialogResult = true;
@@ -101,7 +105,8 @@ public partial class SettingsWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            var summary = SupportSnapshot.Create(ErrorReporter.Version, LocalCatalogStore.UsesLegacyStorage, ErrorReporter.ErrorCount);
+            var summary = SupportSnapshot.Create(ErrorReporter.Version, LocalCatalogStore.UsesLegacyStorage, ErrorReporter.ErrorCount,
+                BackgroundWorkController.Shared, BackgroundWorkScheduler.Shared.PendingCount, BackgroundWorkScheduler.Shared.RunningCount);
             await Task.Run(() =>
             {
                 using var file = new FileStream(dialog.FileName, FileMode.CreateNew, FileAccess.Write, FileShare.Read);

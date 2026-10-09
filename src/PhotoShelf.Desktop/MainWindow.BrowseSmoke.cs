@@ -83,9 +83,11 @@ public partial class MainWindow
     internal bool BrowseSmokeMonitorReady => _libraryMonitor is not null && _libraryRootStates.Count > 0 && _monitorConfigurationTask.IsCompletedSuccessfully;
     internal long BrowseSmokeMonitorGeneration => _libraryMonitor?.Generation ?? -1;
     internal bool BrowseSmokeBusy => _isProjecting || _projectionQueued || LibraryMonitorCallbackActive || !_browseTask.IsCompleted || !_scanTask.IsCompleted ||
-        !_metadataTask.IsCompleted || !_monitorConfigurationTask.IsCompleted || _libraryMonitor?.Activity is { } activity &&
+        !_metadataTask.IsCompleted || !_fingerprintTask.IsCompleted || !_monitorConfigurationTask.IsCompleted || _libraryMonitor?.Activity is { } activity &&
         (activity.IsProcessing || activity.PendingPathCount > 0 || activity.PendingDirectoryCount > 0 || activity.PendingReconciliationRootCount > 0);
-    internal bool BrowseSmokeWritersDrained => _closeReady && _scanTask.IsCompleted && _browseTask.IsCompleted && _metadataTask.IsCompleted;
+    internal bool BrowseSmokeReadersDrained => _scanTask.IsCompleted && _browseTask.IsCompleted && _metadataTask.IsCompleted &&
+        _fingerprintTask.IsCompleted && !LibraryMonitorCallbackActive && _libraryMonitor?.Activity.IsProcessing != true;
+    internal bool BrowseSmokeWritersDrained => _closeReady && BrowseSmokeReadersDrained;
     internal string[] BrowseSmokeLoadedPaths => (PhotoRows as VirtualPhotoRows)?.LoadedItems.Select(x => x.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
 
     internal string? BrowseSmokePublishedSearch => _currentQuery?.SearchText;

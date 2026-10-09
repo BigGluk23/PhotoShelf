@@ -1,4 +1,5 @@
 using System.IO;
+using PhotoShelf.Application.Background;
 using PhotoShelf.Application.Catalog;
 using PhotoShelf.Application.Media;
 
@@ -13,7 +14,7 @@ public sealed record LibraryCatalogUpdate(IReadOnlyList<SavedMediaItem> Items,
 public sealed class LibraryCatalogSynchronizer(
     SqliteDesktopCatalogStore store,
     Func<LibraryCatalogUpdate, Task> publish,
-    IFileSystemObservationProbe? observationProbe = null)
+    IFileSystemObservationProbe? observationProbe = null, BackgroundWorkController? workController = null)
 {
     private readonly IFileSystemObservationProbe _probe = observationProbe ?? new FileSystemObservationProbe();
 
@@ -41,13 +42,28 @@ public sealed class LibraryCatalogSynchronizer(
             (browseRecursively ? IsUnder(path, browsedFolder) :
                 string.Equals(Path.GetDirectoryName(path)?.TrimEnd('\\', '/'), browsedFolder.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase));
 
+        using var activity = workController?.Begin(BackgroundTaskKind.Scan);
+        var pacer = batch.BrowseTarget is null ? workController?.CreatePacer() : null;
+        async Task CheckpointAsync(CancellationToken ct)
+        {
+            // Exact foreground browse keeps its priority; background traversal yields only
+            // between completed reads and never abandons a live directory enumerator.
+            if (pacer is not null) await pacer.CheckpointAsync(ct, activity);
+            activity?.SetPhase(BackgroundTaskPhase.Reading);
+        }
+        async Task ObserveBatchAsync(IReadOnlyList<string> paths, bool force)
+        {
+            await CheckpointAsync(token);
+            await ObservePathsCoreAsync(paths, force, token, MarkCommitted);
+            activity?.Progress(paths.Count);
+        }
         var catalogChanged = false;
         void MarkCommitted() => catalogChanged = true;
         try
         {
             await publish(new([], [], batch.RootStates, false));
             foreach (var paths in batch.ChangedPaths.Where(Observe).Where(PhotoItem.IsSupported).Chunk(128))
-                await ObservePathsCoreAsync(paths, forceContent: true, token, MarkCommitted);
+                await ObserveBatchAsync(paths, true);
 
             // A directory notification describes its own old/new subtree. It must not
             // restart enumeration of the whole watched drive. The catalog pass below
@@ -64,9 +80,9 @@ public sealed class LibraryCatalogSynchronizer(
                     // A browsed, unchecked subtree remains navigable without becoming part of the library.
                     var scanRules = inclusion.Snapshot();
                     if (browsedFolder is not null && IsUnder(root, browsedFolder)) scanRules.SetIncluded(root, true);
-                    await PhotoScanner.ScanAsync([root], scan => ObservePathsCoreAsync(scan.Paths.Where(Observe).ToArray(),
-                        batch.RevalidateContentRoots?.Contains(root, StringComparer.OrdinalIgnoreCase) == true, token, MarkCommitted),
-                        includeSystem, token, recursive: recursive, inclusion: scanRules);
+                    await PhotoScanner.ScanAsync([root], scan => ObserveBatchAsync(scan.Paths.Where(Observe).ToArray(),
+                        batch.RevalidateContentRoots?.Contains(root, StringComparer.OrdinalIgnoreCase) == true),
+                        includeSystem, token, recursive: recursive, inclusion: scanRules, checkpoint: CheckpointAsync);
                 }
 
                 // A second bounded pass covers missing/inaccessible files which enumeration cannot report.
@@ -86,11 +102,13 @@ public sealed class LibraryCatalogSynchronizer(
                             (new FileObservation(Unavailable(item.Path, rootResult)), (SavedMediaItem?)item)).ToArray();
                         await ApplyAsync(updates, [], token, MarkCommitted);
                     }
-                    else await ObservePathsCoreAsync(candidates.Select(item => item.Path).ToArray(), false, token, MarkCommitted);
+                    else await ObserveBatchAsync(candidates.Select(item => item.Path).ToArray(), false);
                 }
             }
             token.ThrowIfCancellationRequested();
+            activity?.Finish(BackgroundTaskPhase.Completed);
         }
+        catch (OperationCanceledException) { activity?.Finish(BackgroundTaskPhase.Cancelled); throw; }
         finally
         {
             // Committed work still needs its metadata/count/publication boundary if this

@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$Scale,
+    [ValidateRange(30, 14400)][int]$BackgroundSoakSeconds = 30,
     [string]$DotNet = 'dotnet',
     [string]$Python = 'python'
 )
@@ -55,6 +56,12 @@ try {
         if ($project -eq 'Desktop') {
             # Native malformed-image regressions run in a disposable testhost with a hard watchdog.
             $arguments += @('--blame-hang-timeout', '30s', '--blame-hang-dump-type', 'none')
+        }
+        else {
+            # A stalled suite must leave its active-test sequence instead of hiding
+            # every later gate behind the overall job timeout. No user files are used.
+            $testTimeout = if ($Scale) { '15m' } else { '5m' }
+            $arguments += @('--blame-hang-timeout', $testTimeout, '--blame-hang-dump-type', 'none')
         }
         # Collect every suite's result so one failure does not hide independent Windows regressions.
         & $DotNet @arguments
@@ -158,11 +165,14 @@ try {
     # A separate process preserves catalog/cache isolation while explicitly enabling
     # the production watcher + metadata + browse path omitted by the basic smoke.
     $browseReport = Join-Path $results 'ui-browse-smoke.json'
+    $previousSoakDuration = $env:PHOTOSHELF_BACKGROUND_SOAK_SECONDS
+    $env:PHOTOSHELF_BACKGROUND_SOAK_SECONDS = [string]$BackgroundSoakSeconds
     $browseSmokeProcess = Start-Process -FilePath $exe -ArgumentList @('--ui-browse-smoke', '--smoke-report', ('"' + $browseReport + '"')) -WorkingDirectory $emptyWork -PassThru
-    if (-not $browseSmokeProcess.WaitForExit(90000)) {
+    $env:PHOTOSHELF_BACKGROUND_SOAK_SECONDS = $previousSoakDuration
+    if (-not $browseSmokeProcess.WaitForExit(($BackgroundSoakSeconds + 180) * 1000)) {
         $browseSmokeProcess.Kill()
         $browseSmokeProcess.WaitForExit()
-        throw 'Production browse/monitor smoke timed out after 90 seconds; isolated fixtures retained.'
+        throw 'Production browse/monitor soak timed out; isolated fixtures retained.'
     }
     if (-not (Test-Path -LiteralPath $browseReport -PathType Leaf)) { throw "Browse smoke exited $($browseSmokeProcess.ExitCode) without a report." }
     $browseSmoke = Get-Content -LiteralPath $browseReport -Raw | ConvertFrom-Json
@@ -238,6 +248,17 @@ try {
         $expectedSearchCases.Remove([string]$case.scenario)
     }
     if ($expectedSearchCases.Count -ne 0) { throw 'Missing search/sort smoke scenarios.' }
+    $soak = $browseSmoke.backgroundSoak
+    if ($soak.passed -ne $true -or $soak.requestedSeconds -ne $BackgroundSoakSeconds -or
+        $soak.elapsedSeconds -lt $BackgroundSoakSeconds -or $soak.cycles -lt 3 -or
+        $soak.originalHashesSizesAndTimesPreserved -ne $true -or $soak.stableAssetIds -ne $true -or
+        $soak.unchangedFingerprintsNotReread -ne $true -or $soak.simulatedSuspendResume -ne $true -or
+        $soak.allLoadModes -ne $true -or $soak.maxDispatcherGapMs -ge 5000 -or
+        $soak.originalsChecked -lt 8 -or $soak.incomingFilesDecoded -ne $soak.cycles -or @($soak.samples).Count -lt 3) {
+        throw 'Background soak did not pass its requested duration, UI, cache and original preservation checks.'
+    }
+    $result.backgroundSoakVerified = $true
+    $result.backgroundSoakSeconds = $BackgroundSoakSeconds
     $result.browseSmokeVerified = $true
     $result.searchSortSmokeVerified = $true
     Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'

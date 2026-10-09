@@ -41,6 +41,7 @@ public partial class MainWindow
 
     private async Task RunPerceptualFingerprintWorkerAsync(CancellationTokenSource operation, FingerprintActivity activity)
     {
+        using var workActivity = BackgroundWorkController.Shared.Begin(BackgroundTaskKind.Fingerprints);
         try
         {
             var token = operation.Token;
@@ -53,11 +54,12 @@ public partial class MainWindow
             {
                 var pending = new List<PerceptualFingerprintCatalogUpdate>(32);
                 var sinceCommit = Stopwatch.StartNew();
-                var workBudget = Stopwatch.StartNew();
+                var workBudget = BackgroundWorkController.Shared.CreatePacer();
 
                 async Task CommitAsync()
                 {
                     if (pending.Count == 0) return;
+                    workActivity.SetPhase(BackgroundTaskPhase.Saving);
                     activity.Value = activity.Value with { Phase = "сохраняю визуальный индекс" };
                     var batch = pending.ToArray();
                     pending.Clear();
@@ -75,9 +77,10 @@ public partial class MainWindow
 
                 async Task IndexOneAsync(SavedMediaItem expected)
                 {
+                    workActivity.SetPhase(BackgroundTaskPhase.Reading);
                     activity.Value = activity.Value with { CurrentPath = expected.Path };
                     var before = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash,
-                        _ => ToSavedItem(expected.Path), token);
+                        _ => ToSavedItem(expected.Path), token, workActivity);
                     if (before is null)
                     {
                         pending.Add(new(expected,
@@ -98,7 +101,7 @@ public partial class MainWindow
                     try
                     {
                         var fingerprint = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash,
-                            readToken => FingerprintReader(expected.Path, readToken), token);
+                            readToken => FingerprintReader(expected.Path, readToken), token, workActivity);
                         result = PerceptualFingerprintReadResult.Found(fingerprint);
                     }
                     catch (NotSupportedException ex) { result = PerceptualFingerprintReadResult.Unsupported(ErrorCode(ex)); }
@@ -117,11 +120,12 @@ public partial class MainWindow
                     }
                     token.ThrowIfCancellationRequested();
                     var after = await BackgroundWorkScheduler.Shared.RunAsync(BackgroundWorkPriority.Hash,
-                        _ => ToSavedItem(expected.Path), token);
+                        _ => ToSavedItem(expected.Path), token, workActivity);
                     if (after is null || !SameFileObservation(before, after)) return;
                     pending.Add(new(expected, result, attempted));
                     if (result.Status != PerceptualFingerprintStatus.Found)
                     {
+                        workActivity.Progress(0, 1);
                         var progress = activity.Value;
                         activity.Value = progress with { Errors = progress.Errors + 1, Error = result.ErrorCode };
                     }
@@ -137,23 +141,20 @@ public partial class MainWindow
                     {
                         token.ThrowIfCancellationRequested();
                         await IndexOneAsync(item);
+                        workActivity.Progress();
                         if (pending.Count >= 32 || sinceCommit.ElapsedMilliseconds >= 250) await CommitAsync();
-                        // Fingerprinting is deliberately background-paced. The shared scheduler
-                        // also reserves an execution slot for visible previews and interaction.
-                        if (workBudget.ElapsedMilliseconds >= 75)
-                        {
-                            await Task.Delay((int)Math.Min(100, workBudget.ElapsedMilliseconds), token);
-                            workBudget.Restart();
-                        }
+                        await workBudget.CheckpointAsync(token, workActivity);
                     }
                     afterPath = page[^1].Path;
                 }
                 await CommitAsync();
                 activity.Value = activity.Value with { Phase = "готово", CurrentPath = null };
             }, token);
+            workActivity.Finish(BackgroundTaskPhase.Completed);
         }
         catch (OperationCanceledException)
         {
+            workActivity.Finish(BackgroundTaskPhase.Cancelled);
             activity.Value = activity.Value with { Phase = "остановлено", CurrentPath = null };
         }
         catch (Exception ex)
