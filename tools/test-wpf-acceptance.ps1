@@ -11,15 +11,16 @@ if (@(& git -C $repo status --porcelain).Count -ne 0 -or $LASTEXITCODE -ne 0) {
 }
 $work = Join-Path ([IO.Path]::GetTempPath()) ('PhotoShelf-acceptance-' + [Guid]::NewGuid().ToString('N'))
 $process = $null
+# Use the same pinned RID/single-file dependency graph as the shipping harness.
+$publishProfile = @('-p:PhotoShelfPublish=true', '-p:PublishSingleFile=true',
+    '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:EnableCompressionInSingleFile=true', '-p:RestoreLockedMode=true')
 try {
     & $Python (Join-Path $repo 'tools/prepare_windows_acceptance.py') --source $repo --work $work
     if ($LASTEXITCODE -ne 0) { throw 'Acceptance source isolation failed.' }
     $project = Join-Path $work 'source/src/PhotoShelf.Desktop/PhotoShelf.Desktop.csproj'
-    & $DotNet restore $project --locked-mode --disable-parallel -r win-x64 -m:1 -nr:false
-    if ($LASTEXITCODE -ne 0) { throw 'Acceptance restore failed.' }
     $app = Join-Path $work 'app'
-    & $DotNet publish $project -c Release -r win-x64 --self-contained true --no-restore -m:1 -nr:false `
-        -p:UseSharedCompilation=false -p:TreatWarningsAsErrors=true "-p:SourceRevisionId=$commit" -o $app
+    & $DotNet publish $project -c Release -r win-x64 --self-contained true -m:1 -nr:false `
+        -p:UseSharedCompilation=false -p:TreatWarningsAsErrors=true "-p:SourceRevisionId=$commit" @publishProfile -o $app
     if ($LASTEXITCODE -ne 0) { throw 'Acceptance test-copy build failed.' }
     $executable = Join-Path $app 'PhotoShelf.exe'
     $process = Start-Process -FilePath $executable -PassThru
