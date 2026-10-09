@@ -52,6 +52,7 @@ internal static class WindowsAcceptance
         {
             ValidateOwnership();
             if (!OperatingSystem.IsWindows()) throw new InvalidOperationException("Windows runtime required.");
+            PinOwnedCatalog();
             if (args.Length == 0) return ParentAsync().GetAwaiter().GetResult();
             if (args.Length != 1 || args[0] is not ("first" or "restart" or "changed"))
                 throw new ArgumentException("Only fixed acceptance phases are allowed; no paths are accepted.");
@@ -61,7 +62,7 @@ internal static class WindowsAcceptance
         {
             // No arbitrary path/exception dump. Owned evidence is retained on every failure.
             WriteNew(Path.Combine(Root, "failure.json"),
-                new { status = "failed", phase = _phase, errorType = error.GetType().Name,
+                new { status = "failed", phase = _phase, errorType = error.GetType().Name, frames = FailureFrames(error),
                     assertion = error is InvalidDataException or TimeoutException ? error.Message : null });
             return 1;
         }
@@ -204,10 +205,14 @@ internal static class WindowsAcceptance
         CopyResource("PhotoShelf.AcceptanceVideo.mp4", Path.Combine(b, "synthetic.mp4"));
         File.WriteAllText(Path.Combine(b, "fixture.xmp"), "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>");
         File.WriteAllText(Path.Combine(b, "fixture.aae"), "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>");
+        _phase = "seed-catalog";
         var store = new SqliteDesktopCatalogStore(Catalog); await store.InitializeAsync();
+        _phase = "seed-fingerprints";
         await new PerceptualFingerprintStore(Catalog).InitializeAsync();
+        _phase = "seed-preferences";
         await store.SaveAsync(new LocalCatalogState { BackgroundProcessingPaused = true,
             IncludeSystemFolders = true, ShowVideos = true, ViewMode = "All", DateGroupingMode = "FileDate" }, saveItems: false);
+        _phase = "seed-media";
         var items = OwnedFiles(Media)
             .Where(path => Path.GetExtension(path) is not (".xmp" or ".aae"))
             .Select(path =>
@@ -218,6 +223,7 @@ internal static class WindowsAcceptance
                 return value;
             }).ToArray();
         await store.UpsertItemsAsync(items);
+        _phase = "seed-large-catalog";
         await using var db = await OpenAsync();
         await using var command = db.CreateCommand();
         command.CommandText = """
@@ -284,15 +290,19 @@ internal static class WindowsAcceptance
         return result;
     }
 
-    private static int Child(string phase)
+    private static void PinOwnedCatalog()
     {
-        RejectReparse(Catalog); RejectReparse(Media);
         // No shipping API accepts an existing catalog for smoke. Reflection is confined to
         // this compile-time owned copy before any App, cache or catalog initialization.
         var location = LocalCatalogStore.StorageLocation;
         typeof(CatalogLocation).GetField("_directory", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(location, Catalog);
         typeof(CatalogLocation).GetProperty(nameof(CatalogLocation.IsIsolatedSmoke))!.SetValue(location, true);
         Require(LocalCatalogStore.IsIsolatedSmokeCatalog && LocalCatalogStore.CatalogDirectory == Catalog, "Isolation failed.");
+    }
+
+    private static int Child(string phase)
+    {
+        RejectReparse(Catalog); RejectReparse(Media);
         ErrorReporter.AutomatedCheck = true;
         var app = new App(); app.InitializeComponent();
         var clock = Stopwatch.StartNew(); _lastTick = 0;
@@ -315,7 +325,7 @@ internal static class WindowsAcceptance
             }
             catch (Exception error)
             {
-                WriteNew(Path.Combine(Root, phase + ".json"), new { status = "failed", phase = _phase, errorType = error.GetType().Name,
+                WriteNew(Path.Combine(Root, phase + ".json"), new { status = "failed", phase = _phase, errorType = error.GetType().Name, frames = FailureFrames(error),
                     assertion = error is InvalidDataException or TimeoutException ? error.Message : null });
                 app.Shutdown(1);
             }
@@ -537,5 +547,8 @@ internal static class WindowsAcceptance
         using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
         JsonSerializer.Serialize(file, value, new JsonSerializerOptions { WriteIndented = true }); file.Flush(true);
     }
+    private static string[] FailureFrames(Exception error) => new StackTrace(error, false).GetFrames()
+        .Take(8).Select(frame => frame.GetMethod()).Where(method => method is not null)
+        .Select(method => method!.DeclaringType?.FullName + "." + method.Name).ToArray();
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidDataException(message); }
 }
