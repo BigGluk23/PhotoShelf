@@ -37,6 +37,7 @@ internal static class WindowsAcceptance
     private static readonly ConcurrentQueue<double> WriteTimes = new();
     private static readonly ConcurrentDictionary<string, int> Reads = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentQueue<double> DecodeTimes = new();
+    private static readonly ConcurrentDictionary<string, string> DecodeFailures = new(StringComparer.OrdinalIgnoreCase);
     private static readonly List<double> PageTimes = [];
     private static readonly List<object> ScopeResults = [];
     private static int _scrollsDuringIndexing, _maxQueue, _maxCachedPages;
@@ -339,6 +340,7 @@ internal static class WindowsAcceptance
         {
             status = "passed", phase, processId = Environment.ProcessId, gracefulExit = true,
             reads = Reads.OrderBy(pair => pair.Key).Select(pair => new { name = pair.Key, count = pair.Value }).ToArray(),
+            decoderFailures = DecodeFailures.OrderBy(pair => pair.Key).Select(pair => new { name = pair.Key, errorType = pair.Value }).ToArray(),
             decoderCalls = Reads.Values.Sum(), decoderTimes = Summary(DecodeTimes), sqliteWriteTimes = Summary(WriteTimes),
             uiPageTimes = Summary(PageTimes), scrollsDuringIndexing = _scrollsDuringIndexing,
             maxDispatcherGapMs = _maxGap, maxPrivateBytes = _maxMemory, warmPrivateBytes = _warmMemory, maxQueue = _maxQueue, maxCachedPages = _maxCachedPages,
@@ -362,8 +364,16 @@ internal static class WindowsAcceptance
             Require(path.StartsWith(Media + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "Reader escaped its synthetic media root.");
             Reads.AddOrUpdate(Path.GetRelativePath(Media, path), 1, (_, count) => count + 1);
             if (phase == "first" && token.WaitHandle.WaitOne(90)) token.ThrowIfCancellationRequested();
-            var started = Stopwatch.GetTimestamp(); var result = original(path, token);
-            DecodeTimes.Enqueue(Stopwatch.GetElapsedTime(started).TotalMilliseconds); return result;
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                var result = original(path, token);
+                DecodeTimes.Enqueue(Stopwatch.GetElapsedTime(started).TotalMilliseconds); return result;
+            }
+            catch (Exception error)
+            {
+                DecodeFailures[Path.GetRelativePath(Media, path)] = error.GetType().Name; throw;
+            }
         };
         await window.ToggleBackgroundProcessingAsync();
         if (phase == "first")

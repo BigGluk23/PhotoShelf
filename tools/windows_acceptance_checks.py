@@ -38,6 +38,8 @@ def validate(report, commit):
         gap = phase.get("maxDispatcherGapMs")
         if type(gap) not in (int, float) or not math.isfinite(gap) or not 0 < gap < 5000:
             raise ValueError("Dispatcher measurements incomplete or over budget")
+        if phase.get("decoderFailures") != []:
+            raise ValueError("Real fixture decoder failed or its failure evidence is missing: " + str(phase.get("decoderFailures")))
         reads = phase.get("reads")
         if not isinstance(reads, list) or len(reads) > 512:
             raise ValueError("Unbounded/missing reader evidence")

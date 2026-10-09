@@ -6,7 +6,7 @@ from windows_acceptance_checks import validate
 def evidence():
     phase = dict(status="passed", gracefulExit=True, noApplicationErrors=True, actualCatalogStartup=True,
                  videoPlaybackTested=False, physicalSleepTested=False, maxDispatcherGapMs=120,
-                 reads=[], decoderCalls=0)
+                 reads=[], decoderCalls=0, decoderFailures=[])
     first = dict(phase, phase="first", processId=10, scrollsDuringIndexing=10, maxCachedPages=2, maxQueue=3, warmPrivateBytes=100000000, maxPrivateBytes=120000000,
                  reads=[dict(name=n, count=1) for n in ["B/fixture.jpg", "B/fixture.webp", "B/fixture.heic"]] +
                  [dict(name=f"A/{i}.png", count=1) for i in range(196)], decoderCalls=199,
@@ -50,6 +50,7 @@ class AcceptanceGateTests(unittest.TestCase):
     def test_nonfinite_measurement_and_no_overlap_cannot_pass(self):
         for mutation in (lambda r: r["phases"][0].update(maxDispatcherGapMs=float("nan")),
                          lambda r: r["phases"][0].update(scrollsDuringIndexing=0),
+                         lambda r: r["phases"][0].update(decoderFailures=[dict(name="B/fixture.webp", errorType="NotSupportedException")]),
                          lambda r: r["phases"][0].update(warmPrivateBytes=None),
                          lambda r: r["phases"][0].update(maxPrivateBytes=500000000),
                          lambda r: r["phases"][0]["sqliteWriteTimes"].update(count=0),
