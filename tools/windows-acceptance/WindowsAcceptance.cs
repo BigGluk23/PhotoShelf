@@ -339,6 +339,8 @@ internal static class WindowsAcceptance
     private static async Task ExerciseAsync(MainWindow window, string phase)
     {
         _phase = "initial-projection";
+        var startupError = await window.InitialCatalogReady.WaitAsync(TimeSpan.FromSeconds(30));
+        Require(startupError is null, "Production catalog startup did not complete successfully.");
         await UntilAsync(() => window.PhotoRows is VirtualPhotoRows rows && rows.ItemCount > 0 && !Get<bool>(window, "_isCatalogLoading"));
         if (phase == "first") Require(((VirtualPhotoRows)window.PhotoRows).ItemCount >= VirtualCount, "Large catalog did not restore its initial view.");
         Require(window.GetBackgroundActivity().Paused, "Persisted pause was not restored before workers.");
@@ -467,7 +469,8 @@ internal static class WindowsAcceptance
             await UntilAsync(() => Get<long>(review, "_groupOffset") > previous && !Get<bool>(review, "_loadingPage"));
         }
         groups.SelectedItem = review.Groups.First(group => group.TotalFiles == 130);
-        groups.ScrollIntoView(groups.SelectedItem); await Task.Delay(100);
+        groups.ScrollIntoView(groups.SelectedItem);
+        await UntilAsync(() => review.SelectedGroup is { TotalFiles: 130, Items.Count: 65 } && !Get<bool>(review, "_loadingPage"));
         var first = review.SelectedGroup!;
         Require(first.Items.Count == 65 && first.Items.Count(item => item.IsKeep) == 1, "Large duplicate group was not bounded.");
         members.ScrollIntoView(first.Items[^1]); await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
