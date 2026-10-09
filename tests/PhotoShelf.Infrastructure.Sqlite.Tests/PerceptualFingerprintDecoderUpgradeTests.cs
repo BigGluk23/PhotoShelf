@@ -89,7 +89,9 @@ public sealed class PerceptualFingerprintDecoderUpgradeTests : IDisposable
         var update = new PerceptualFingerprintCatalogUpdate(item, PerceptualFingerprintReadResult.Found(Fingerprint), DateTime.UtcNow);
         using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.SaveObservedBatchAsync([update], cancelled.Token));
-        await ExecuteAsync("CREATE TRIGGER synthetic_commit_failure BEFORE UPDATE ON perceptual_fingerprint_cache BEGIN SELECT RAISE(ABORT,'synthetic checkpoint'); END;");
+        // Fail after the cache row/revision changed but before its band insert completes.
+        // The entire transaction must restore the previous retry, not acknowledge it early.
+        await ExecuteAsync("CREATE TRIGGER synthetic_commit_failure BEFORE INSERT ON perceptual_fingerprint_bands BEGIN SELECT RAISE(ABORT,'synthetic checkpoint'); END;");
         await Assert.ThrowsAsync<SqliteException>(() => store.SaveObservedBatchAsync([update]));
         Assert.Equal(cacheBefore, await SnapshotAsync("perceptual_fingerprint_cache"));
         Assert.Equal(catalogBefore, await SnapshotAsync("desktop_media_items"));
