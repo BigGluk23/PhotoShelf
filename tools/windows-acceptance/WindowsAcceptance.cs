@@ -211,7 +211,7 @@ internal static class WindowsAcceptance
         await new PerceptualFingerprintStore(Catalog).InitializeAsync();
         _phase = "seed-preferences";
         await store.SaveAsync(new LocalCatalogState { BackgroundProcessingPaused = true,
-            IncludeSystemFolders = true, ShowVideos = true, ViewMode = "All", DateGroupingMode = "FileDate" }, saveItems: false);
+            IncludeSystemFolders = true, ShowVideos = true, WatchedFolders = [Media], ViewMode = "All", DateGroupingMode = "FileDate" }, saveItems: false);
         _phase = "seed-media";
         var items = OwnedFiles(Media)
             .Where(path => Path.GetExtension(path) is not (".xmp" or ".aae"))
@@ -326,7 +326,9 @@ internal static class WindowsAcceptance
             catch (Exception error)
             {
                 WriteNew(Path.Combine(Root, phase + ".json"), new { status = "failed", phase = _phase, errorType = error.GetType().Name, frames = FailureFrames(error),
-                    assertion = error is InvalidDataException or TimeoutException ? error.Message : null });
+                    assertion = error is InvalidDataException or TimeoutException ? error.Message : null,
+                    decoderCalls = Reads.Values.Sum(), completedDuplicateScopes = ScopeResults,
+                    viewCount = window.BrowseSmokeItemCount, busy = window.BrowseSmokeBusy });
                 app.Shutdown(1);
             }
         };
@@ -422,7 +424,7 @@ internal static class WindowsAcceptance
 
     private static async Task DuplicateScopesAsync(MainWindow window)
     {
-        _phase = "duplicate-scopes";
+        _phase = "duplicate-folder-ready";
         // Use the real folder handler on one owned node; no disk ancestors are expanded.
         // Selecting a known owned node uses the production folder event; no guard is relaxed.
         window.AllowIsolatedLibraryMonitoring = true;
@@ -431,6 +433,7 @@ internal static class WindowsAcceptance
         await UntilAsync(() => window.BrowseSmokePublishedFolder == folder.FullPath && window.BrowseSmokeItemCount > 130 && !window.BrowseSmokeBusy);
         foreach (var currentFolder in new[] { false, true })
         {
+            _phase = currentFolder ? "duplicate-current-folder" : "duplicate-whole-library";
             var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var handling = false; var dialogObserved = false;
             var scopeDeadline = Stopwatch.StartNew();
