@@ -423,11 +423,13 @@ internal static class WindowsAcceptance
         {
             var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var handling = false; var dialogObserved = false;
+            var scopeDeadline = Stopwatch.StartNew();
             var observer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(25) };
             observer.Tick += async (_, _) =>
             {
                 try
                 {
+                    if (scopeDeadline.Elapsed.TotalSeconds > 60) throw new TimeoutException("Duplicate modal scope timed out.");
                     if (!dialogObserved && System.Windows.Application.Current.Windows.OfType<DuplicateSearchDialog>().FirstOrDefault() is { } dialog)
                     {
                         dialogObserved = true;
@@ -442,7 +444,15 @@ internal static class WindowsAcceptance
                         review.Close(); completion.TrySetResult();
                     }
                 }
-                catch (Exception error) { completion.TrySetException(error); }
+                catch (Exception error)
+                {
+                    observer.Stop();
+                    completion.TrySetException(error);
+                    // RaiseEvent can synchronously enter ShowDialog's nested dispatcher.
+                    // Close only this test's duplicate modals so the failure can unwind.
+                    foreach (var modal in System.Windows.Application.Current.Windows.Cast<Window>()
+                        .Where(modal => modal is DuplicateSearchDialog or DuplicateReviewWindow).ToArray()) modal.Close();
+                }
             };
             observer.Start();
             try
