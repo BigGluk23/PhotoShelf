@@ -32,6 +32,7 @@ try {
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
     Invoke-Checked $Python @('-B', 'tools/test_harness_checks.py')
+    Invoke-Checked $Python @('-B', 'tools/test_windows_acceptance_checks.py')
     Invoke-Checked $Python @('-B', 'tools/test_package_checks.py')
     Invoke-Checked $Python @('-B', 'tools/test_update_release.py')
     Invoke-Checked $Python @('tools/harness_checks.py', 'repository')
@@ -259,6 +260,13 @@ try {
     }
     $result.backgroundSoakVerified = $true
     $result.backgroundSoakSeconds = $BackgroundSoakSeconds
+    # Sequential real-process cache + WPF duplicate/large-view acceptance. This builds
+    # an owned source copy only; its binaries never enter the shipping package.
+    & (Join-Path $repoRoot 'tools/test-wpf-acceptance.ps1') -ReportDirectory $results -DotNet $DotNet -Python $Python
+    $acceptanceReport = Join-Path $results 'windows-acceptance.json'
+    Invoke-Checked $Python @('tools/windows_acceptance_checks.py', $acceptanceReport, '--commit', $result.commit)
+    $result.windowsAcceptanceVerified = $true
+    $result.windowsAcceptanceReportSha256 = (Get-FileHash -LiteralPath $acceptanceReport -Algorithm SHA256).Hash.ToLowerInvariant()
     $result.browseSmokeVerified = $true
     $result.searchSortSmokeVerified = $true
     Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'
