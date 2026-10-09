@@ -42,6 +42,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify application version.' }
     Invoke-Checked $DotNet @('--info')
     & (Join-Path $repoRoot 'tools/build-heif-codec.ps1')
+    # Sequential real-process cache + WPF duplicate/large-view acceptance. This builds
+    # an owned source copy only; its binaries never enter the shipping package.
+    & (Join-Path $repoRoot 'tools/test-wpf-acceptance.ps1') -ReportDirectory $results -DotNet $DotNet -Python $Python
+    $acceptanceReport = Join-Path $results 'windows-acceptance.json'
+    Invoke-Checked $Python @('tools/windows_acceptance_checks.py', $acceptanceReport, '--commit', $result.commit)
+    $result.windowsAcceptanceVerified = $true
+    $result.windowsAcceptanceReportSha256 = (Get-FileHash -LiteralPath $acceptanceReport -Algorithm SHA256).Hash.ToLowerInvariant()
     # Lockfiles pin direct/transitive package hashes; NuGet audit is required and warnings fail restore.
     Invoke-Checked $DotNet @('restore', 'PhotoShelf.sln', '--locked-mode', '--force', '--disable-parallel')
     & $DotNet list PhotoShelf.sln package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'dependencies.json') -Encoding utf8
@@ -260,13 +267,6 @@ try {
     }
     $result.backgroundSoakVerified = $true
     $result.backgroundSoakSeconds = $BackgroundSoakSeconds
-    # Sequential real-process cache + WPF duplicate/large-view acceptance. This builds
-    # an owned source copy only; its binaries never enter the shipping package.
-    & (Join-Path $repoRoot 'tools/test-wpf-acceptance.ps1') -ReportDirectory $results -DotNet $DotNet -Python $Python
-    $acceptanceReport = Join-Path $results 'windows-acceptance.json'
-    Invoke-Checked $Python @('tools/windows_acceptance_checks.py', $acceptanceReport, '--commit', $result.commit)
-    $result.windowsAcceptanceVerified = $true
-    $result.windowsAcceptanceReportSha256 = (Get-FileHash -LiteralPath $acceptanceReport -Algorithm SHA256).Hash.ToLowerInvariant()
     $result.browseSmokeVerified = $true
     $result.searchSortSmokeVerified = $true
     Write-Output 'OK production browse/search/sort smoke: isolated monitoring, decoded PNG, full order/count, selection/anchor, cancellation, stable views, unchanged originals, graceful close.'

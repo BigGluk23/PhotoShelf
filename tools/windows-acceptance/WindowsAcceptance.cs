@@ -278,7 +278,7 @@ internal static class WindowsAcceptance
     private static async Task<SortedDictionary<string, string>> CacheSnapshotAsync()
     {
         await using var db = await OpenAsync(); await using var command = db.CreateCommand();
-        command.CommandText = "SELECT asset_id,path_key,size_bytes,file_modified_utc_ticks,observation_version,algorithm_version,status,difference_hash,average_hash,pixel_width,pixel_height,attempted_at_utc_ticks,retry_at_utc_ticks,error_code FROM perceptual_fingerprint_cache ORDER BY asset_id;";
+        command.CommandText = "SELECT asset_id,path,path_key,size_bytes,file_modified_utc_ticks,observation_version,algorithm_version,status,difference_hash,average_hash,pixel_width,pixel_height,attempted_at_utc_ticks,retry_at_utc_ticks,error_code FROM perceptual_fingerprint_cache ORDER BY asset_id;";
         var result = new SortedDictionary<string, string>(); await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync()) result.Add(reader.GetString(0), JsonSerializer.Serialize(Enumerable.Range(1, reader.FieldCount - 1).Select(i => reader.IsDBNull(i) ? null : reader.GetValue(i)).ToArray()));
         return result;
