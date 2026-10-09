@@ -17,7 +17,7 @@ def evidence():
     return dict(schema=1, status="passed", commit="a" * 40, scope="production-WPF-startup-in-owned-compile-time-test-copy",
                 sourceCopyInstrumented=True, shippingEntrypointChanged=False, originalHashesSizesAndTimesPreserved=True,
                 companionsPreserved=True, catalogIntegrityPassed=True, assetIdsAndFavoritesPreserved=True,
-                restartCacheVerified=True, singleChangedFileVerified=True, syntheticCatalogRows=100000, originalsChecked=202,
+                restartCacheVerified=True, singleChangedFileVerified=True, legacyUnsupportedWebpRecovered=True, syntheticCatalogRows=100000, originalsChecked=202,
                 phases=[first, dict(phase, phase="restart", processId=11),
                         dict(phase, phase="changed", processId=12, reads=[dict(name="A/group-00-copy.png", count=1)], decoderCalls=1)])
 
@@ -27,7 +27,7 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual("passed", validate(evidence(), "a" * 40)["status"])
 
     def test_missing_assertions_and_wrong_commit_are_rejected(self):
-        for key in ("companionsPreserved", "originalHashesSizesAndTimesPreserved", "restartCacheVerified", "singleChangedFileVerified"):
+        for key in ("companionsPreserved", "originalHashesSizesAndTimesPreserved", "restartCacheVerified", "singleChangedFileVerified", "legacyUnsupportedWebpRecovered"):
             with self.subTest(key=key):
                 report = evidence(); del report[key]
                 with self.assertRaises(ValueError): validate(report, "a" * 40)

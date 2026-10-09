@@ -12,7 +12,7 @@ def validate(report, commit):
     if report.get("scope") != "production-WPF-startup-in-owned-compile-time-test-copy":
         raise ValueError("Unknown acceptance scope")
     for field in ("sourceCopyInstrumented", "originalHashesSizesAndTimesPreserved", "companionsPreserved",
-                  "catalogIntegrityPassed", "assetIdsAndFavoritesPreserved", "restartCacheVerified", "singleChangedFileVerified"):
+                  "catalogIntegrityPassed", "assetIdsAndFavoritesPreserved", "restartCacheVerified", "singleChangedFileVerified", "legacyUnsupportedWebpRecovered"):
         if report.get(field) is not True:
             raise ValueError("Missing acceptance assertion: " + field)
     if report.get("shippingEntrypointChanged") is not False or report.get("syntheticCatalogRows") != 100000:

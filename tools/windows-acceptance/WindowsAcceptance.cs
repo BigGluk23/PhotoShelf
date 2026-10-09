@@ -15,6 +15,7 @@ using System.Windows.Threading;
 using Microsoft.Data.Sqlite;
 using PhotoShelf.Application.Background;
 using PhotoShelf.Application.Catalog;
+using PhotoShelf.Application.Duplicates;
 using PhotoShelf.Application.Metadata;
 using PhotoShelf.Infrastructure.Sqlite;
 using SkiaSharp;
@@ -130,6 +131,14 @@ internal static class WindowsAcceptance
         VerifyOriginals(originals); await VerifyCatalogAsync(items);
         var cached = await CacheSnapshotAsync();
         Require(cached.Count >= 190, "Initial fingerprints are missing.");
+        await using (var check = await OpenAsync())
+        await using (var command = check.CreateCommand())
+        {
+            command.CommandText = "SELECT count(*) FROM perceptual_fingerprint_cache WHERE path=$path AND status=$found AND decoder_revision>0;";
+            command.Parameters.AddWithValue("$path", Path.Combine(Media, "B", "fixture.webp"));
+            command.Parameters.AddWithValue("$found", (int)PerceptualFingerprintStatus.Found);
+            Require(Convert.ToInt64(await command.ExecuteScalarAsync()) == 1, "Legacy unsupported WebP was not recovered by the bundled decoder.");
+        }
         results.Add(await StartChildAsync("restart"));
         VerifyOriginals(originals); await VerifyCatalogAsync(items);
         Require(cached.SequenceEqual(await CacheSnapshotAsync()), "Restart changed the persisted fingerprint cache.");
@@ -154,6 +163,7 @@ internal static class WindowsAcceptance
             commit = "__SOURCE_COMMIT__", sourceCopyInstrumented = true, shippingEntrypointChanged = false,
             originalHashesSizesAndTimesPreserved = true, companionsPreserved = true, catalogIntegrityPassed = true,
             assetIdsAndFavoritesPreserved = true, restartCacheVerified = true, singleChangedFileVerified = true,
+            legacyUnsupportedWebpRecovered = true,
             syntheticCatalogRows = VirtualCount, originalsChecked = originals.Count, phases = results,
             limitations = new[] { "Test entrypoint bypasses updater admission; App startup and real MainWindow are used.",
                 "100k absent catalog rows are fixture setup, not a media-import benchmark.",
@@ -224,9 +234,20 @@ internal static class WindowsAcceptance
                 return value;
             }).ToArray();
         await store.UpsertItemsAsync(items);
+        _phase = "seed-legacy-webp-error";
+        var legacyWebp = items.Single(item => Path.GetExtension(item.Path) == ".webp");
+        legacyWebp = (await store.GetItemAsync(legacyWebp.Path))!;
+        var fingerprints = new PerceptualFingerprintStore(Catalog);
+        Require((await fingerprints.SaveObservedBatchAsync([
+            new(legacyWebp, PerceptualFingerprintReadResult.Unsupported("NotSupportedException"), DateTime.UtcNow)])).Single(),
+            "Legacy WebP cache fixture could not be created.");
         _phase = "seed-large-catalog";
         await using var db = await OpenAsync();
         await using var command = db.CreateCommand();
+        command.CommandText = "UPDATE perceptual_fingerprint_cache SET decoder_revision=0 WHERE asset_id=$id;";
+        command.Parameters.AddWithValue("$id", legacyWebp.AssetId);
+        Require(await command.ExecuteNonQueryAsync() == 1, "Legacy decoder revision fixture is missing.");
+        command.Parameters.Clear();
         command.CommandText = """
             PRAGMA synchronous=FULL; PRAGMA cache_size=-65536;
             WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)), numbers(i) AS (
@@ -285,7 +306,7 @@ internal static class WindowsAcceptance
     private static async Task<SortedDictionary<string, string>> CacheSnapshotAsync()
     {
         await using var db = await OpenAsync(); await using var command = db.CreateCommand();
-        command.CommandText = "SELECT asset_id,path,path_key,size_bytes,file_modified_utc_ticks,observation_version,algorithm_version,status,difference_hash,average_hash,pixel_width,pixel_height,attempted_at_utc_ticks,retry_at_utc_ticks,error_code FROM perceptual_fingerprint_cache ORDER BY asset_id;";
+        command.CommandText = "SELECT asset_id,path,path_key,size_bytes,file_modified_utc_ticks,observation_version,algorithm_version,decoder_revision,status,difference_hash,average_hash,pixel_width,pixel_height,attempted_at_utc_ticks,retry_at_utc_ticks,error_code FROM perceptual_fingerprint_cache ORDER BY asset_id;";
         var result = new SortedDictionary<string, string>(); await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync()) result.Add(reader.GetString(0), JsonSerializer.Serialize(Enumerable.Range(1, reader.FieldCount - 1).Select(i => reader.IsDBNull(i) ? null : reader.GetValue(i)).ToArray()));
         return result;

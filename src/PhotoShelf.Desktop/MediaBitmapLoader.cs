@@ -146,7 +146,12 @@ public static class MediaBitmapLoader
     public static PerceptualFingerprint LoadPerceptualFingerprint(string path, CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
-        var bitmap = LoadStillBounded(path, 64, token);
+        // GIF/WebP use the bundled decoder, including still WebP and disguised extensions.
+        // Fingerprints use one frame within the same input and pixel limits as previews.
+        var animationInfo = ReadInfo(path);
+        var bitmap = animationInfo is not null
+            ? ReadAnimation(path, 64, 1, token, animationInfo)[0].Bitmap
+            : LoadStillBounded(path, 64, token);
         var gray = bitmap.Format == PixelFormats.Gray8
             ? bitmap
             : new FormatConvertedBitmap(bitmap, PixelFormats.Gray8, null, 0);
