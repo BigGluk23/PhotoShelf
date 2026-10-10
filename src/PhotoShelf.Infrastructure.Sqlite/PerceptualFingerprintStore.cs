@@ -39,6 +39,9 @@ public sealed class PerceptualFingerprintStore
 {
     private readonly string _connectionString;
     private readonly string _directory;
+    // Decoder capability changes do not invalidate successful algorithm-v1 fingerprints.
+    // Revision 1 adds bundled WebP decoding to the fingerprint reader.
+    private const int CurrentDecoderRevision = 1;
     // Per-instance test observation of the actual SQLite VM; production callers leave it unset.
     internal Func<SqliteConnection, IDisposable>? ObserveCandidateQuery { get; init; }
 
@@ -53,7 +56,9 @@ public sealed class PerceptualFingerprintStore
         {
             Directory.CreateDirectory(_directory);
             await using var connection = await OpenAsync(token);
+            await using var transaction = connection.BeginTransaction();
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = """
                 CREATE TABLE IF NOT EXISTS perceptual_fingerprint_cache (
                     asset_id TEXT NOT NULL PRIMARY KEY,
@@ -63,6 +68,7 @@ public sealed class PerceptualFingerprintStore
                     file_modified_utc_ticks INTEGER NOT NULL,
                     observation_version INTEGER NOT NULL,
                     algorithm_version INTEGER NOT NULL,
+                    decoder_revision INTEGER NOT NULL DEFAULT 0,
                     status INTEGER NOT NULL,
                     difference_hash INTEGER NULL,
                     average_hash INTEGER NULL,
@@ -84,6 +90,18 @@ public sealed class PerceptualFingerprintStore
                     ON perceptual_fingerprint_bands(algorithm_version,band_index,band_value,asset_id);
                 """;
             await command.ExecuteNonQueryAsync(token);
+            var hasDecoderRevision = false;
+            command.CommandText = "PRAGMA table_info(perceptual_fingerprint_cache);";
+            await using (var reader = await command.ExecuteReaderAsync(token))
+                while (await reader.ReadAsync(token))
+                    if (reader.GetString(1) == "decoder_revision") hasDecoderRevision = true;
+            if (!hasDecoderRevision)
+            {
+                // SQLite adds this constant default without rewriting/scanning cached rows.
+                command.CommandText = "ALTER TABLE perceptual_fingerprint_cache ADD COLUMN decoder_revision INTEGER NOT NULL DEFAULT 0;";
+                await command.ExecuteNonQueryAsync(token);
+            }
+            await transaction.CommitAsync(token);
         }, token), token);
 
     /// <summary>
@@ -113,13 +131,17 @@ public sealed class PerceptualFingerprintStore
                   AND (i.availability=0 OR (i.availability=4 AND i.availability_error_code IS NULL))
                   AND ($includeSystem=1 OR i.is_hidden_or_system=0)
                   AND i.path_key>$after AND {folderPredicate}
-                  AND (p.asset_id IS NULL OR (p.status=$transient AND p.retry_at_utc_ticks<=$due))
+                  AND (p.asset_id IS NULL OR (p.status=$transient AND p.retry_at_utc_ticks<=$due)
+                    OR (p.decoder_revision<$decoderRevision AND p.status=$unsupported
+                        AND p.error_code='NotSupportedException' AND substr(i.path_key,-5)='.WEBP'))
                 ORDER BY i.path_key ASC LIMIT $take;
                 """;
             command.Parameters.AddWithValue("$algorithm", PerceptualFingerprint.CurrentAlgorithmVersion);
             command.Parameters.AddWithValue("$includeSystem", scope.IncludeSystemFolders ? 1 : 0);
             command.Parameters.AddWithValue("$after", afterPath is null ? "" : SqliteDesktopCatalogStore.NormalizePathKey(afterPath));
             command.Parameters.AddWithValue("$transient", (int)PerceptualFingerprintStatus.TransientError);
+            command.Parameters.AddWithValue("$unsupported", (int)PerceptualFingerprintStatus.Unsupported);
+            command.Parameters.AddWithValue("$decoderRevision", CurrentDecoderRevision);
             command.Parameters.AddWithValue("$due", scope.DueAtUtc.ToUniversalTime().Ticks);
             command.Parameters.AddWithValue("$take", pageSize);
             try
@@ -322,9 +344,9 @@ public sealed class PerceptualFingerprintStore
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO perceptual_fingerprint_cache(asset_id,path,path_key,size_bytes,file_modified_utc_ticks,
-                    observation_version,algorithm_version,status,difference_hash,average_hash,pixel_width,pixel_height,
+                    observation_version,algorithm_version,decoder_revision,status,difference_hash,average_hash,pixel_width,pixel_height,
                     attempted_at_utc_ticks,retry_at_utc_ticks,error_code)
-                SELECT $id,$path,$key,$size,$modified,$version,$algorithm,$status,$difference,$average,$width,$height,
+                SELECT $id,$path,$key,$size,$modified,$version,$algorithm,$decoderRevision,$status,$difference,$average,$width,$height,
                     $attempted,$retry,$error
                 WHERE EXISTS(SELECT 1 FROM desktop_media_items WHERE asset_id=$id AND path_key=$key
                     AND size_bytes=$size AND file_modified_utc_ticks=$modified AND observation_version=$version
@@ -333,6 +355,7 @@ public sealed class PerceptualFingerprintStore
                 ON CONFLICT(asset_id) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,
                     size_bytes=excluded.size_bytes,file_modified_utc_ticks=excluded.file_modified_utc_ticks,
                     observation_version=excluded.observation_version,algorithm_version=excluded.algorithm_version,
+                    decoder_revision=excluded.decoder_revision,
                     status=excluded.status,difference_hash=excluded.difference_hash,average_hash=excluded.average_hash,
                     pixel_width=excluded.pixel_width,pixel_height=excluded.pixel_height,
                     attempted_at_utc_ticks=excluded.attempted_at_utc_ticks,retry_at_utc_ticks=excluded.retry_at_utc_ticks,
@@ -345,6 +368,7 @@ public sealed class PerceptualFingerprintStore
             command.Parameters.AddWithValue("$modified", expected.FileModifiedAt?.ToUniversalTime().Ticks ?? 0);
             command.Parameters.AddWithValue("$version", expected.ObservationVersion);
             command.Parameters.AddWithValue("$algorithm", PerceptualFingerprint.CurrentAlgorithmVersion);
+            command.Parameters.AddWithValue("$decoderRevision", CurrentDecoderRevision);
             command.Parameters.AddWithValue("$status", (int)result.Status);
             command.Parameters.AddWithValue("$difference", fingerprint is null ? DBNull.Value : unchecked((long)fingerprint.DifferenceHash));
             command.Parameters.AddWithValue("$average", fingerprint is null ? DBNull.Value : unchecked((long)fingerprint.AverageHash));

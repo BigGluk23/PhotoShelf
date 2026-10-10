@@ -32,6 +32,7 @@ try {
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
     Invoke-Checked $Python @('-B', 'tools/test_harness_checks.py')
+    Invoke-Checked $Python @('-B', 'tools/test_windows_acceptance_checks.py')
     Invoke-Checked $Python @('-B', 'tools/test_package_checks.py')
     Invoke-Checked $Python @('-B', 'tools/test_update_release.py')
     Invoke-Checked $Python @('tools/harness_checks.py', 'repository')
@@ -41,6 +42,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify application version.' }
     Invoke-Checked $DotNet @('--info')
     & (Join-Path $repoRoot 'tools/build-heif-codec.ps1')
+    # Sequential real-process cache + WPF duplicate/large-view acceptance. This builds
+    # an owned source copy only; its binaries never enter the shipping package.
+    & (Join-Path $repoRoot 'tools/test-wpf-acceptance.ps1') -ReportDirectory $results -DotNet $DotNet -Python $Python
+    $acceptanceReport = Join-Path $results 'windows-acceptance.json'
+    Invoke-Checked $Python @('tools/windows_acceptance_checks.py', $acceptanceReport, '--commit', $result.commit)
+    $result.windowsAcceptanceVerified = $true
+    $result.windowsAcceptanceReportSha256 = (Get-FileHash -LiteralPath $acceptanceReport -Algorithm SHA256).Hash.ToLowerInvariant()
     # Lockfiles pin direct/transitive package hashes; NuGet audit is required and warnings fail restore.
     Invoke-Checked $DotNet @('restore', 'PhotoShelf.sln', '--locked-mode', '--force', '--disable-parallel')
     & $DotNet list PhotoShelf.sln package --include-transitive --no-restore --format json | Set-Content -LiteralPath (Join-Path $results 'dependencies.json') -Encoding utf8
